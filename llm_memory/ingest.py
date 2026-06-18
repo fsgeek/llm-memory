@@ -24,7 +24,11 @@ def record_to_episode(record, source_file):
         "user_message": record.get("user_message", "") or "",
         "response": response or "",
         "state": state,
-        "state_text": flatten_state(state),
+        # exclude _activity_log (tool-trace) — it echoes the instance's own
+        # queries and would confound recall if indexed as state.
+        "state_text": flatten_state(
+            {k: v for k, v in state.items() if k != "_activity_log"}
+        ),
         "activity_log": state.get("_activity_log", []),
     }
 

@@ -27,14 +27,15 @@ def _matched_field(doc, query):
     return best
 
 
-def search(db, query, scope="all", limit=10):
-    """Search the conversation-inclusive index (user_message + response +
-    state_text) with BM25 ranking. `scope` is accepted for parity with the
-    existing search_memory API; in the single-corpus sandbox it does not yet
-    partition results."""
+def search(db, query, scope="all", limit=10, view=VIEW):
+    """Search an ArangoSearch view with BM25 ranking. Defaults to the
+    conversation-inclusive view (user_message + response + state_text); `view`
+    can target another (e.g. a state-only view for controlled comparison).
+    `scope` is accepted for parity with the existing search_memory API; in the
+    single-corpus sandbox it does not yet partition results."""
     cursor = db.aql.execute(
         _AQL,
-        bind_vars={"@view": VIEW, "q": query, "analyzer": ANALYZER, "limit": limit},
+        bind_vars={"@view": view, "q": query, "analyzer": ANALYZER, "limit": limit},
     )
     hits = []
     for doc in cursor:

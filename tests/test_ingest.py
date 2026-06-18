@@ -27,6 +27,9 @@ def test_record_to_episode_extracts_conversation_and_state():
     assert ep["user_message"] == "what did you mean by recognition?"
     assert ep["response"] == "I meant recognition enhancement."
     assert "drowning wall" in ep["state_text"]
+    # _activity_log is tool-trace (it echoes the instance's own queries); it must
+    # NOT leak into the searchable state_text, or it confounds recall.
+    assert "search_memory" not in ep["state_text"]
     assert ep["activity_log"] == [{"cycle": 457, "tool": "search_memory"}]
     assert ep["source_file"] == "taste_open_20260331.jsonl"
 
