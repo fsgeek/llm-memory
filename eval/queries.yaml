@@ -1,0 +1,16 @@
+# Queries that returned 0 results in taste_open_20260331_035903.jsonl, where the
+# search was scoped to the instance's state object only (manufactured silence).
+# `expected` = the cycle(s) whose conversational text demonstrably contains the
+# terms (self-grounding ground truth). Baseline for every query: 0 results.
+k: 3
+queries:
+  - query: "recognition enhancement"
+    expected: [457, 456]
+  - query: "bounded autonomy harness new system"
+    expected: [431]
+  - query: "drowning wall forty cycles context window"
+    expected: [430]
+  - query: "clock time on restart"
+    expected: [456]
+  - query: "narrates its own trustedness"
+    expected: [444]
