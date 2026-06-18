@@ -1,0 +1,27 @@
+#!/bin/bash
+set -e
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+OTS="$GIT_ROOT/.venv/bin/ots"
+
+# Guard: don't stamp OTS commits (--no-verify skips pre-commit but not post-commit)
+COMMIT_MSG=$(git log -1 --format="%s")
+if [[ "$COMMIT_MSG" == ots:* ]]; then
+    exit 0
+fi
+
+if [ ! -x "$OTS" ]; then
+    echo "ots: client not found at $GIT_ROOT/.venv/bin/ots, skipping timestamp" >&2
+    exit 0
+fi
+
+HASH=$(git rev-parse HEAD)
+TIMESTAMP_DIR="$GIT_ROOT/timestamps"
+mkdir -p "$TIMESTAMP_DIR"
+
+HASH_FILE="$TIMESTAMP_DIR/$HASH"
+echo "$HASH" > "$HASH_FILE"
+"$OTS" stamp "$HASH_FILE"
+
+git -C "$GIT_ROOT" add "$TIMESTAMP_DIR/"
+git -C "$GIT_ROOT" commit --no-verify -m "ots: stamp $HASH"
