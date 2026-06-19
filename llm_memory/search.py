@@ -8,6 +8,7 @@ FOR doc IN @@view
     doc.state_text   IN TOKENS(@q, @analyzer),
     @analyzer)
   OPTIONS { waitForSync: true }
+  __SCOPE_FILTER__
   LET score = BM25(doc)
   SORT score DESC
   LIMIT @limit
@@ -31,12 +32,18 @@ def search(db, query, scope="all", limit=10, view=VIEW):
     """Search an ArangoSearch view with BM25 ranking. Defaults to the
     conversation-inclusive view (user_message + response + state_text); `view`
     can target another (e.g. a state-only view for controlled comparison).
-    `scope` is accepted for parity with the existing search_memory API; in the
-    single-corpus sandbox it does not yet partition results."""
-    cursor = db.aql.execute(
-        _AQL,
-        bind_vars={"@view": view, "q": query, "analyzer": ANALYZER, "limit": limit},
-    )
+    `scope` partitions by `experiment_label`: the default "all" searches every
+    corpus, any other value restricts results to episodes with that label (e.g.
+    "claude_code" so a live-session query cannot surface taste_open episodes)."""
+    bind_vars = {"@view": view, "q": query, "analyzer": ANALYZER, "limit": limit}
+    if scope == "all":
+        aql = _AQL.replace("  __SCOPE_FILTER__\n", "")
+    else:
+        aql = _AQL.replace(
+            "  __SCOPE_FILTER__\n", "  FILTER doc.experiment_label == @scope\n"
+        )
+        bind_vars["scope"] = scope
+    cursor = db.aql.execute(aql, bind_vars=bind_vars)
     hits = []
     for doc in cursor:
         field = _matched_field(doc, query)
