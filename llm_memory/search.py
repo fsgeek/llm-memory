@@ -12,7 +12,7 @@ FOR doc IN @@view
   LET score = BM25(doc)
   SORT score DESC
   LIMIT @limit
-  RETURN { cycle: doc.cycle, score: score,
+  RETURN { _key: doc._key, cycle: doc.cycle, score: score,
            user_message: doc.user_message, response: doc.response }
 """
 
@@ -50,6 +50,7 @@ def search(db, query, scope="all", limit=10, view=VIEW):
         snippet = (doc.get(field) or "")[:200] if field else ""
         hits.append(
             {
+                "key": doc["_key"],
                 "cycle": doc["cycle"],
                 "score": doc["score"],
                 "matched_field": field,

@@ -35,6 +35,35 @@ def test_search_finds_a_phrase_the_instance_said_in_response(tmp_path):
             col.delete(key)
 
 
+def test_search_result_carries_key_for_recall(tmp_path):
+    """A search hit must hand back the episode's `_key`. search ranks and gives a
+    snippet; recall(db, key) reads it in full. The `key` is the seam between them
+    — without it the instance can't recall what it found and falls back to the
+    filesystem, which is the manufactured silence this whole tool exists to kill."""
+    db = get_database()
+    ensure_index(db)
+    col = db.collection(EPISODES)
+    key = "900040"
+    try:
+        rec = {
+            "cycle": 900040,
+            "user_message": "seam question",
+            "raw_output": {"response": "the kingfisher escarpment marker"},
+            "state": {},
+        }
+        p = tmp_path / "k.jsonl"
+        p.write_text(json.dumps(rec))
+        ingest_file(db, p)
+
+        results = search(db, "kingfisher escarpment", limit=5)
+        hit = next(r for r in results if r["cycle"] == 900040)
+
+        assert hit["key"] == key
+    finally:
+        if col.has(key):
+            col.delete(key)
+
+
 def test_scope_partitions_corpora_by_experiment_label(tmp_path):
     """Two episodes share one unique marker phrase but belong to different
     corpora. `scope="claude_code"` must surface only the claude_code episode, so
