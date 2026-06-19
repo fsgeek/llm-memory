@@ -33,6 +33,75 @@ def record_to_episode(record, source_file):
     }
 
 
+def _turn_text(content):
+    """Extract plain text from a message turn whose content is either a string or
+    a list of Anthropic content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def gateway_record_to_episode(record, seq, source_file):
+    """Transform one pichay gateway `request_metrics` event into an episode. The
+    exchange's `user_message` is the LAST user turn in `messages_full` (the prompt
+    this turn answered); `response` is `response_text` — the words pichay now
+    captures instead of dropping. Claude Code has no authored state, so state is
+    empty. Keyed by session+seq since there is no global cycle counter."""
+    session = record.get("session_id") or "unknown"
+    messages = record.get("messages_full") or []
+    user_message = ""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            user_message = _turn_text(m.get("content"))
+            break
+    return {
+        "_key": f"{session}-{seq:04d}",
+        "cycle": seq,
+        "session_id": session,
+        "ts": record.get("timestamp"),
+        "model": record.get("model"),
+        "experiment_label": "claude_code",
+        "source_file": source_file,
+        "user_message": user_message,
+        "response": record.get("response_text", "") or "",
+        "state": {},
+        "state_text": "",
+        "activity_log": [],
+        "messages_full": messages,
+    }
+
+
+def ingest_gateway_file(db, path):
+    """Load a pichay gateway log (jsonl of telemetry events) into the episodes
+    collection. Only `request_metrics` events become episodes, sequenced per
+    session. Idempotent per (session, seq). Returns the number ingested."""
+    col = db.collection(EPISODES)
+    source = str(path)
+    seq_by_session = {}
+    count = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("type") != "request_metrics":
+                continue
+            session = rec.get("session_id") or "unknown"
+            seq = seq_by_session.get(session, 0)
+            seq_by_session[session] = seq + 1
+            episode = gateway_record_to_episode(rec, seq=seq, source_file=source)
+            col.insert(episode, overwrite=True)
+            count += 1
+    return count
+
+
 def ingest_file(db, path):
     """Load a taste_open jsonl into the episodes collection. Idempotent per cycle
     (overwrite by _key). Returns the number of records ingested."""
