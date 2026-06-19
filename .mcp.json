@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "llm-memory": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/tony/projects/llm-memory",
+        "python",
+        "-m",
+        "llm_memory.mcp_server"
+      ]
+    }
+  }
+}
