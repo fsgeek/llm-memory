@@ -77,6 +77,71 @@ def gateway_record_to_episode(record, seq, source_file):
     }
 
 
+def claude_session_to_episodes(path, experiment_label):
+    """Yield one episode per assistant turn in a Claude Code project JSONL.
+
+    Each line is one event; `type` is `user`/`assistant`/etc. An episode pairs an
+    assistant turn (`response`) with the most recent preceding user turn
+    (`user_message`), mirroring the gateway mapper. Claude Code has no authored
+    state, so state is empty. Keyed by session+assistant-uuid (stable across
+    re-ingest). `experiment_label` is caller-supplied so a project's construction
+    history partitions distinctly from pichay-captured `claude_code` traffic."""
+    session = "unknown"
+    last_user = ""
+    last_user_ts = None
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rtype = rec.get("type")
+            msg = rec.get("message")
+            if not isinstance(msg, dict):
+                continue
+            session = rec.get("sessionId") or session
+            if rtype == "user":
+                last_user = _turn_text(msg.get("content"))
+                last_user_ts = rec.get("timestamp")
+                continue
+            if rtype != "assistant":
+                continue
+            response = _turn_text(msg.get("content"))
+            if not response.strip():
+                continue  # tool-use-only turn with no prose; skip
+            uuid = rec.get("uuid") or ""
+            yield {
+                "_key": f"{session}-{uuid}",
+                "session_id": session,
+                "ts": rec.get("timestamp"),
+                "model": msg.get("model"),
+                "experiment_label": experiment_label,
+                "source_file": str(path),
+                "user_message": last_user,
+                "user_ts": last_user_ts,
+                "response": response,
+                "state": {},
+                "state_text": "",
+                "activity_log": [],
+            }
+
+
+def ingest_claude_session(db, path, experiment_label, dry_run=False):
+    """Load one Claude Code project JSONL into the episodes collection. One
+    episode per prose assistant turn. Idempotent per (session, uuid). When
+    dry_run, counts what WOULD be inserted without writing. Returns the count."""
+    col = db.collection(EPISODES)
+    count = 0
+    for episode in claude_session_to_episodes(path, experiment_label):
+        if not dry_run:
+            col.insert(episode, overwrite=True)
+        count += 1
+    return count
+
+
 def ingest_gateway_file(db, path):
     """Load a pichay gateway log (jsonl of telemetry events) into the episodes
     collection. Only `request_metrics` events become episodes, sequenced per
