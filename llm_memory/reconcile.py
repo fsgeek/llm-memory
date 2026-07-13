@@ -234,6 +234,8 @@ def _begin_build(
             "build_generation_id": uuid4().hex,
             "build_mode": mode,
             "build_reason": reason,
+            "build_canonicalization_version": enrollment.canonicalization_version,
+            "build_boundary_version": enrollment.boundary_version,
             "build_cursor": {"byte_offset": offset, "adapter_state": adapter_state},
             "build_seeded": False,
             "freshness": FreshnessStanding.STALE.value if state.get("active_generation_id") else FreshnessStanding.INCOMPLETE.value,
@@ -244,20 +246,23 @@ def _begin_build(
 def _record_supersessions(
     db,
     enrollment: SourceEnrollment,
-    member: SourceMember,
+    member_id: str,
     old_documents: tuple[dict, ...],
     new_documents: tuple[dict, ...],
     reason: str,
     detected_at: datetime,
 ) -> None:
-    old_by_event = {
-        EpisodeReference.parse(document["episode_ref"]).event_token: document["episode_ref"]
-        for document in old_documents
-    }
+    old_by_event = {}
+    for document in old_documents:
+        reference = EpisodeReference.parse(document["episode_ref"])
+        old_by_event[(reference.native_session_id, reference.event_token)] = document[
+            "episode_ref"
+        ]
     for document in new_documents:
         new_ref = document["episode_ref"]
-        event_token = EpisodeReference.parse(new_ref).event_token
-        old_ref = old_by_event.get(event_token)
+        reference = EpisodeReference.parse(new_ref)
+        event_token = reference.event_token
+        old_ref = old_by_event.get((reference.native_session_id, event_token))
         if not old_ref or old_ref == new_ref:
             continue
         key = hashlib.sha256(f"{old_ref}\0{new_ref}".encode()).hexdigest()
@@ -266,7 +271,7 @@ def _record_supersessions(
                 "_key": key,
                 "corpus_id": enrollment.corpus_id,
                 "source_id": enrollment.source_id,
-                "member_id": member.member_id,
+                "member_id": member_id,
                 "event_token": event_token,
                 "old_ref": old_ref,
                 "new_ref": new_ref,
@@ -277,11 +282,55 @@ def _record_supersessions(
         )
 
 
+def _finalize_supersessions(
+    db,
+    enrollment: SourceEnrollment,
+    state: dict,
+) -> None:
+    pending = state.get("supersession_finalization")
+    if not pending:
+        return
+    old_generation = pending["old_generation_id"]
+    new_generation = pending["new_generation_id"]
+    if state.get("active_generation_id") != new_generation:
+        return
+    old_documents = _generation_documents(db, state, old_generation)
+    new_documents = _generation_documents(db, state, new_generation)
+    _record_supersessions(
+        db,
+        enrollment,
+        state["member_id"],
+        old_documents,
+        new_documents,
+        pending["reason"],
+        _parse_timestamp(pending["detected_at"]),
+    )
+    delete_generation(
+        db,
+        enrollment.corpus_id,
+        enrollment.source_id,
+        state["member_id"],
+        old_generation,
+    )
+    _patch_state(
+        db,
+        enrollment,
+        state["member_id"],
+        {"supersession_finalization": None},
+    )
+
+
 def _tail_needed(enrollment: SourceEnrollment, member: SourceMember, state: dict | None) -> tuple[bool, str]:
-    if not state or not state.get("active_generation_id"):
-        return True, state.get("build_reason", "initial") if state else "initial"
-    if state.get("build_generation_id"):
+    if state and state.get("build_generation_id"):
+        if (
+            state.get("build_canonicalization_version")
+            != enrollment.canonicalization_version
+            or state.get("build_boundary_version") != enrollment.boundary_version
+        ):
+            return True, "semantic_version"
         return True, state.get("build_reason", "initial")
+    if not state or not state.get("active_generation_id"):
+        return True, "initial"
     if (
         state.get("canonicalization_version") != enrollment.canonicalization_version
         or state.get("boundary_version") != enrollment.boundary_version
@@ -304,7 +353,14 @@ def _reconcile_tail(
     needed, reason = _tail_needed(enrollment, member, state)
     if not needed or budget.exhausted:
         return
-    if not state or not state.get("build_generation_id") or state.get("build_reason") != reason:
+    if (
+        not state
+        or not state.get("build_generation_id")
+        or state.get("build_reason") != reason
+        or state.get("build_canonicalization_version")
+        != enrollment.canonicalization_version
+        or state.get("build_boundary_version") != enrollment.boundary_version
+    ):
         state = _begin_build(db, enrollment, member, state, reason)
 
     generation_id = state["build_generation_id"]
@@ -348,7 +404,20 @@ def _reconcile_tail(
         return
 
     old_generation = state.get("active_generation_id")
-    old_documents = _generation_documents(db, state, old_generation)
+    pending_finalization = None
+    if old_generation and old_generation != generation_id:
+        pending_finalization = {
+            "old_generation_id": old_generation,
+            "new_generation_id": generation_id,
+            "reason": reason,
+            "detected_at": _timestamp(budget.now),
+        }
+        _patch_state(
+            db,
+            enrollment,
+            member.member_id,
+            {"supersession_finalization": pending_finalization},
+        )
     activation_state = {
         "implementation_version": adapter.implementation_version,
         "observed_end": chunk.observed_end,
@@ -361,9 +430,12 @@ def _reconcile_tail(
         "build_generation_id": None,
         "build_mode": None,
         "build_reason": None,
+        "build_canonicalization_version": None,
+        "build_boundary_version": None,
         "build_cursor": None,
         "build_seeded": None,
         "validated_at": None,
+        "supersession_finalization": pending_finalization,
         "integrity_audit": {
             "offset": 0,
             "cursor": {"byte_offset": 0, "adapter_state": {}},
@@ -372,30 +444,18 @@ def _reconcile_tail(
             "start_mtime_ns": 0,
             "start_observed_end": 0,
             "restart_count": 0,
+            "episode_count": 0,
             "bytes_read": 0,
             "elapsed_ms": 0.0,
         },
     }
     activate_generation(db, enrollment, member, generation_id, activation_state)
     new_state = _member_state(db, enrollment, member.member_id)
-    new_documents = _generation_documents(db, new_state)
-    _record_supersessions(
-        db,
-        enrollment,
-        member,
-        old_documents,
-        new_documents,
-        reason,
-        budget.now,
-    )
-    if old_generation and old_generation != generation_id:
-        delete_generation(db, enrollment.corpus_id, enrollment.source_id, member.member_id, old_generation)
+    _finalize_supersessions(db, enrollment, new_state)
 
 
 def _audit_due(enrollment: SourceEnrollment, member: SourceMember, state: dict | None, now: datetime) -> bool:
     if not state or not state.get("active_generation_id") or state.get("build_generation_id"):
-        return False
-    if state.get("source_standing") != SourceStanding.AVAILABLE.value:
         return False
     if state.get("complete_end") != state.get("observed_end"):
         return False
@@ -416,6 +476,7 @@ def _restart_audit(state: dict, member_generation: dict | None) -> dict:
         "start_mtime_ns": member_generation["mtime_ns"] if member_generation else 0,
         "start_observed_end": member_generation["size"] if member_generation else 0,
         "restart_count": previous.get("restart_count", 0) + (1 if previous.get("offset") else 0),
+        "episode_count": 0,
         "bytes_read": previous.get("bytes_read", 0),
         "elapsed_ms": previous.get("elapsed_ms", 0.0),
     }
@@ -473,9 +534,44 @@ def _reconcile_audit(
         "offset": chunk.next_cursor.byte_offset,
         "cursor": _cursor_dict(chunk.next_cursor),
         "chain_digest": chain,
+        "episode_count": audit.get("episode_count", 0) + len(chunk.episodes),
         "bytes_read": audit.get("bytes_read", 0) + chunk.bytes_read,
         "elapsed_ms": audit.get("elapsed_ms", 0.0) + elapsed_ms,
     }
+    if (
+        chunk.source_standing is not SourceStanding.AVAILABLE
+        or chunk.error_position is not None
+    ):
+        freshness = (
+            FreshnessStanding.UNAVAILABLE.value
+            if chunk.source_standing
+            in {SourceStanding.MISSING, SourceStanding.UNAVAILABLE}
+            else FreshnessStanding.UNKNOWN.value
+        )
+        _patch_state(
+            db,
+            enrollment,
+            member.member_id,
+            {
+                "integrity_audit": updated_audit,
+                "source_standing": chunk.source_standing.value,
+                "freshness": freshness,
+                "error_position": chunk.error_position,
+            },
+        )
+        return
+    if chunk.freshness is FreshnessStanding.INCOMPLETE and not chunk.exhausted:
+        _patch_state(
+            db,
+            enrollment,
+            member.member_id,
+            {
+                "integrity_audit": updated_audit,
+                "source_standing": chunk.source_standing.value,
+                "freshness": FreshnessStanding.INCOMPLETE.value,
+            },
+        )
+        return
     if mismatch:
         _patch_state(
             db,
@@ -507,6 +603,33 @@ def _reconcile_audit(
             enrollment,
             member.member_id,
             {"integrity_audit": restarted, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
+        )
+        return
+
+    expected_chain = ""
+    for document in active_documents:
+        expected_chain = extend_chain(expected_chain, document["episode_ref"])
+    if (
+        updated_audit["episode_count"] != len(active_documents)
+        or updated_audit["chain_digest"] != expected_chain
+    ):
+        _patch_state(
+            db,
+            enrollment,
+            member.member_id,
+            {
+                "integrity_audit": updated_audit,
+                "freshness": FreshnessStanding.STALE.value,
+                "build_generation_id": None,
+                "build_reason": "source_content",
+            },
+        )
+        _begin_build(
+            db,
+            enrollment,
+            member,
+            _member_state(db, enrollment, member.member_id),
+            "source_content",
         )
         return
 
@@ -638,6 +761,10 @@ def reconcile_registry(
     }
 
     for source in sources:
+        for state in _source_states(db, source):
+            _finalize_supersessions(db, source, state)
+
+    for source in sources:
         for member in discovered[(source.corpus_id, source.source_id)]:
             _reconcile_tail(db, source, member, budget)
 
@@ -684,6 +811,9 @@ def reconcile_member(
     budget: WorkBudget,
 ) -> dict:
     ensure_contract_index(db)
+    state = _member_state(db, enrollment, member.member_id)
+    if state:
+        _finalize_supersessions(db, enrollment, state)
     _reconcile_tail(db, enrollment, member, budget)
     _reconcile_audit(db, enrollment, member, budget)
     return _member_standing(_member_state(db, enrollment, member.member_id), member.member_id, budget.now)

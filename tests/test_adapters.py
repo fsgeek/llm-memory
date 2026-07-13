@@ -206,7 +206,7 @@ def test_claude_reuses_user_prose_for_repeated_assistants_and_skips_non_episodes
 
     result = scan(path, "claude_code_jsonl", source_id="claude-project")
 
-    assert result.member.member_id == "native/session?yes"
+    assert result.member.member_id.startswith("member-")
     assert len(result.episodes) == 2
     assert [episode.body.user_message for episode in result.episodes] == [
         "question",
@@ -358,7 +358,7 @@ def test_claude_member_without_any_native_session_is_visibly_malformed(tmp_path)
 
     result = adapter.scan(declared, member)
 
-    assert member.member_id.startswith("unresolved-")
+    assert member.member_id.startswith("member-")
     assert result.source_standing is SourceStanding.MALFORMED
     assert result.freshness is FreshnessStanding.UNKNOWN
     assert result.error_position == 0
@@ -381,7 +381,7 @@ def test_claude_native_session_may_begin_with_unresolved_prefix(tmp_path):
 
     result = scan(path, "claude_code_jsonl")
 
-    assert result.member.member_id == "unresolved-native"
+    assert result.member.member_id.startswith("member-")
     assert result.source_standing is SourceStanding.AVAILABLE
     assert len(result.episodes) == 1
     assert (
@@ -413,8 +413,7 @@ def test_claude_directory_members_are_sorted_and_unresolved_ids_are_operational(
     members = adapter.members(declared)
 
     assert [member.path.name for member in members] == ["a.jsonl", "b.jsonl"]
-    assert members[0].member_id.startswith("unresolved-")
-    assert members[1].member_id == "session-b"
+    assert all(member.member_id.startswith("member-") for member in members)
     malformed = adapter.scan(declared, members[0])
     assert malformed.source_standing is SourceStanding.MALFORMED
     assert malformed.error_position == 0
@@ -423,7 +422,7 @@ def test_claude_directory_members_are_sorted_and_unresolved_ids_are_operational(
         member.member_id not in episode.identity.episode_ref
         for member in members
         for episode in adapter.scan(declared, member).episodes
-        if member.member_id.startswith("unresolved-")
+        if member.member_id.startswith("member-")
     )
 
 
@@ -526,3 +525,55 @@ def test_chunk_scan_declares_single_record_overshoot_and_stops_before_next(tmp_p
     assert len(chunk.episodes) == 1
     assert chunk.exhausted is True
     assert chunk.complete_end == first_line_end
+
+
+def test_blank_complete_line_advances_chunk_cursor(tmp_path):
+    path = tmp_path / "blank.jsonl"
+    record = json.dumps(
+        {"cycle": 1, "user_message": "after blank", "response_text": "answer"}
+    ).encode() + b"\n"
+    path.write_bytes(b"\n" + record)
+    declared = enrollment("taste_open_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    blank = adapter.scan_chunk(declared, member, None, 1)
+    episode = adapter.scan_chunk(declared, member, blank.next_cursor, len(record))
+
+    assert blank.bytes_read == 1
+    assert blank.next_cursor.byte_offset == 1
+    assert blank.exhausted is True
+    assert len(episode.episodes) == 1
+
+
+def test_claude_member_discovery_uses_relative_name_without_reading_source(tmp_path, monkeypatch):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = first_root / "session.jsonl"
+    second = second_root / "session.jsonl"
+    write_jsonl(first, [
+        {
+            "type": "assistant",
+            "sessionId": "native-a",
+            "uuid": "answer-a",
+            "message": {"content": "answer"},
+        }
+    ])
+    second.write_bytes(first.read_bytes())
+    adapter = get_adapter("claude_code_jsonl")
+    original_open = Path.open
+
+    def forbidden_open(self, *args, **kwargs):
+        if self in {first, second}:
+            raise AssertionError("member discovery read source contents")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+
+    first_member = adapter.members(enrollment("claude_code_jsonl", first_root))[0]
+    second_member = adapter.members(enrollment("claude_code_jsonl", second_root))[0]
+
+    assert first_member.member_id == second_member.member_id
+    assert first_member.member_id.startswith("member-")

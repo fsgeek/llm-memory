@@ -215,6 +215,7 @@ def _scan_lines_chunk(
                 break
             complete_end = end
             if not line.strip():
+                next_offset = end
                 continue
             try:
                 decoded = json.loads(line.decode("utf-8"))
@@ -393,28 +394,9 @@ class GatewayAdapter:
         return _scan_lines_chunk(member, cursor, max_bytes, handle, state)
 
 
-def _unresolved_member_id(relative_name: str) -> str:
+def _operational_member_id(relative_name: str) -> str:
     digest = hashlib.sha256(relative_name.encode("utf-8")).hexdigest()
-    return f"unresolved-{digest}"
-
-
-def _claude_member_id(path: Path, relative_name: str) -> str:
-    try:
-        with path.open("rb") as source:
-            for line in source:
-                if not line.endswith(b"\n"):
-                    break
-                try:
-                    record = json.loads(line.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if isinstance(record, dict):
-                    session = record.get("sessionId")
-                    if isinstance(session, str) and session:
-                        return session
-    except OSError:
-        pass
-    return _unresolved_member_id(relative_name)
+    return f"member-{digest}"
 
 
 @dataclass(frozen=True)
@@ -428,14 +410,14 @@ class ClaudeCodeAdapter:
             paths = sorted(locator.glob("*.jsonl"))
             return tuple(
                 SourceMember(
-                    _claude_member_id(path, path.relative_to(locator).as_posix()),
+                    _operational_member_id(path.relative_to(locator).as_posix()),
                     path,
                 )
                 for path in paths
             )
         return (
             SourceMember(
-                _claude_member_id(locator, locator.name),
+                _operational_member_id(locator.name),
                 locator,
             ),
         )

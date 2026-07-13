@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -249,6 +250,62 @@ def test_generation_can_be_staged_across_bounded_writes(contract_storage):
 
     state = active_states(db, (corpus_id,))[0]
     assert state["episode_count"] == 2
+
+
+def test_generation_writes_are_idempotent_and_count_stored_documents(contract_storage):
+    db, corpus_id, _ = contract_storage
+    enrollment = _enrollment(corpus_id)
+    member = SourceMember("member-a", Path("/unused"))
+    episode = _episode(enrollment)
+
+    write_generation(db, enrollment, member, "retryable", [episode])
+    write_generation(db, enrollment, member, "retryable", [episode])
+    activate_generation(db, enrollment, member, "retryable", _state())
+
+    assert active_states(db, (corpus_id,))[0]["episode_count"] == 1
+
+
+def test_generation_retry_rejects_conflicting_deterministic_document(contract_storage):
+    db, corpus_id, _ = contract_storage
+    enrollment = _enrollment(corpus_id)
+    member = SourceMember("member-a", Path("/unused"))
+    episode = _episode(enrollment)
+    conflicting = replace(
+        episode,
+        body=replace(episode.body, response="conflicting stored body"),
+    )
+    write_generation(db, enrollment, member, "retryable", [episode])
+
+    with pytest.raises(ValueError, match="conflicting generation document"):
+        write_generation(db, enrollment, member, "retryable", [conflicting])
+
+
+def test_staging_versions_are_distinct_from_active_versions(contract_storage):
+    db, corpus_id, _ = contract_storage
+    original = _enrollment(corpus_id)
+    changed = replace(original, canonicalization_version=5, boundary_version=6)
+    member = SourceMember("member-a", Path("/unused"))
+    write_generation(db, original, member, "active", [_episode(original)])
+    activate_generation(db, original, member, "active", _state())
+
+    write_generation(db, changed, member, "staging", [_episode(changed)])
+    state = active_states(db, (corpus_id,))[0]
+
+    assert state["canonicalization_version"] == 4
+    assert state["boundary_version"] == 3
+    assert state["staging_canonicalization_version"] == 5
+    assert state["staging_boundary_version"] == 6
+
+
+def test_same_staging_generation_rejects_semantic_version_conflict(contract_storage):
+    db, corpus_id, _ = contract_storage
+    original = _enrollment(corpus_id)
+    changed = replace(original, canonicalization_version=5)
+    member = SourceMember("member-a", Path("/unused"))
+    write_generation(db, original, member, "staging", [_episode(original)])
+
+    with pytest.raises(ValueError, match="staging generation semantic versions conflict"):
+        write_generation(db, changed, member, "staging", [_episode(changed)])
 
 
 def test_active_states_filters_corpora_and_generation_deletion_is_scoped(

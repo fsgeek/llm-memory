@@ -92,34 +92,64 @@ def write_generation(
     generation_id: str,
     episodes: Iterable[EpisodeRecord],
 ) -> int:
+    state_key = _source_state_key(
+        enrollment.corpus_id, enrollment.source_id, member.member_id
+    )
+    current_state = db.collection(SOURCE_STATES).get(state_key)
+    if (
+        current_state
+        and current_state.get("staging_generation_id") == generation_id
+        and (
+            current_state.get("staging_canonicalization_version")
+            != enrollment.canonicalization_version
+            or current_state.get("staging_boundary_version")
+            != enrollment.boundary_version
+        )
+    ):
+        raise ValueError("staging generation semantic versions conflict")
+
     collection = db.collection(CONTRACT_EPISODES)
     documents = [
         _episode_document(enrollment, member, generation_id, episode)
         for episode in episodes
     ]
     for document in documents:
-        collection.insert(document)
+        existing = collection.get(document["_key"])
+        if existing is None:
+            collection.insert(document)
+            continue
+        stored = {
+            key: value
+            for key, value in existing.items()
+            if key not in {"_id", "_rev"}
+        }
+        if stored != document:
+            raise ValueError(
+                f"conflicting generation document {document['_key']!r}"
+            )
 
-    state_key = _source_state_key(
-        enrollment.corpus_id, enrollment.source_id, member.member_id
-    )
     db.aql.execute(
         """
+        LET staged_count = LENGTH(
+            FOR episode IN @@episodes
+                FILTER episode.corpus_id == @corpus_id
+                FILTER episode.source_id == @source_id
+                FILTER episode.member_id == @member_id
+                FILTER episode.generation_id == @generation_id
+                RETURN 1
+        )
         UPSERT { _key: @key }
-            INSERT @identity
+            INSERT MERGE(@identity, { staging_episode_count: staged_count })
             UPDATE {
                 staging_generation_id: @generation_id,
-                staging_episode_count: (
-                    OLD.staging_generation_id == @generation_id
-                    ? OLD.staging_episode_count + @episode_count
-                    : @episode_count
-                ),
-                canonicalization_version: @canonicalization_version,
-                boundary_version: @boundary_version
+                staging_episode_count: staged_count,
+                staging_canonicalization_version: @canonicalization_version,
+                staging_boundary_version: @boundary_version
             }
             IN @@states
         """,
         bind_vars={
+            "@episodes": CONTRACT_EPISODES,
             "@states": SOURCE_STATES,
             "key": state_key,
             "identity": {
@@ -129,12 +159,16 @@ def write_generation(
                 "member_id": member.member_id,
                 "active_generation_id": None,
                 "staging_generation_id": generation_id,
-                "staging_episode_count": len(documents),
-                "canonicalization_version": enrollment.canonicalization_version,
-                "boundary_version": enrollment.boundary_version,
+                "staging_episode_count": None,
+                "canonicalization_version": None,
+                "boundary_version": None,
+                "staging_canonicalization_version": enrollment.canonicalization_version,
+                "staging_boundary_version": enrollment.boundary_version,
             },
             "generation_id": generation_id,
-            "episode_count": len(documents),
+            "corpus_id": enrollment.corpus_id,
+            "source_id": enrollment.source_id,
+            "member_id": member.member_id,
             "canonicalization_version": enrollment.canonicalization_version,
             "boundary_version": enrollment.boundary_version,
         },
@@ -159,6 +193,8 @@ def activate_generation(
         "member_id": member.member_id,
         "active_generation_id": generation_id,
         "staging_generation_id": None,
+        "staging_canonicalization_version": None,
+        "staging_boundary_version": None,
         "canonicalization_version": enrollment.canonicalization_version,
         "boundary_version": enrollment.boundary_version,
     }

@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 import llm_memory.adapters as adapters_module
+import llm_memory.reconcile as reconcile_module
 from llm_memory.contract import EpisodeReference
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
@@ -128,6 +129,24 @@ def active_documents(db, corpus_id: str) -> list[dict]:
     return [doc for doc in documents(db, corpus_id) if doc["generation_id"] in active]
 
 
+def source_state(db, corpus_id: str, source_id: str = "taste") -> dict:
+    return list(
+        db.aql.execute(
+            """
+            FOR state IN @@states
+                FILTER state.corpus_id == @corpus_id
+                FILTER state.source_id == @source_id
+                RETURN state
+            """,
+            bind_vars={
+                "@states": SOURCE_STATES,
+                "corpus_id": corpus_id,
+                "source_id": source_id,
+            },
+        )
+    )[0]
+
+
 def test_work_budget_validation_and_initial_build_reaches_current(reconciliation_storage, tmp_path):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "taste.jsonl"
@@ -216,10 +235,10 @@ def test_source_sets_and_multiple_declarations_keep_independent_standing(reconci
     corpus = report.corpus_standing[0]
     assert [source["source_id"] for source in corpus["sources"]] == ["claude", "gateway"]
     claude_members = corpus["sources"][0]["members"]
-    assert [(m["member_id"], m["indexed_through"]["value"]) for m in claude_members] == [
-        ("session-a", len(first_data)),
-        ("session-b", len(second_data)),
-    ]
+    assert sorted(m["indexed_through"]["value"] for m in claude_members) == sorted(
+        [len(first_data), len(second_data)]
+    )
+    assert len({member["member_id"] for member in claude_members}) == 2
 
 
 def test_relocation_preserves_references_and_bounded_work_resumes(reconciliation_storage, tmp_path):
@@ -390,12 +409,248 @@ def test_vanished_source_set_member_remains_visible(reconciliation_storage, tmp_
     path = directory / "session.jsonl"
     write_jsonl(path, [claude("session-a", "answer", "present")])
     source = enrollment(corpus_id, "claude", "claude_code_jsonl", directory)
-    run(db, source)
+    initial = run(db, source)
+    member_id = members(initial)[0]["member_id"]
 
     path.unlink()
     report = run(db, source)
 
     member = members(report)[0]
-    assert member["member_id"] == "session-a"
+    assert member["member_id"] == member_id
     assert member["source_standing"] in {"missing", "unavailable"}
     assert len(active_documents(db, corpus_id)) == 1
+
+
+@pytest.mark.parametrize("failure", ["truncated", "missing", "malformed"])
+def test_invalid_source_cannot_recertify_stale_active_generation(
+    reconciliation_storage, tmp_path, failure
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "invalid-audit.jsonl"
+    first = json.dumps(taste(1, "one", "aaa")).encode() + b"\n"
+    second = json.dumps(taste(2, "two", "bbb")).encode() + b"\n"
+    path.write_bytes(first + second)
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path, max_age=10)
+    run(db, source)
+
+    if failure == "truncated":
+        path.write_bytes(first)
+    elif failure == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"{broken}\n")
+    report = run(db, source, now=NOW + timedelta(seconds=11))
+
+    assert members(report)[0]["freshness"] != "current"
+
+    path.write_bytes(first + second)
+    recovered = run(db, source, now=NOW + timedelta(seconds=11))
+    assert members(recovered)[0]["freshness"] == "current"
+
+
+def test_audit_completion_compares_full_active_chain_and_count(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "full-chain.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path, max_age=10)
+    run(db, source)
+    run(db, source, max_bytes=1, now=NOW + timedelta(seconds=11))
+    first_document = active_documents(db, corpus_id)[0]
+    db.collection(CONTRACT_EPISODES).delete(first_document["_key"])
+
+    completed = run(db, source, now=NOW + timedelta(seconds=11))
+
+    assert members(completed)[0]["freshness"] != "current"
+
+
+def test_semantic_version_change_restarts_in_progress_bounded_build(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "semantic-mid-build.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    first_version = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, first_version, max_bytes=1)
+    abandoned_generation = source_state(db, corpus_id)["staging_generation_id"]
+
+    second_version = replace(first_version, canonicalization_version=2)
+    report = run(db, second_version)
+
+    assert members(report)[0]["freshness"] == "current"
+    state = active_states(db, (corpus_id,))[0]
+    assert state["canonicalization_version"] == 2
+    assert state["active_generation_id"] != abandoned_generation
+    assert all(
+        document["generation_id"] != abandoned_generation
+        for document in documents(db, corpus_id)
+    )
+
+
+def test_retry_after_insert_before_staging_state_is_idempotent(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "insert-failure.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    collection_type = type(db.collection(CONTRACT_EPISODES))
+    original_insert = collection_type.insert
+    failed = False
+
+    def insert_then_fail(self, document, *args, **kwargs):
+        nonlocal failed
+        result = original_insert(self, document, *args, **kwargs)
+        if document.get("corpus_id") == corpus_id and not failed:
+            failed = True
+            raise RuntimeError("injected after insert")
+        return result
+
+    monkeypatch.setattr(collection_type, "insert", insert_then_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        run(db, source)
+    monkeypatch.setattr(collection_type, "insert", original_insert)
+
+    resumed = run(db, source)
+
+    assert members(resumed)[0]["freshness"] == "current"
+    assert len(active_documents(db, corpus_id)) == 1
+
+
+@pytest.mark.parametrize("boundary", ["seeded", "cursor"])
+def test_bounded_build_state_patch_retries_are_idempotent(
+    reconciliation_storage, tmp_path, monkeypatch, boundary
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / f"{boundary}.jsonl"
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    if boundary == "seeded":
+        write_jsonl(path, [taste(1, "one", "aaa")])
+        run(db, source)
+        with path.open("ab") as stream:
+            stream.write(json.dumps(taste(2, "two", "bbb")).encode() + b"\n")
+    else:
+        write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    original_patch = reconcile_module._patch_state
+    failed = False
+
+    def patch_then_fail(database, declared, member_id, values):
+        nonlocal failed
+        target = (
+            values.get("build_seeded") is True
+            if boundary == "seeded"
+            else "build_cursor" in values and "observed_end" in values
+        )
+        if target and not failed:
+            failed = True
+            raise RuntimeError(f"injected before {boundary} state patch")
+        return original_patch(database, declared, member_id, values)
+
+    monkeypatch.setattr(reconcile_module, "_patch_state", patch_then_fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        run(db, source, max_bytes=1)
+    monkeypatch.setattr(reconcile_module, "_patch_state", original_patch)
+
+    for _ in range(6):
+        resumed = run(db, source, max_bytes=1)
+        if members(resumed)[0]["freshness"] == "current":
+            break
+
+    assert members(resumed)[0]["freshness"] == "current"
+    assert len(active_documents(db, corpus_id)) == 2
+
+
+def test_supersession_finalization_resumes_after_activation_failure(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "supersession-resume.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    old_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    changed = replace(source, canonicalization_version=2)
+    original_finalize = reconcile_module._record_supersessions
+    failed = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected after activation")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(reconcile_module, "_record_supersessions", fail_once)
+    with pytest.raises(RuntimeError, match="injected"):
+        run(db, changed)
+    monkeypatch.setattr(reconcile_module, "_record_supersessions", original_finalize)
+
+    resumed = run(db, changed)
+    supersessions = list(
+        db.aql.execute(
+            "FOR doc IN @@collection FILTER doc.corpus_id == @corpus RETURN doc",
+            bind_vars={"@collection": SUPERSESSIONS, "corpus": corpus_id},
+        )
+    )
+
+    assert len(supersessions) == 1
+    assert all(
+        document["generation_id"] != old_generation
+        for document in documents(db, corpus_id)
+    )
+    assert source_state(db, corpus_id).get("supersession_finalization") is None
+
+
+def test_supersession_intent_does_not_finalize_before_activation(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "supersession-before-activation.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    changed = replace(source, boundary_version=2)
+
+    def fail_activation(*args, **kwargs):
+        raise RuntimeError("injected before activation")
+
+    monkeypatch.setattr(reconcile_module, "activate_generation", fail_activation)
+    with pytest.raises(RuntimeError, match="injected"):
+        run(db, changed)
+    with pytest.raises(RuntimeError, match="injected"):
+        run(db, changed)
+    supersessions = list(
+        db.aql.execute(
+            "FOR doc IN @@collection FILTER doc.corpus_id == @corpus RETURN doc",
+            bind_vars={"@collection": SUPERSESSIONS, "corpus": corpus_id},
+        )
+    )
+
+    assert supersessions == []
+
+
+def test_gateway_supersessions_match_native_session_and_event_token(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "gateway-sessions.jsonl"
+    write_jsonl(path, [gateway("session-a", "one", "aaa"), gateway("session-b", "two", "bbb")])
+    source = enrollment(corpus_id, "gateway", "gateway_jsonl", path)
+    run(db, source)
+
+    changed = replace(source, boundary_version=2)
+    run(db, changed)
+    supersessions = list(
+        db.aql.execute(
+            "FOR doc IN @@collection FILTER doc.corpus_id == @corpus RETURN doc",
+            bind_vars={"@collection": SUPERSESSIONS, "corpus": corpus_id},
+        )
+    )
+
+    assert len(supersessions) == 2
+    assert all(
+        EpisodeReference.parse(document["old_ref"]).native_session_id
+        == EpisodeReference.parse(document["new_ref"]).native_session_id
+        for document in supersessions
+    )
