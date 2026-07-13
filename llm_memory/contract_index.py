@@ -22,6 +22,12 @@ class GenerationStateConflict(ValueError):
     pass
 
 
+class GenerationDocumentConflict(ValueError):
+    def __init__(self, document: dict[str, Any]):
+        self.error_position = document["source_position"]["start"]
+        super().__init__(f"conflicting generation document {document['_key']!r}")
+
+
 def _view_properties() -> dict[str, Any]:
     return {
         "links": {
@@ -130,9 +136,7 @@ def write_generation(
             if key not in {"_id", "_rev"}
         }
         if stored != document:
-            raise ValueError(
-                f"conflicting generation document {document['_key']!r}"
-            )
+            raise GenerationDocumentConflict(document)
 
     bind_vars = {
         "@episodes": CONTRACT_EPISODES,

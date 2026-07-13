@@ -24,6 +24,7 @@ from llm_memory.contract import (
 )
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
+    GenerationDocumentConflict,
     GenerationStateConflict,
     SOURCE_STATES,
     SUPERSESSIONS,
@@ -527,7 +528,7 @@ def _reconcile_tail(
                 (_episode_from_document(document) for document in active),
                 expected_state=transition,
             )
-        except GenerationStateConflict:
+        except (GenerationDocumentConflict, GenerationStateConflict):
             return
         state = _member_state(db, enrollment, member.member_id)
         if not state or any(
@@ -572,6 +573,26 @@ def _reconcile_tail(
                 chunk.episodes,
                 expected_state=transition,
             )
+        except GenerationDocumentConflict as conflict:
+            current = _member_state(db, enrollment, member.member_id)
+            if _same_transition(current, transition):
+                try:
+                    _patch_state(
+                        db,
+                        enrollment,
+                        member.member_id,
+                        {
+                            "observed_end": chunk.observed_end,
+                            "source_standing": SourceStanding.MALFORMED.value,
+                            "freshness": FreshnessStanding.UNKNOWN.value,
+                            "error_position": conflict.error_position,
+                            "member_generation": _stat(member),
+                        },
+                        expected_state=current,
+                    )
+                except _StateConflict:
+                    pass
+            return
         except GenerationStateConflict:
             return
     state = _member_state(db, enrollment, member.member_id)
@@ -601,7 +622,16 @@ def _reconcile_tail(
                     FreshnessStanding.STALE.value
                     if state.get("active_generation_integrity") == "invalid"
                     and chunk.source_standing is SourceStanding.AVAILABLE
-                    else chunk.freshness.value
+                    else FreshnessStanding.INCOMPLETE.value
+                    if chunk.freshness is FreshnessStanding.INCOMPLETE
+                    or chunk.exhausted
+                    else FreshnessStanding.UNAVAILABLE.value
+                    if chunk.source_standing
+                    in {SourceStanding.MISSING, SourceStanding.UNAVAILABLE}
+                    else FreshnessStanding.UNKNOWN.value
+                    if chunk.source_standing is not SourceStanding.AVAILABLE
+                    or chunk.error_position is not None
+                    else FreshnessStanding.TAIL_VALIDATED.value
                 ),
                 "implementation_version": adapter.implementation_version,
             },
@@ -611,12 +641,15 @@ def _reconcile_tail(
         return
     if chunk.exhausted:
         return
-    if (
-        (
-            chunk.source_standing is not SourceStanding.AVAILABLE
-            or chunk.error_position is not None
-        )
-        and not state.get("staging_episode_count")
+    source_failed = (
+        chunk.source_standing is not SourceStanding.AVAILABLE
+        or chunk.error_position is not None
+        or chunk.freshness is FreshnessStanding.INCOMPLETE
+        or chunk.complete_end < chunk.observed_end
+    )
+    if source_failed and (
+        state.get("active_generation_id")
+        or not state.get("staging_episode_count")
     ):
         return
 
@@ -797,12 +830,23 @@ def _reconcile_audit(
         and len(active_documents) == state.get("episode_count")
     )
     expected = tuple(
-        document["episode_ref"]
+        (
+            document["episode_ref"],
+            document["source_position"]["start"],
+            document["source_position"]["end"],
+        )
         for document in active_documents
         if document["source_position"]["start"] >= audit.get("offset", 0)
         and document["source_position"]["end"] <= chunk.next_cursor.byte_offset
     )
-    actual = tuple(episode.identity.episode_ref for episode in chunk.episodes)
+    actual = tuple(
+        (
+            episode.identity.episode_ref,
+            episode.source_position["start"],
+            episode.source_position["end"],
+        )
+        for episode in chunk.episodes
+    )
     mismatch = (
         active_generation_backed and expected != actual
     ) or chunk.observed_end < target_end
@@ -846,6 +890,7 @@ def _reconcile_audit(
         chunk.freshness is FreshnessStanding.INCOMPLETE
         and not chunk.exhausted
         and not audit_complete
+        and not mismatch
     ):
         try:
             _patch_state(

@@ -279,6 +279,94 @@ def test_append_and_partial_or_malformed_tail_preserve_exact_position(reconcilia
     assert len(active_documents(db, prefix + "-bad")) == 1
 
 
+def test_duplicate_identical_tail_is_malformed_without_replacing_active_generation(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "duplicate.jsonl"
+    first = write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0][
+        "active_generation_id"
+    ]
+
+    with path.open("ab") as stream:
+        stream.write(first)
+    report = run(db, source)
+
+    member = members(report)[0]
+    assert member["source_standing"] == "malformed"
+    assert member["error_position"] == len(first)
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] == (
+        original_generation
+    )
+    assert len(active_documents(db, corpus_id)) == 1
+
+
+def test_activation_failure_never_leaves_tail_only_build_current(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "activation-window.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0][
+        "active_generation_id"
+    ]
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(2, "two", "reply")).encode() + b"\n")
+
+    def lose_activation(*args, **kwargs):
+        raise ValueError("injected activation conflict")
+
+    monkeypatch.setattr(reconcile_module, "activate_generation", lose_activation)
+    report = run(db, source)
+
+    assert members(report)[0]["freshness"] == "tail_validated"
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] == (
+        original_generation
+    )
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed"])
+def test_failed_replacement_build_preserves_complete_active_generation(
+    reconciliation_storage,
+    tmp_path,
+    enable_semantic_version,
+    failure,
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / f"replace-{failure}.jsonl"
+    first = json.dumps(taste(1, "one", "answer")).encode() + b"\n"
+    second = json.dumps(taste(2, "two", "reply")).encode() + b"\n"
+    path.write_bytes(first + second)
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0][
+        "active_generation_id"
+    ]
+    original_refs = [doc["episode_ref"] for doc in active_documents(db, corpus_id)]
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
+    replacement = replace(source, canonicalization_version=2)
+
+    run(db, replacement, max_bytes=len(first))
+    if failure == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(first + b"{broken}\n")
+    report = run(db, replacement)
+
+    assert members(report)[0]["source_standing"] == failure
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] == (
+        original_generation
+    )
+    assert [doc["episode_ref"] for doc in active_documents(db, corpus_id)] == (
+        original_refs
+    )
+
+
 def test_source_sets_and_multiple_declarations_keep_independent_standing(reconciliation_storage, tmp_path):
     db, corpus_id = reconciliation_storage
     directory = tmp_path / "claude"
@@ -428,6 +516,56 @@ def test_prefix_rewrite_activates_replacement_after_full_audit(reconciliation_st
     assert members(rebuilt)[0]["freshness"] == "current"
     assert active_states(db, (corpus_id,))[0]["active_generation_id"] != original_generation
     assert [doc["episode_ref"] for doc in active_documents(db, corpus_id)] != original_refs
+
+
+def test_mid_record_truncation_marks_active_generation_stale(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "truncated.jsonl"
+    original = write_jsonl(
+        path, [taste(1, "one", "answer"), taste(2, "two", "reply")]
+    )
+    source = enrollment(
+        corpus_id, "taste", "taste_open_jsonl", path, max_age=10
+    )
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0][
+        "active_generation_id"
+    ]
+    path.write_bytes(original[: len(original) // 2])
+
+    report = run(db, source, now=NOW + timedelta(seconds=11))
+
+    assert members(report)[0]["freshness"] == "stale"
+    state = source_state(db, corpus_id)
+    assert state["active_generation_id"] == original_generation
+    assert state["build_reason"] == "source_content"
+
+
+def test_content_equivalent_byte_shift_invalidates_stored_positions(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "shifted.jsonl"
+    original = write_jsonl(
+        path, [taste(1, "one", "answer"), taste(2, "two", "reply")]
+    )
+    source = enrollment(
+        corpus_id, "taste", "taste_open_jsonl", path, max_age=10
+    )
+    run(db, source)
+    original_refs = [doc["episode_ref"] for doc in active_documents(db, corpus_id)]
+    path.write_bytes(b"\n" + original)
+
+    report = run(db, source, now=NOW + timedelta(seconds=11))
+
+    assert members(report)[0]["freshness"] == "stale"
+    state = source_state(db, corpus_id)
+    assert [doc["episode_ref"] for doc in active_documents(db, corpus_id)] == (
+        original_refs
+    )
+    assert state["build_reason"] == "source_content"
 
 
 @pytest.mark.parametrize("version_field", ["canonicalization_version", "boundary_version"])
