@@ -3,11 +3,49 @@ import json
 from llm_memory.db import get_database
 from llm_memory.index import EPISODES, ensure_index
 from llm_memory.ingest import (
+    claude_session_to_episodes,
     gateway_record_to_episode,
     ingest_file,
     ingest_gateway_file,
     record_to_episode,
 )
+
+
+def test_claude_session_legacy_shape_is_preserved(tmp_path):
+    path = tmp_path / "session.jsonl"
+    records = [
+        {
+            "type": "user",
+            "sessionId": "session-legacy",
+            "timestamp": "2026-07-12T10:00:00Z",
+            "message": {"content": "question"},
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-legacy",
+            "uuid": "assistant-1",
+            "timestamp": "2026-07-12T10:00:01Z",
+            "message": {"model": "claude-test", "content": "answer"},
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records))
+
+    episode = list(claude_session_to_episodes(path, "project-history"))[0]
+
+    assert episode == {
+        "_key": "session-legacy-assistant-1",
+        "session_id": "session-legacy",
+        "ts": "2026-07-12T10:00:01Z",
+        "model": "claude-test",
+        "experiment_label": "project-history",
+        "source_file": str(path),
+        "user_message": "question",
+        "user_ts": "2026-07-12T10:00:00Z",
+        "response": "answer",
+        "state": {},
+        "state_text": "",
+        "activity_log": [],
+    }
 
 
 def test_record_to_episode_extracts_conversation_and_state():

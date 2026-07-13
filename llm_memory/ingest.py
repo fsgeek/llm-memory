@@ -1,5 +1,6 @@
 import json
 
+from llm_memory.adapters import turn_text
 from llm_memory.index import EPISODES
 from llm_memory.schema import flatten_state
 
@@ -36,15 +37,7 @@ def record_to_episode(record, source_file):
 def _turn_text(content):
     """Extract plain text from a message turn whose content is either a string or
     a list of Anthropic content blocks."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
-        )
-    return ""
+    return turn_text(content)
 
 
 def gateway_record_to_episode(record, seq, source_file):
