@@ -361,9 +361,12 @@ def search_history(
         report = reports[corpus_id]
         sources = [_public_source(source) for source in report["sources"]]
         index_available = all(
-            member["index_standing"] == "available"
+            source["source_set_standing"] == "available"
+            and all(
+                member["index_standing"] == "available"
+                for member in source["members"]
+            )
             for source in sources
-            for member in source["members"]
         )
         every_index_available = every_index_available and index_available
         corpus_standing.append(

@@ -391,6 +391,32 @@ def test_unavailable_member_index_keeps_hits_but_makes_population_unknown(monkey
     assert missing["members"][0]["index_standing"] == "unavailable"
 
 
+def test_missing_empty_source_set_does_not_become_exact_empty(
+    history_storage, tmp_path
+):
+    db, corpus_id = history_storage
+    registry = EnrollmentRegistry(
+        (
+            enrollment(
+                corpus_id,
+                "claude",
+                "claude_code_jsonl",
+                tmp_path / "missing-sessions",
+            ),
+        )
+    )
+
+    response = run_search(db, registry, request(corpus_id))
+
+    assert response["returned_count"] == 0
+    assert response["total_matches"] is None
+    assert response["total_standing"] == "unknown"
+    corpus = response["corpus_standing"][0]
+    assert corpus["indexed_matches"] is None
+    assert corpus["match_standing"] == "unknown"
+    assert corpus["sources"][0]["source_set_standing"] == "missing"
+
+
 def test_active_generations_are_limited_to_enabled_sources(monkeypatch):
     corpus_id = "corpus-a"
     enabled = enrollment(corpus_id, "enabled", "taste_open_jsonl", Path("/enabled"))
