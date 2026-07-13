@@ -28,6 +28,10 @@ from llm_memory.contract_index import (
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
 
 
+class _StateConflict(RuntimeError):
+    pass
+
+
 @dataclass
 class WorkBudget:
     max_bytes: int
@@ -91,7 +95,7 @@ def _source_states(db, enrollment: SourceEnrollment) -> tuple[dict, ...]:
                 FILTER state.corpus_id == @corpus_id
                 FILTER state.source_id == @source_id
                 SORT state.member_id
-                RETURN UNSET(state, "_id", "_rev")
+                RETURN UNSET(state, "_id")
             """,
             bind_vars={
                 "@states": SOURCE_STATES,
@@ -112,6 +116,8 @@ def _patch_state(
     enrollment: SourceEnrollment,
     member_id: str,
     values: dict[str, Any],
+    *,
+    expected_state: dict | None | object = ...,
 ) -> dict:
     key = _state_key(enrollment.corpus_id, enrollment.source_id, member_id)
     identity = {
@@ -122,23 +128,57 @@ def _patch_state(
         "active_generation_id": None,
         "staging_generation_id": None,
     }
-    return list(
-        db.aql.execute(
-            """
-            UPSERT { _key: @key }
-                INSERT MERGE(@identity, @values)
-                UPDATE @values
-                IN @@states
-                RETURN UNSET(NEW, "_id", "_rev")
-            """,
-            bind_vars={
-                "@states": SOURCE_STATES,
-                "key": key,
-                "identity": identity,
-                "values": values,
-            },
+    bind_vars = {
+        "@states": SOURCE_STATES,
+        "key": key,
+        "identity": identity,
+        "values": values,
+    }
+    if expected_state is ...:
+        query = """
+        UPSERT { _key: @key }
+            INSERT MERGE(@identity, @values)
+            UPDATE @values
+            IN @@states
+            RETURN UNSET(NEW, "_id")
+        """
+    elif expected_state is None:
+        query = """
+        LET existing = DOCUMENT(@@states, @key)
+        FILTER existing == null
+        INSERT MERGE(@identity, @values) IN @@states
+        RETURN UNSET(NEW, "_id")
+        """
+    else:
+        query = """
+        FOR current IN @@states
+            FILTER current._key == @key
+            FILTER current._rev == @expected_revision
+            FILTER current.active_generation_id == @expected_active_generation_id
+            FILTER current.build_generation_id == @expected_build_generation_id
+            FILTER current.build_cursor == @expected_build_cursor
+            UPDATE current WITH @values IN @@states
+            RETURN UNSET(NEW, "_id")
+        """
+        bind_vars.update(
+            {
+                "expected_revision": expected_state.get("_rev"),
+                "expected_active_generation_id": expected_state.get(
+                    "active_generation_id"
+                ),
+                "expected_build_generation_id": expected_state.get(
+                    "build_generation_id"
+                ),
+                "expected_build_cursor": expected_state.get("build_cursor"),
+            }
         )
-    )[0]
+        bind_vars.pop("identity")
+    updated = list(db.aql.execute(query, bind_vars=bind_vars))
+    if not updated:
+        raise _StateConflict(
+            f"source state changed for {enrollment.source_id}/{member_id}"
+        )
+    return updated[0]
 
 
 def _generation_documents(db, state: dict, generation_id: str | None = None) -> tuple[dict, ...]:
@@ -164,6 +204,25 @@ def _generation_documents(db, state: dict, generation_id: str | None = None) -> 
                 "generation_id": generation_id,
             },
         )
+    )
+
+
+def _active_generation_backed(db, state: dict | None) -> bool:
+    if not state or not state.get("active_generation_id"):
+        return False
+    expected = state.get("episode_count")
+    return expected is not None and len(_generation_documents(db, state)) == expected
+
+
+def _same_transition(current: dict | None, expected: dict) -> bool:
+    return bool(
+        current
+        and current.get("_rev") == expected.get("_rev")
+        and current.get("active_generation_id")
+        == expected.get("active_generation_id")
+        and current.get("build_generation_id")
+        == expected.get("build_generation_id")
+        and current.get("build_cursor") == expected.get("build_cursor")
     )
 
 
@@ -213,20 +272,13 @@ def _begin_build(
     state: dict | None,
     reason: str,
 ) -> dict:
+    expected_state = state
     state = state or {}
     old_staging = state.get("staging_generation_id")
-    if old_staging:
-        delete_generation(
-            db,
-            enrollment.corpus_id,
-            enrollment.source_id,
-            member.member_id,
-            old_staging,
-        )
     mode = "append" if reason == "append" and state.get("active_generation_id") else "replace"
     adapter_state = state.get("tail_cursor", {}).get("adapter_state", {}) if mode == "append" else {}
     offset = state.get("complete_end", 0) if mode == "append" else 0
-    return _patch_state(
+    updated = _patch_state(
         db,
         enrollment,
         member.member_id,
@@ -240,7 +292,17 @@ def _begin_build(
             "build_seeded": False,
             "freshness": FreshnessStanding.STALE.value if state.get("active_generation_id") else FreshnessStanding.INCOMPLETE.value,
         },
+        expected_state=expected_state,
     )
+    if old_staging:
+        delete_generation(
+            db,
+            enrollment.corpus_id,
+            enrollment.source_id,
+            member.member_id,
+            old_staging,
+        )
+    return updated
 
 
 def _record_supersessions(
@@ -312,12 +374,16 @@ def _finalize_supersessions(
         state["member_id"],
         old_generation,
     )
-    _patch_state(
-        db,
-        enrollment,
-        state["member_id"],
-        {"supersession_finalization": None},
-    )
+    try:
+        _patch_state(
+            db,
+            enrollment,
+            state["member_id"],
+            {"supersession_finalization": None},
+            expected_state=state,
+        )
+    except _StateConflict:
+        pass
 
 
 def _tail_needed(enrollment: SourceEnrollment, member: SourceMember, state: dict | None) -> tuple[bool, str]:
@@ -350,21 +416,36 @@ def _reconcile_tail(
 ) -> None:
     adapter = get_adapter(enrollment.adapter)
     state = _member_state(db, enrollment, member.member_id)
-    needed, reason = _tail_needed(enrollment, member, state)
+    if (
+        state
+        and state.get("implementation_compatibility") == "incompatible"
+        and state.get("canonicalization_version")
+        == enrollment.canonicalization_version
+        and state.get("boundary_version") == enrollment.boundary_version
+    ):
+        return
+    if state and state.get("active_generation_id") and not _active_generation_backed(db, state):
+        needed, reason = True, "derived_loss"
+    else:
+        needed, reason = _tail_needed(enrollment, member, state)
     if not needed or budget.exhausted:
         return
-    if (
-        not state
-        or not state.get("build_generation_id")
-        or state.get("build_reason") != reason
-        or state.get("build_canonicalization_version")
-        != enrollment.canonicalization_version
-        or state.get("build_boundary_version") != enrollment.boundary_version
-    ):
-        state = _begin_build(db, enrollment, member, state, reason)
+    try:
+        if (
+            not state
+            or not state.get("build_generation_id")
+            or state.get("build_reason") != reason
+            or state.get("build_canonicalization_version")
+            != enrollment.canonicalization_version
+            or state.get("build_boundary_version") != enrollment.boundary_version
+        ):
+            state = _begin_build(db, enrollment, member, state, reason)
+    except _StateConflict:
+        return
 
     generation_id = state["build_generation_id"]
     if state["build_mode"] == "append" and not state.get("build_seeded"):
+        transition = state
         active = _generation_documents(db, state)
         write_generation(
             db,
@@ -373,8 +454,28 @@ def _reconcile_tail(
             generation_id,
             (_episode_from_document(document) for document in active),
         )
-        state = _patch_state(db, enrollment, member.member_id, {"build_seeded": True})
+        state = _member_state(db, enrollment, member.member_id)
+        if not state or any(
+            state.get(field) != transition.get(field)
+            for field in (
+                "active_generation_id",
+                "build_generation_id",
+                "build_cursor",
+            )
+        ):
+            return
+        try:
+            state = _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {"build_seeded": True},
+                expected_state=state,
+            )
+        except _StateConflict:
+            return
 
+    transition = state
     chunk = adapter.scan_chunk(
         enrollment,
         member,
@@ -382,25 +483,52 @@ def _reconcile_tail(
         budget.remaining,
     )
     budget.charge(chunk.bytes_read)
+    if not _same_transition(
+        _member_state(db, enrollment, member.member_id), transition
+    ):
+        return
     if chunk.episodes or not state.get("staging_generation_id"):
         write_generation(db, enrollment, member, generation_id, chunk.episodes)
+    state = _member_state(db, enrollment, member.member_id)
+    if not state or any(
+        state.get(field) != transition.get(field)
+        for field in (
+            "active_generation_id",
+            "build_generation_id",
+            "build_cursor",
+        )
+    ):
+        return
     generation = _stat(member)
-    state = _patch_state(
-        db,
-        enrollment,
-        member.member_id,
-        {
-            "build_cursor": _cursor_dict(chunk.next_cursor),
-            "observed_end": chunk.observed_end,
-            "complete_end": chunk.complete_end,
-            "source_standing": chunk.source_standing.value,
-            "error_position": chunk.error_position,
-            "member_generation": generation,
-            "freshness": chunk.freshness.value,
-            "implementation_version": adapter.implementation_version,
-        },
-    )
+    try:
+        state = _patch_state(
+            db,
+            enrollment,
+            member.member_id,
+            {
+                "build_cursor": _cursor_dict(chunk.next_cursor),
+                "observed_end": chunk.observed_end,
+                "complete_end": chunk.complete_end,
+                "source_standing": chunk.source_standing.value,
+                "error_position": chunk.error_position,
+                "member_generation": generation,
+                "freshness": chunk.freshness.value,
+                "implementation_version": adapter.implementation_version,
+            },
+            expected_state=state,
+        )
+    except _StateConflict:
+        return
     if chunk.exhausted:
+        return
+    if (
+        not state.get("active_generation_id")
+        and (
+            chunk.source_standing is not SourceStanding.AVAILABLE
+            or chunk.error_position is not None
+        )
+        and not state.get("staging_episode_count")
+    ):
         return
 
     old_generation = state.get("active_generation_id")
@@ -412,12 +540,16 @@ def _reconcile_tail(
             "reason": reason,
             "detected_at": _timestamp(budget.now),
         }
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {"supersession_finalization": pending_finalization},
-        )
+        try:
+            state = _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {"supersession_finalization": pending_finalization},
+                expected_state=state,
+            )
+        except _StateConflict:
+            return
     activation_state = {
         "implementation_version": adapter.implementation_version,
         "observed_end": chunk.observed_end,
@@ -434,6 +566,8 @@ def _reconcile_tail(
         "build_boundary_version": None,
         "build_cursor": None,
         "build_seeded": None,
+        "implementation_compatibility": None,
+        "incompatible_implementation_version": None,
         "validated_at": None,
         "supersession_finalization": pending_finalization,
         "integrity_audit": {
@@ -449,7 +583,17 @@ def _reconcile_tail(
             "elapsed_ms": 0.0,
         },
     }
-    activate_generation(db, enrollment, member, generation_id, activation_state)
+    try:
+        activate_generation(
+            db,
+            enrollment,
+            member,
+            generation_id,
+            activation_state,
+            expected_state=state,
+        )
+    except ValueError:
+        return
     new_state = _member_state(db, enrollment, member.member_id)
     _finalize_supersessions(db, enrollment, new_state)
 
@@ -461,7 +605,13 @@ def _audit_due(enrollment: SourceEnrollment, member: SourceMember, state: dict |
         return False
     validated = _parse_timestamp(state.get("validated_at"))
     expired = validated is None or (now - validated).total_seconds() > enrollment.full_validation_max_age_seconds
-    adapter_changed = state.get("implementation_version") != get_adapter(enrollment.adapter).implementation_version
+    adapter_version = get_adapter(enrollment.adapter).implementation_version
+    if (
+        state.get("implementation_compatibility") == "incompatible"
+        and state.get("incompatible_implementation_version") == adapter_version
+    ):
+        return False
+    adapter_changed = state.get("implementation_version") != adapter_version
     generation_changed = _stat(member) != state.get("member_generation")
     return state.get("freshness") != FreshnessStanding.CURRENT.value or expired or adapter_changed or generation_changed
 
@@ -508,6 +658,9 @@ def _reconcile_audit(
 
     started = time.perf_counter()
     adapter = get_adapter(enrollment.adapter)
+    implementation_changed = (
+        state.get("implementation_version") != adapter.implementation_version
+    )
     chunk = adapter.scan_chunk(
         enrollment,
         member,
@@ -548,62 +701,101 @@ def _reconcile_audit(
             in {SourceStanding.MISSING, SourceStanding.UNAVAILABLE}
             else FreshnessStanding.UNKNOWN.value
         )
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {
-                "integrity_audit": updated_audit,
-                "source_standing": chunk.source_standing.value,
-                "freshness": freshness,
-                "error_position": chunk.error_position,
-            },
-        )
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "integrity_audit": updated_audit,
+                    "source_standing": chunk.source_standing.value,
+                    "freshness": freshness,
+                    "error_position": chunk.error_position,
+                },
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
         return
     if chunk.freshness is FreshnessStanding.INCOMPLETE and not chunk.exhausted:
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {
-                "integrity_audit": updated_audit,
-                "source_standing": chunk.source_standing.value,
-                "freshness": FreshnessStanding.INCOMPLETE.value,
-            },
-        )
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "integrity_audit": updated_audit,
+                    "source_standing": chunk.source_standing.value,
+                    "freshness": FreshnessStanding.INCOMPLETE.value,
+                },
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
         return
     if mismatch:
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {
-                "integrity_audit": updated_audit,
-                "freshness": FreshnessStanding.STALE.value,
-                "build_generation_id": None,
-                "build_reason": "source_content",
-            },
-        )
-        _begin_build(db, enrollment, member, _member_state(db, enrollment, member.member_id), "source_content")
+        if implementation_changed:
+            try:
+                _patch_state(
+                    db,
+                    enrollment,
+                    member.member_id,
+                    {
+                        "integrity_audit": updated_audit,
+                        "implementation_compatibility": "incompatible",
+                        "incompatible_implementation_version": (
+                            adapter.implementation_version
+                        ),
+                        "freshness": FreshnessStanding.UNKNOWN.value,
+                    },
+                    expected_state=state,
+                )
+            except _StateConflict:
+                pass
+            return
+        try:
+            updated = _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "integrity_audit": updated_audit,
+                    "freshness": FreshnessStanding.STALE.value,
+                    "build_generation_id": None,
+                    "build_reason": "source_content",
+                },
+                expected_state=state,
+            )
+            _begin_build(db, enrollment, member, updated, "source_content")
+        except _StateConflict:
+            pass
         return
 
     if chunk.exhausted:
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {"integrity_audit": updated_audit, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
-        )
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {"integrity_audit": updated_audit, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
         return
 
     if generation != _stat(member) or chunk.observed_end != updated_audit["start_observed_end"]:
         restarted = _restart_audit({"integrity_audit": updated_audit}, _stat(member))
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {"integrity_audit": restarted, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
-        )
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {"integrity_audit": restarted, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
         return
 
     expected_chain = ""
@@ -613,39 +805,62 @@ def _reconcile_audit(
         updated_audit["episode_count"] != len(active_documents)
         or updated_audit["chain_digest"] != expected_chain
     ):
+        if implementation_changed:
+            try:
+                _patch_state(
+                    db,
+                    enrollment,
+                    member.member_id,
+                    {
+                        "integrity_audit": updated_audit,
+                        "implementation_compatibility": "incompatible",
+                        "incompatible_implementation_version": (
+                            adapter.implementation_version
+                        ),
+                        "freshness": FreshnessStanding.UNKNOWN.value,
+                    },
+                    expected_state=state,
+                )
+            except _StateConflict:
+                pass
+            return
+        try:
+            updated = _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "integrity_audit": updated_audit,
+                    "freshness": FreshnessStanding.STALE.value,
+                    "build_generation_id": None,
+                    "build_reason": "source_content",
+                },
+                expected_state=state,
+            )
+            _begin_build(db, enrollment, member, updated, "source_content")
+        except _StateConflict:
+            pass
+        return
+
+    try:
         _patch_state(
             db,
             enrollment,
             member.member_id,
             {
                 "integrity_audit": updated_audit,
-                "freshness": FreshnessStanding.STALE.value,
-                "build_generation_id": None,
-                "build_reason": "source_content",
+                "validated_at": _timestamp(budget.now),
+                "member_generation": generation,
+                "implementation_version": adapter.implementation_version,
+                "implementation_compatibility": "compatible",
+                "incompatible_implementation_version": None,
+                "source_standing": chunk.source_standing.value,
+                "freshness": FreshnessStanding.CURRENT.value,
             },
+            expected_state=state,
         )
-        _begin_build(
-            db,
-            enrollment,
-            member,
-            _member_state(db, enrollment, member.member_id),
-            "source_content",
-        )
-        return
-
-    _patch_state(
-        db,
-        enrollment,
-        member.member_id,
-        {
-            "integrity_audit": updated_audit,
-            "validated_at": _timestamp(budget.now),
-            "member_generation": generation,
-            "implementation_version": adapter.implementation_version,
-            "source_standing": chunk.source_standing.value,
-            "freshness": FreshnessStanding.CURRENT.value,
-        },
-    )
+    except _StateConflict:
+        pass
 
 
 def _mark_due_audit(
@@ -662,18 +877,29 @@ def _mark_due_audit(
     ):
         audit = _restart_audit(state, _stat(member))
         audit["restart_count"] = 0
-        _patch_state(
-            db,
-            enrollment,
-            member.member_id,
-            {
-                "freshness": FreshnessStanding.TAIL_VALIDATED.value,
-                "integrity_audit": audit,
-            },
-        )
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "freshness": FreshnessStanding.TAIL_VALIDATED.value,
+                    "integrity_audit": audit,
+                },
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
 
 
-def _member_standing(state: dict | None, member_id: str, now: datetime, *, missing: bool = False) -> dict:
+def _member_standing(
+    db,
+    state: dict | None,
+    member_id: str,
+    now: datetime,
+    *,
+    missing: bool = False,
+) -> dict:
     state = state or {}
     validated = _parse_timestamp(state.get("validated_at"))
     age = max(0.0, (now - validated).total_seconds()) if validated else None
@@ -681,15 +907,28 @@ def _member_standing(state: dict | None, member_id: str, now: datetime, *, missi
         "integrity_audit",
         {"offset": 0, "chain_digest": "", "restart_count": 0, "bytes_read": 0, "elapsed_ms": 0.0},
     )
-    if state.get("active_generation_id"):
+    source_standing = (
+        SourceStanding.MISSING.value
+        if missing
+        else state.get("source_standing", SourceStanding.UNKNOWN.value)
+    )
+    incompatible = state.get("implementation_compatibility") == "incompatible"
+    if (
+        state.get("active_generation_id")
+        and _active_generation_backed(db, state)
+        and not incompatible
+    ):
         index_standing = "available"
-    elif state.get("staging_generation_id") or state.get("build_generation_id"):
+    elif (
+        source_standing == SourceStanding.AVAILABLE.value
+        and (state.get("staging_generation_id") or state.get("build_generation_id"))
+    ):
         index_standing = "rebuilding"
     else:
         index_standing = "unavailable"
     return {
         "member_id": member_id,
-        "source_standing": SourceStanding.MISSING.value if missing else state.get("source_standing", SourceStanding.UNKNOWN.value),
+        "source_standing": source_standing,
         "index_standing": index_standing,
         "freshness": FreshnessStanding.UNAVAILABLE.value if missing else state.get("freshness", FreshnessStanding.UNKNOWN.value),
         "indexed_through": {"kind": "byte_offset", "value": state.get("complete_end", 0)},
@@ -717,11 +956,11 @@ def _source_standing(
     states = {state["member_id"]: state for state in _source_states(db, enrollment)}
     live_ids = {member.member_id for member in live_members}
     member_reports = [
-        _member_standing(states.get(member.member_id), member.member_id, now)
+        _member_standing(db, states.get(member.member_id), member.member_id, now)
         for member in live_members
     ]
     member_reports.extend(
-        _member_standing(state, member_id, now, missing=True)
+        _member_standing(db, state, member_id, now, missing=True)
         for member_id, state in states.items()
         if member_id not in live_ids
     )
@@ -816,4 +1055,9 @@ def reconcile_member(
         _finalize_supersessions(db, enrollment, state)
     _reconcile_tail(db, enrollment, member, budget)
     _reconcile_audit(db, enrollment, member, budget)
-    return _member_standing(_member_state(db, enrollment, member.member_id), member.member_id, budget.now)
+    return _member_standing(
+        db,
+        _member_state(db, enrollment, member.member_id),
+        member.member_id,
+        budget.now,
+    )

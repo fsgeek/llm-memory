@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from llm_memory.contract import CONTRACT_VERSION
+from llm_memory.contract import CONTRACT_VERSION, validate_corpus_id
 
 
 DEFAULT_SOURCES_PATH = Path(__file__).resolve().parent.parent / "config" / "sources.yaml"
@@ -52,7 +52,7 @@ class SourceEnrollment:
     full_validation_max_age_seconds: int
 
     def __post_init__(self) -> None:
-        _require_identifier("corpus_id", self.corpus_id)
+        validate_corpus_id(self.corpus_id)
         _require_identifier("source_id", self.source_id)
         if not isinstance(self.adapter, str) or self.adapter not in _SUPPORTED_ADAPTERS:
             raise ValueError(f"unsupported adapter: {self.adapter!r}")

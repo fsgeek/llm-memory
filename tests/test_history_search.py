@@ -22,6 +22,7 @@ from llm_memory.contract_index import (
 from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
 from llm_memory.history import provider_capabilities, search_history
+from llm_memory.lifecycle import purge_derived
 from llm_memory.reconcile import ReconcileReport, WorkBudget
 
 
@@ -563,3 +564,24 @@ def test_search_reconciles_before_its_population_query(history_storage, tmp_path
 
     assert response["returned_count"] == 1
     assert len(active_states(db, (corpus_id,))) == 1
+
+
+def test_episode_only_purge_rebuilds_before_reporting_exact_population(
+    history_storage, tmp_path
+):
+    db, corpus_id = history_storage
+    path = tmp_path / "purged-episodes.jsonl"
+    write_jsonl(path, [taste(1, "heliotrope marker survives derived purge")])
+    registry = EnrollmentRegistry(
+        (enrollment(corpus_id, "taste", "taste_open_jsonl", path),)
+    )
+    assert run_search(db, registry, request(corpus_id))["total_matches"] == 1
+    assert purge_derived(
+        db, corpus_id, classes=frozenset({"episodes"})
+    ) == {"episodes": 1}
+
+    rebuilt = run_search(db, registry, request(corpus_id))
+
+    assert rebuilt["total_matches"] == 1
+    assert rebuilt["total_standing"] == "exact"
+    assert rebuilt["corpus_standing"][0]["match_standing"] == "exact"

@@ -10,13 +10,15 @@ import pytest
 
 import llm_memory.adapters as adapters_module
 import llm_memory.reconcile as reconcile_module
-from llm_memory.contract import EpisodeReference
+from llm_memory.contract import EpisodeReference, build_identity
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
     SOURCE_STATES,
     SUPERSESSIONS,
     active_states,
+    activate_generation,
     ensure_contract_index,
+    write_generation,
 )
 from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
@@ -145,6 +147,65 @@ def source_state(db, corpus_id: str, source_id: str = "taste") -> dict:
             },
         )
     )[0]
+
+
+class ChangedOutputAdapter:
+    def __init__(self, delegate, implementation_version: str, on_chunk=None):
+        self.delegate = delegate
+        self.name = delegate.name
+        self.implementation_version = implementation_version
+        self.on_chunk = on_chunk
+
+    def members(self, declared):
+        return self.delegate.members(declared)
+
+    def scan(self, declared, member):
+        return self.delegate.scan(declared, member)
+
+    def scan_chunk(self, declared, member, cursor, max_bytes):
+        chunk = self.delegate.scan_chunk(declared, member, cursor, max_bytes)
+        changed = []
+        for episode in chunk.episodes:
+            body = replace(episode.body, response=episode.body.response + " changed")
+            reference = episode.identity.reference
+            changed.append(
+                replace(
+                    episode,
+                    body=body,
+                    identity=build_identity(
+                        corpus_id=declared.corpus_id,
+                        source_id=declared.source_id,
+                        native_session_id=reference.native_session_id,
+                        event_token=reference.event_token,
+                        canonicalization_version=declared.canonicalization_version,
+                        boundary_version=declared.boundary_version,
+                        body=body,
+                    ),
+                )
+            )
+        result = replace(chunk, episodes=tuple(changed))
+        if self.on_chunk:
+            self.on_chunk(result)
+        return result
+
+
+class InterleavingAdapter:
+    def __init__(self, delegate, on_chunk):
+        self.delegate = delegate
+        self.name = delegate.name
+        self.implementation_version = delegate.implementation_version
+        self.on_chunk = on_chunk
+
+    def members(self, declared):
+        return self.delegate.members(declared)
+
+    def scan(self, declared, member):
+        return self.delegate.scan(declared, member)
+
+    def scan_chunk(self, declared, member, cursor, max_bytes):
+        chunk = self.delegate.scan_chunk(declared, member, cursor, max_bytes)
+        self.on_chunk(chunk)
+        return chunk
 
 
 def test_work_budget_validation_and_initial_build_reaches_current(reconciliation_storage, tmp_path):
@@ -448,7 +509,7 @@ def test_invalid_source_cannot_recertify_stale_active_generation(
     assert members(recovered)[0]["freshness"] == "current"
 
 
-def test_audit_completion_compares_full_active_chain_and_count(
+def test_missing_active_episode_triggers_replacement_rebuild(
     reconciliation_storage, tmp_path
 ):
     db, corpus_id = reconciliation_storage
@@ -462,7 +523,8 @@ def test_audit_completion_compares_full_active_chain_and_count(
 
     completed = run(db, source, now=NOW + timedelta(seconds=11))
 
-    assert members(completed)[0]["freshness"] != "current"
+    assert members(completed)[0]["freshness"] == "current"
+    assert len(active_documents(db, corpus_id)) == 2
 
 
 def test_semantic_version_change_restarts_in_progress_bounded_build(
@@ -535,7 +597,7 @@ def test_bounded_build_state_patch_retries_are_idempotent(
     original_patch = reconcile_module._patch_state
     failed = False
 
-    def patch_then_fail(database, declared, member_id, values):
+    def patch_then_fail(database, declared, member_id, values, **kwargs):
         nonlocal failed
         target = (
             values.get("build_seeded") is True
@@ -545,7 +607,7 @@ def test_bounded_build_state_patch_retries_are_idempotent(
         if target and not failed:
             failed = True
             raise RuntimeError(f"injected before {boundary} state patch")
-        return original_patch(database, declared, member_id, values)
+        return original_patch(database, declared, member_id, values, **kwargs)
 
     monkeypatch.setattr(reconcile_module, "_patch_state", patch_then_fail)
     with pytest.raises(RuntimeError, match="injected"):
@@ -654,3 +716,184 @@ def test_gateway_supersessions_match_native_session_and_event_token(
         == EpisodeReference.parse(document["new_ref"]).native_session_id
         for document in supersessions
     )
+
+
+def test_incompatible_implementation_audit_preserves_active_references(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "incompatible-implementation.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_state = active_states(db, (corpus_id,))[0]
+    original_refs = [document["episode_ref"] for document in active_documents(db, corpus_id)]
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        ChangedOutputAdapter(delegate, "2"),
+    )
+
+    first = run(db, source)
+    second = run(db, source)
+
+    assert members(first)[0]["index_standing"] == "unavailable"
+    assert members(second)[0]["index_standing"] == "unavailable"
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] == original_state[
+        "active_generation_id"
+    ]
+    assert [document["episode_ref"] for document in active_documents(db, corpus_id)] == original_refs
+    assert list(
+        db.aql.execute(
+            "FOR doc IN @@supersessions FILTER doc.corpus_id == @corpus RETURN doc",
+            bind_vars={"@supersessions": SUPERSESSIONS, "corpus": corpus_id},
+        )
+    ) == []
+
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(2, "two", "appended")).encode() + b"\n")
+    still_incompatible = run(db, source)
+
+    assert members(still_incompatible)[0]["index_standing"] == "unavailable"
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] == original_state[
+        "active_generation_id"
+    ]
+    assert [
+        document["episode_ref"] for document in active_documents(db, corpus_id)
+    ] == original_refs
+
+    semantic_change = replace(source, canonicalization_version=2)
+    rebuilt = run(db, semantic_change)
+
+    assert members(rebuilt)[0]["index_standing"] == "available"
+    assert active_states(db, (corpus_id,))[0]["active_generation_id"] != original_state[
+        "active_generation_id"
+    ]
+    assert [
+        document["episode_ref"] for document in active_documents(db, corpus_id)
+    ] != original_refs
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "malformed"])
+def test_initial_invalid_source_does_not_activate_empty_generation(
+    reconciliation_storage, tmp_path, source_kind
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / f"{source_kind}.jsonl"
+    if source_kind == "malformed":
+        path.write_bytes(b"{broken}\n")
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+
+    report = run(db, source)
+
+    assert active_states(db, (corpus_id,)) == ()
+    assert members(report)[0]["index_standing"] == "unavailable"
+
+
+def test_initial_available_empty_source_is_exact_empty_generation(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "empty.jsonl"
+    path.write_bytes(b"")
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+
+    report = run(db, source)
+
+    state = active_states(db, (corpus_id,))[0]
+    assert state["episode_count"] == 0
+    assert members(report)[0]["index_standing"] == "available"
+
+
+def test_stale_audit_cannot_certify_competing_replacement(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "audit-cas.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(
+        corpus_id, "taste", "taste_open_jsonl", path, max_age=10
+    )
+    run(db, source)
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    member = delegate.members(source)[0]
+    scan = delegate.scan(source, member)
+    write_generation(db, source, member, "competing", scan.episodes)
+    interleaved = False
+
+    def activate_competing(_chunk):
+        nonlocal interleaved
+        if interleaved:
+            return
+        interleaved = True
+        stat = path.stat()
+        activate_generation(
+            db,
+            source,
+            member,
+            "competing",
+            {
+                "implementation_version": delegate.implementation_version,
+                "observed_end": stat.st_size,
+                "complete_end": stat.st_size,
+                "member_generation": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns},
+                "source_standing": "available",
+                "freshness": "stale",
+                "validated_at": None,
+                "integrity_audit": {"offset": 0, "chain_digest": ""},
+            },
+        )
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, activate_competing),
+    )
+
+    run(db, source, now=NOW + timedelta(seconds=11))
+    state = active_states(db, (corpus_id,))[0]
+
+    assert state["active_generation_id"] == "competing"
+    assert state["freshness"] == "stale"
+    assert state.get("validated_at") is None
+
+
+def test_stale_build_cannot_overwrite_competing_build_progress(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "build-cas.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source, max_bytes=1)
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    advanced = False
+
+    def advance_competing_build(_chunk):
+        nonlocal advanced
+        if advanced:
+            return
+        advanced = True
+        state = source_state(db, corpus_id)
+        reconcile_module._patch_state(
+            db,
+            source,
+            "taste",
+            {
+                "build_generation_id": "competing-build",
+                "build_cursor": {"byte_offset": 0, "adapter_state": {}},
+            },
+        )
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, advance_competing_build),
+    )
+
+    run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert state.get("active_generation_id") is None
+    assert state["build_generation_id"] == "competing-build"

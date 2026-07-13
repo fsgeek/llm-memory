@@ -134,13 +134,23 @@ def test_environment_overrides_default_sources_path(tmp_path, monkeypatch):
     assert registry.known_corpora == frozenset({"project-history"})
 
 
-@pytest.mark.parametrize("identifier", ["", "contains/slash"])
-@pytest.mark.parametrize("field", ["corpus_id", "source_id"])
+@pytest.mark.parametrize(
+    ("field", "identifier"),
+    [
+        ("corpus_id", ""),
+        ("corpus_id", "contains/slash"),
+        ("corpus_id", "contains space"),
+        ("corpus_id", "caf\u00e9"),
+        ("corpus_id", "wild*"),
+        ("source_id", ""),
+        ("source_id", "contains/slash"),
+    ],
+)
 def test_registry_rejects_invalid_identifiers(tmp_path, field, identifier):
     source = VALID_CONFIG["sources"][0] | {field: identifier}
     path = write_config(tmp_path, VALID_CONFIG | {"sources": [source]})
 
-    with pytest.raises(ValueError, match=f"{field} must be non-empty and contain no '/'"):
+    with pytest.raises(ValueError, match=field):
         load_registry(path)
 
 

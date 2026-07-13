@@ -129,12 +129,16 @@ def _require_text(name: str, value: str) -> str:
     return value
 
 
-def _require_corpus_id(value: str) -> str:
+def validate_corpus_id(value: str) -> str:
     if not isinstance(value, str) or _CORPUS_ID_PATTERN.fullmatch(value) is None:
         raise ContractError(
             "corpus_id must contain only URL-safe letters, digits, '.', '_', '~', or '-'"
         )
     return value
+
+
+def _require_corpus_id(value: str) -> str:
+    return validate_corpus_id(value)
 
 
 def _require_positive_version(name: str, value: int) -> int:

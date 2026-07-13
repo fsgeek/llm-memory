@@ -354,6 +354,23 @@ def test_delete_generation_does_not_remove_the_active_generation(contract_storag
     )
 
 
+def test_active_state_reports_missing_stored_generation_population(contract_storage):
+    db, corpus_id, _ = contract_storage
+    enrollment = _enrollment(corpus_id)
+    member = SourceMember("member-a", Path("/unused"))
+    episode = _episode(enrollment)
+    write_generation(db, enrollment, member, "active", [episode])
+    activate_generation(db, enrollment, member, "active", _state())
+    db.collection(CONTRACT_EPISODES).delete(
+        generation_storage_key("active", episode.identity.episode_ref)
+    )
+
+    state = active_states(db, (corpus_id,))[0]
+
+    assert state["stored_episode_count"] == 0
+    assert state["active_generation_backed"] is False
+
+
 def test_generation_storage_key_uses_generation_nul_episode_sha256():
     expected = hashlib.sha256(b"generation-a\0episode://corpus/session/event").hexdigest()
     assert (

@@ -182,6 +182,8 @@ def activate_generation(
     member: SourceMember,
     generation_id: str,
     state: dict,
+    *,
+    expected_state: dict | None = None,
 ) -> None:
     state_key = _source_state_key(
         enrollment.corpus_id, enrollment.source_id, member.member_id
@@ -213,6 +215,12 @@ def activate_generation(
                 FILTER current._key == @key
                 FILTER current.staging_generation_id == @generation_id
                 FILTER current.staging_episode_count == episode_count
+                FILTER @expected_revision == null OR current._rev == @expected_revision
+                FILTER @guard_transition == false OR (
+                    current.active_generation_id == @expected_active_generation_id
+                    AND current.build_generation_id == @expected_build_generation_id
+                    AND current.build_cursor == @expected_build_cursor
+                )
                 UPDATE current WITH MERGE(
                     @state,
                     {
@@ -231,6 +239,23 @@ def activate_generation(
                 "member_id": member.member_id,
                 "generation_id": generation_id,
                 "state": authoritative_state,
+                "expected_revision": (
+                    expected_state.get("_rev") if expected_state else None
+                ),
+                "guard_transition": expected_state is not None,
+                "expected_active_generation_id": (
+                    expected_state.get("active_generation_id")
+                    if expected_state
+                    else None
+                ),
+                "expected_build_generation_id": (
+                    expected_state.get("build_generation_id")
+                    if expected_state
+                    else None
+                ),
+                "expected_build_cursor": (
+                    expected_state.get("build_cursor") if expected_state else None
+                ),
             },
         )
     )
@@ -247,10 +272,28 @@ def active_states(db, corpus_ids: tuple[str, ...]) -> tuple[dict, ...]:
             FOR state IN @@states
                 FILTER state.corpus_id IN @corpus_ids
                 FILTER state.active_generation_id != null
+                LET stored_episode_count = LENGTH(
+                    FOR episode IN @@episodes
+                        FILTER episode.corpus_id == state.corpus_id
+                        FILTER episode.source_id == state.source_id
+                        FILTER episode.member_id == state.member_id
+                        FILTER episode.generation_id == state.active_generation_id
+                        RETURN 1
+                )
                 SORT state.corpus_id, state.source_id, state.member_id
-                RETURN UNSET(state, "_id", "_rev")
+                RETURN MERGE(
+                    UNSET(state, "_id", "_rev"),
+                    {
+                        stored_episode_count,
+                        active_generation_backed: stored_episode_count == state.episode_count
+                    }
+                )
             """,
-            bind_vars={"@states": SOURCE_STATES, "corpus_ids": list(corpus_ids)},
+            bind_vars={
+                "@states": SOURCE_STATES,
+                "@episodes": CONTRACT_EPISODES,
+                "corpus_ids": list(corpus_ids),
+            },
         )
     )
 
