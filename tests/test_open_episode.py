@@ -132,7 +132,7 @@ def test_available_opening_is_recomputed_from_source_without_arango(tmp_path):
             "corpus_id": source.corpus_id,
             "source_id": source.source_id,
             "adapter": source.adapter,
-            "implementation_version": "1",
+            "implementation_version": "2",
             "canonicalization_version": 1,
             "boundary_version": 1,
             "native_event_id": "7",

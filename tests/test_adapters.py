@@ -43,7 +43,18 @@ def test_adapter_registry_is_explicit_and_metadata_is_immutable(tmp_path):
     adapter = get_adapter("taste_open_jsonl")
 
     assert adapter.name == "taste_open_jsonl"
-    assert adapter.implementation_version
+    assert {
+        name: get_adapter(name).implementation_version
+        for name in (
+            "taste_open_jsonl",
+            "gateway_jsonl",
+            "claude_code_jsonl",
+        )
+    } == {
+        "taste_open_jsonl": "2",
+        "gateway_jsonl": "2",
+        "claude_code_jsonl": "2",
+    }
     with pytest.raises(FrozenInstanceError):
         adapter.implementation_version = "changed"
     with pytest.raises(ContractError, match="unsupported adapter: mystery"):

@@ -304,7 +304,7 @@ def _optional_text(record: dict[str, Any], field: str) -> str:
 @dataclass(frozen=True)
 class TasteOpenAdapter:
     name: str = "taste_open_jsonl"
-    implementation_version: str = "1"
+    implementation_version: str = "2"
 
     def members(self, enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
         return _file_member(enrollment)
@@ -375,7 +375,7 @@ class TasteOpenAdapter:
 @dataclass(frozen=True)
 class GatewayAdapter:
     name: str = "gateway_jsonl"
-    implementation_version: str = "1"
+    implementation_version: str = "2"
 
     def members(self, enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
         return _file_member(enrollment)
@@ -447,7 +447,7 @@ def _operational_member_id(relative_name: str) -> str:
 @dataclass(frozen=True)
 class ClaudeCodeAdapter:
     name: str = "claude_code_jsonl"
-    implementation_version: str = "1"
+    implementation_version: str = "2"
 
     def members(self, enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
         locator = enrollment.locator

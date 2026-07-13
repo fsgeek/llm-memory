@@ -232,7 +232,7 @@ def test_work_budget_validation_and_initial_build_reaches_current(reconciliation
     assert source_report == source_report | {
         "source_id": "taste",
         "adapter": "taste_open_jsonl",
-        "implementation_version": "1",
+        "implementation_version": "2",
         "canonicalization_version": 1,
         "boundary_version": 1,
         "source_set_standing": "available",
@@ -672,7 +672,7 @@ def test_version_changes_preserve_or_supersede_references(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        replace(adapter, implementation_version="2"),
+        replace(adapter, implementation_version="3"),
     )
 
     implementation = run(db, source)
@@ -970,7 +970,7 @@ def test_incompatible_implementation_audit_preserves_active_references(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        ChangedOutputAdapter(delegate, "2"),
+        ChangedOutputAdapter(delegate, "3"),
     )
 
     first = run(db, source)
@@ -1030,7 +1030,7 @@ def test_implementation_change_validates_indexed_prefix_before_append(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        ChangedOutputAdapter(delegate, "2"),
+        ChangedOutputAdapter(delegate, "3"),
     )
 
     report = run(db, source)
@@ -1059,7 +1059,7 @@ def test_compatible_implementation_validates_prefix_then_appends(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        replace(delegate, implementation_version="2"),
+        replace(delegate, implementation_version="3"),
     )
 
     report = run(db, source)
@@ -1068,8 +1068,35 @@ def test_compatible_implementation_validates_prefix_then_appends(
     assert members(report)[0]["index_standing"] == "available"
     assert members(report)[0]["freshness"] == "current"
     assert state["active_generation_id"] != original_generation
-    assert state["implementation_version"] == "2"
+    assert state["implementation_version"] == "3"
     assert len(active_documents(db, corpus_id)) == 2
+
+
+def test_parser_repair_version_validates_persisted_version_one_state(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "version-one-parser-state.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original = source_state(db, corpus_id)
+    original_generation = original["active_generation_id"]
+    reconcile_module._patch_state(
+        db,
+        source,
+        "taste",
+        {"implementation_version": "1"},
+        expected_state=original,
+    )
+
+    report = run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert members(report)[0]["freshness"] == "current"
+    assert state["implementation_version"] == "2"
+    assert state["implementation_compatibility"] == "compatible"
+    assert state["active_generation_id"] == original_generation
 
 
 def test_compatible_prefix_validation_is_bounded_and_resumable(
@@ -1087,7 +1114,7 @@ def test_compatible_prefix_validation_is_bounded_and_resumable(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        replace(delegate, implementation_version="2"),
+        replace(delegate, implementation_version="3"),
     )
 
     bounded = run(db, source, max_bytes=1)
@@ -1104,7 +1131,7 @@ def test_compatible_prefix_validation_is_bounded_and_resumable(
     state = active_states(db, (corpus_id,))[0]
 
     assert members(resumed)[0]["freshness"] == "current"
-    assert state["implementation_version"] == "2"
+    assert state["implementation_version"] == "3"
     assert len(active_documents(db, corpus_id)) == 3
 
 
@@ -1129,7 +1156,7 @@ def test_compatibility_prefix_progress_survives_repeated_tail_growth(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        replace(delegate, implementation_version="2"),
+        replace(delegate, implementation_version="3"),
     )
 
     offsets = []
@@ -1176,7 +1203,7 @@ def test_compatibility_prefix_mutation_restarts_and_quarantines(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        replace(delegate, implementation_version="2"),
+        replace(delegate, implementation_version="3"),
     )
     run(db, source, max_bytes=1)
     prior_stat = path.stat()
@@ -1208,7 +1235,7 @@ def test_compatibility_completion_publishes_tail_from_final_stat(
     trusted_end = source_state(db, corpus_id)["complete_end"]
     delegate = replace(
         adapters_module.get_adapter("taste_open_jsonl"),
-        implementation_version="2",
+        implementation_version="3",
     )
     appended = False
 
@@ -1264,7 +1291,7 @@ def test_pending_compatibility_tail_truncation_replaces_from_zero(
     original_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
     delegate = replace(
         adapters_module.get_adapter("taste_open_jsonl"),
-        implementation_version="2",
+        implementation_version="3",
     )
     appended = False
 
@@ -1304,7 +1331,7 @@ def test_pending_compatibility_tail_atomic_replacement_does_not_seed_old_prefix(
     original_ref = active_documents(db, corpus_id)[0]["episode_ref"]
     delegate = replace(
         adapters_module.get_adapter("taste_open_jsonl"),
-        implementation_version="2",
+        implementation_version="3",
     )
     appended = False
 
@@ -1355,7 +1382,7 @@ def test_pending_compatibility_tail_disappearance_is_unavailable_then_recovers(
     original_ref = active_documents(db, corpus_id)[0]["episode_ref"]
     delegate = replace(
         adapters_module.get_adapter("taste_open_jsonl"),
-        implementation_version="2",
+        implementation_version="3",
     )
     appended = False
 
@@ -1407,7 +1434,7 @@ def test_implementation_change_checks_trusted_prefix_before_derived_loss(
     monkeypatch.setitem(
         adapters_module._ADAPTERS,
         "taste_open_jsonl",
-        ChangedOutputAdapter(delegate, "2"),
+        ChangedOutputAdapter(delegate, "3"),
     )
 
     report = run(db, source)

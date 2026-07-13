@@ -330,7 +330,7 @@ def test_unavailable_member_index_keeps_hits_but_makes_population_unknown(monkey
     }
     source_shape = {
         "adapter": "taste_open_jsonl",
-        "implementation_version": "1",
+        "implementation_version": "2",
         "canonicalization_version": 1,
         "boundary_version": 1,
         "source_set_standing": "available",
@@ -432,7 +432,7 @@ def test_active_generations_are_limited_to_enabled_sources(monkeypatch):
                     {
                         "source_id": "enabled",
                         "adapter": "taste_open_jsonl",
-                        "implementation_version": "1",
+                        "implementation_version": "2",
                         "canonicalization_version": 1,
                         "boundary_version": 1,
                         "source_set_standing": "available",
@@ -509,7 +509,7 @@ def test_noncurrent_available_indexes_remain_searchable_with_member_standing(
                     {
                         "source_id": "source-a",
                         "adapter": "taste_open_jsonl",
-                        "implementation_version": "1",
+                        "implementation_version": "2",
                         "canonicalization_version": 1,
                         "boundary_version": 1,
                         "source_set_standing": "available",
