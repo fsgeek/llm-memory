@@ -18,6 +18,10 @@ _INDEXED_FIELDS = ("user_message", "response", "state_text")
 _ANALYZER = "text_en"
 
 
+class GenerationStateConflict(ValueError):
+    pass
+
+
 def _view_properties() -> dict[str, Any]:
     return {
         "links": {
@@ -91,6 +95,8 @@ def write_generation(
     member: SourceMember,
     generation_id: str,
     episodes: Iterable[EpisodeRecord],
+    *,
+    expected_state: dict | None = None,
 ) -> int:
     state_key = _source_state_key(
         enrollment.corpus_id, enrollment.source_id, member.member_id
@@ -128,8 +134,31 @@ def write_generation(
                 f"conflicting generation document {document['_key']!r}"
             )
 
-    db.aql.execute(
-        """
+    bind_vars = {
+        "@episodes": CONTRACT_EPISODES,
+        "@states": SOURCE_STATES,
+        "key": state_key,
+        "identity": {
+            "_key": state_key,
+            "corpus_id": enrollment.corpus_id,
+            "source_id": enrollment.source_id,
+            "member_id": member.member_id,
+            "active_generation_id": None,
+            "staging_generation_id": generation_id,
+            "staging_episode_count": None,
+            "canonicalization_version": None,
+            "boundary_version": None,
+            "staging_canonicalization_version": enrollment.canonicalization_version,
+            "staging_boundary_version": enrollment.boundary_version,
+        },
+        "generation_id": generation_id,
+        "corpus_id": enrollment.corpus_id,
+        "source_id": enrollment.source_id,
+        "member_id": member.member_id,
+        "canonicalization_version": enrollment.canonicalization_version,
+        "boundary_version": enrollment.boundary_version,
+    }
+    count_query = """
         LET staged_count = LENGTH(
             FOR episode IN @@episodes
                 FILTER episode.corpus_id == @corpus_id
@@ -138,6 +167,9 @@ def write_generation(
                 FILTER episode.generation_id == @generation_id
                 RETURN 1
         )
+    """
+    if expected_state is None:
+        query = count_query + """
         UPSERT { _key: @key }
             INSERT MERGE(@identity, { staging_episode_count: staged_count })
             UPDATE {
@@ -147,32 +179,50 @@ def write_generation(
                 staging_boundary_version: @boundary_version
             }
             IN @@states
-        """,
-        bind_vars={
-            "@episodes": CONTRACT_EPISODES,
-            "@states": SOURCE_STATES,
-            "key": state_key,
-            "identity": {
-                "_key": state_key,
-                "corpus_id": enrollment.corpus_id,
-                "source_id": enrollment.source_id,
-                "member_id": member.member_id,
-                "active_generation_id": None,
-                "staging_generation_id": generation_id,
-                "staging_episode_count": None,
-                "canonicalization_version": None,
-                "boundary_version": None,
-                "staging_canonicalization_version": enrollment.canonicalization_version,
-                "staging_boundary_version": enrollment.boundary_version,
-            },
-            "generation_id": generation_id,
-            "corpus_id": enrollment.corpus_id,
-            "source_id": enrollment.source_id,
-            "member_id": member.member_id,
-            "canonicalization_version": enrollment.canonicalization_version,
-            "boundary_version": enrollment.boundary_version,
-        },
-    )
+        RETURN NEW._key
+        """
+    else:
+        query = count_query + """
+        FOR current IN @@states
+            FILTER current._key == @key
+            FILTER current._rev == @expected_revision
+            FILTER current.active_generation_id == @expected_active_generation_id
+            FILTER current.build_generation_id == @expected_build_generation_id
+            FILTER current.build_cursor == @expected_build_cursor
+            FILTER current.staging_generation_id == @expected_staging_generation_id
+            FILTER current.staging_episode_count == @expected_staging_episode_count
+            UPDATE current WITH {
+                staging_generation_id: @generation_id,
+                staging_episode_count: staged_count,
+                staging_canonicalization_version: @canonicalization_version,
+                staging_boundary_version: @boundary_version
+            } IN @@states
+            RETURN NEW._key
+        """
+        bind_vars.pop("identity")
+        bind_vars.update(
+            {
+                "expected_revision": expected_state.get("_rev"),
+                "expected_active_generation_id": expected_state.get(
+                    "active_generation_id"
+                ),
+                "expected_build_generation_id": expected_state.get(
+                    "build_generation_id"
+                ),
+                "expected_build_cursor": expected_state.get("build_cursor"),
+                "expected_staging_generation_id": expected_state.get(
+                    "staging_generation_id"
+                ),
+                "expected_staging_episode_count": expected_state.get(
+                    "staging_episode_count"
+                ),
+            }
+        )
+    published = list(db.aql.execute(query, bind_vars=bind_vars))
+    if not published:
+        raise GenerationStateConflict(
+            f"generation {generation_id!r} lost staging ownership"
+        )
     return len(documents)
 
 

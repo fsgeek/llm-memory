@@ -775,6 +775,127 @@ def test_incompatible_implementation_audit_preserves_active_references(
     ] != original_refs
 
 
+def test_implementation_change_validates_indexed_prefix_before_append(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "implementation-and-append.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_state = active_states(db, (corpus_id,))[0]
+    original_refs = [document["episode_ref"] for document in active_documents(db, corpus_id)]
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(2, "two", "appended")).encode() + b"\n")
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        ChangedOutputAdapter(delegate, "2"),
+    )
+
+    report = run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert members(report)[0]["index_standing"] == "unavailable"
+    assert members(report)[0]["freshness"] == "unknown"
+    assert state["active_generation_id"] == original_state["active_generation_id"]
+    assert state["implementation_version"] == delegate.implementation_version
+    assert state.get("build_generation_id") is None
+    assert [document["episode_ref"] for document in active_documents(db, corpus_id)] == original_refs
+
+
+def test_compatible_implementation_validates_prefix_then_appends(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "compatible-implementation-and-append.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(2, "two", "appended")).encode() + b"\n")
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        replace(delegate, implementation_version="2"),
+    )
+
+    report = run(db, source)
+    state = active_states(db, (corpus_id,))[0]
+
+    assert members(report)[0]["index_standing"] == "available"
+    assert members(report)[0]["freshness"] == "current"
+    assert state["active_generation_id"] != original_generation
+    assert state["implementation_version"] == "2"
+    assert len(active_documents(db, corpus_id)) == 2
+
+
+def test_compatible_prefix_validation_is_bounded_and_resumable(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "bounded-compatible-prefix.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(3, "three", "ccc")).encode() + b"\n")
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        replace(delegate, implementation_version="2"),
+    )
+
+    bounded = run(db, source, max_bytes=1)
+    bounded_state = source_state(db, corpus_id)
+
+    assert bounded.work_exhausted is True
+    assert members(bounded)[0]["index_standing"] == "unavailable"
+    assert bounded_state["active_generation_id"] == original_generation
+    assert bounded_state["implementation_version"] == delegate.implementation_version
+    assert bounded_state["implementation_compatibility"] == "pending"
+    assert bounded_state["integrity_audit"]["offset"] > 0
+
+    resumed = run(db, source)
+    state = active_states(db, (corpus_id,))[0]
+
+    assert members(resumed)[0]["freshness"] == "current"
+    assert state["implementation_version"] == "2"
+    assert len(active_documents(db, corpus_id)) == 3
+
+
+def test_implementation_change_checks_trusted_prefix_before_derived_loss(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "implementation-and-derived-loss.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_state = active_states(db, (corpus_id,))[0]
+    for document in active_documents(db, corpus_id):
+        db.collection(CONTRACT_EPISODES).delete(document["_key"])
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        ChangedOutputAdapter(delegate, "2"),
+    )
+
+    report = run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert members(report)[0]["index_standing"] == "unavailable"
+    assert state["active_generation_id"] == original_state["active_generation_id"]
+    assert state["implementation_version"] == delegate.implementation_version
+    assert state.get("build_generation_id") is None
+
+
 @pytest.mark.parametrize("source_kind", ["missing", "malformed"])
 def test_initial_invalid_source_does_not_activate_empty_generation(
     reconciliation_storage, tmp_path, source_kind
@@ -897,3 +1018,88 @@ def test_stale_build_cannot_overwrite_competing_build_progress(
 
     assert state.get("active_generation_id") is None
     assert state["build_generation_id"] == "competing-build"
+
+
+def test_stale_writer_cannot_publish_staging_after_competing_build_takes_ownership(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "staging-publication-cas.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source, max_bytes=1)
+    original_write = reconcile_module.write_generation
+    interleaved = False
+
+    def publish_after_competitor(database, declared, member, generation_id, episodes, **kwargs):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            reconcile_module._patch_state(
+                db,
+                source,
+                "taste",
+                {
+                    "build_generation_id": "competing-build",
+                    "build_cursor": {"byte_offset": 0, "adapter_state": {}},
+                    "staging_generation_id": "competing-stage",
+                    "staging_episode_count": 0,
+                },
+            )
+        return original_write(
+            database,
+            declared,
+            member,
+            generation_id,
+            episodes,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(reconcile_module, "write_generation", publish_after_competitor)
+
+    run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert state["build_generation_id"] == "competing-build"
+    assert state["build_cursor"] == {"byte_offset": 0, "adapter_state": {}}
+    assert state["staging_generation_id"] == "competing-stage"
+    assert state["staging_episode_count"] == 0
+
+
+def test_zero_document_replacement_recovers_after_abandoned_staging_and_crash(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "zero-replacement-recovery.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa"), taste(2, "two", "bbb")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source, max_bytes=1)
+    abandoned = source_state(db, corpus_id)["staging_generation_id"]
+    path.write_bytes(b"")
+    changed = replace(source, canonicalization_version=2)
+    original_activate = reconcile_module.activate_generation
+    failed = False
+
+    def crash_before_activation(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected zero-generation activation crash")
+        return original_activate(*args, **kwargs)
+
+    monkeypatch.setattr(reconcile_module, "activate_generation", crash_before_activation)
+    with pytest.raises(RuntimeError, match="zero-generation activation crash"):
+        run(db, changed)
+    monkeypatch.setattr(reconcile_module, "activate_generation", original_activate)
+
+    recovered = run(db, changed)
+    state = active_states(db, (corpus_id,))[0]
+
+    assert members(recovered)[0]["freshness"] == "current"
+    assert state["episode_count"] == 0
+    assert state["staging_generation_id"] is None
+    assert state["active_generation_id"] != abandoned
+    assert all(
+        document["generation_id"] != abandoned
+        for document in documents(db, corpus_id)
+    )

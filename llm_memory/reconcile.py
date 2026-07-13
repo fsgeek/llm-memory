@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from llm_memory.adapters import EpisodeRecord, ScanCursor, SourceMember, get_adapter
+from llm_memory.adapters import (
+    EpisodeRecord,
+    MemberChunk,
+    ScanCursor,
+    SourceMember,
+    get_adapter,
+)
 from llm_memory.contract import (
     EpisodeBody,
     EpisodeIdentity,
@@ -18,6 +24,7 @@ from llm_memory.contract import (
 )
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
+    GenerationStateConflict,
     SOURCE_STATES,
     SUPERSESSIONS,
     activate_generation,
@@ -290,6 +297,10 @@ def _begin_build(
             "build_boundary_version": enrollment.boundary_version,
             "build_cursor": {"byte_offset": offset, "adapter_state": adapter_state},
             "build_seeded": False,
+            "staging_generation_id": None,
+            "staging_episode_count": None,
+            "staging_canonicalization_version": None,
+            "staging_boundary_version": None,
             "freshness": FreshnessStanding.STALE.value if state.get("active_generation_id") else FreshnessStanding.INCOMPLETE.value,
         },
         expected_state=expected_state,
@@ -418,7 +429,8 @@ def _reconcile_tail(
     state = _member_state(db, enrollment, member.member_id)
     if (
         state
-        and state.get("implementation_compatibility") == "incompatible"
+        and state.get("active_generation_id")
+        and state.get("implementation_version") != adapter.implementation_version
         and state.get("canonicalization_version")
         == enrollment.canonicalization_version
         and state.get("boundary_version") == enrollment.boundary_version
@@ -447,13 +459,17 @@ def _reconcile_tail(
     if state["build_mode"] == "append" and not state.get("build_seeded"):
         transition = state
         active = _generation_documents(db, state)
-        write_generation(
-            db,
-            enrollment,
-            member,
-            generation_id,
-            (_episode_from_document(document) for document in active),
-        )
+        try:
+            write_generation(
+                db,
+                enrollment,
+                member,
+                generation_id,
+                (_episode_from_document(document) for document in active),
+                expected_state=transition,
+            )
+        except GenerationStateConflict:
+            return
         state = _member_state(db, enrollment, member.member_id)
         if not state or any(
             state.get(field) != transition.get(field)
@@ -487,8 +503,18 @@ def _reconcile_tail(
         _member_state(db, enrollment, member.member_id), transition
     ):
         return
-    if chunk.episodes or not state.get("staging_generation_id"):
-        write_generation(db, enrollment, member, generation_id, chunk.episodes)
+    if chunk.episodes or state.get("staging_generation_id") != generation_id:
+        try:
+            write_generation(
+                db,
+                enrollment,
+                member,
+                generation_id,
+                chunk.episodes,
+                expected_state=transition,
+            )
+        except GenerationStateConflict:
+            return
     state = _member_state(db, enrollment, member.member_id)
     if not state or any(
         state.get(field) != transition.get(field)
@@ -607,7 +633,7 @@ def _audit_due(enrollment: SourceEnrollment, member: SourceMember, state: dict |
     expired = validated is None or (now - validated).total_seconds() > enrollment.full_validation_max_age_seconds
     adapter_version = get_adapter(enrollment.adapter).implementation_version
     if (
-        state.get("implementation_compatibility") == "incompatible"
+        state.get("implementation_compatibility") in {"incompatible", "unverified"}
         and state.get("incompatible_implementation_version") == adapter_version
     ):
         return False
@@ -618,6 +644,11 @@ def _audit_due(enrollment: SourceEnrollment, member: SourceMember, state: dict |
 
 def _restart_audit(state: dict, member_generation: dict | None) -> dict:
     previous = state.get("integrity_audit") or {}
+    trusted_chain = previous.get("trusted_chain_digest")
+    trusted_count = previous.get("trusted_episode_count")
+    if trusted_chain is None and state.get("validated_at"):
+        trusted_chain = previous.get("chain_digest")
+        trusted_count = previous.get("episode_count")
     return {
         "offset": 0,
         "cursor": {"byte_offset": 0, "adapter_state": {}},
@@ -625,10 +656,13 @@ def _restart_audit(state: dict, member_generation: dict | None) -> dict:
         "start_size": member_generation["size"] if member_generation else 0,
         "start_mtime_ns": member_generation["mtime_ns"] if member_generation else 0,
         "start_observed_end": member_generation["size"] if member_generation else 0,
+        "target_end": state.get("complete_end", 0),
         "restart_count": previous.get("restart_count", 0) + (1 if previous.get("offset") else 0),
         "episode_count": 0,
         "bytes_read": previous.get("bytes_read", 0),
         "elapsed_ms": previous.get("elapsed_ms", 0.0),
+        "trusted_chain_digest": trusted_chain,
+        "trusted_episode_count": trusted_count,
     }
 
 
@@ -661,12 +695,27 @@ def _reconcile_audit(
     implementation_changed = (
         state.get("implementation_version") != adapter.implementation_version
     )
-    chunk = adapter.scan_chunk(
-        enrollment,
-        member,
-        _cursor(audit.get("cursor")),
-        budget.remaining,
-    )
+    audit_cursor = _cursor(audit.get("cursor"))
+    target_end = audit.get("target_end", state.get("complete_end", 0))
+    if audit_cursor.byte_offset >= target_end and generation is not None:
+        chunk = MemberChunk(
+            member=member,
+            episodes=(),
+            next_cursor=audit_cursor,
+            observed_end=generation["size"],
+            complete_end=target_end,
+            source_standing=SourceStanding.AVAILABLE,
+            freshness=FreshnessStanding.CURRENT,
+            bytes_read=0,
+            exhausted=False,
+        )
+    else:
+        chunk = adapter.scan_chunk(
+            enrollment,
+            member,
+            audit_cursor,
+            min(budget.remaining, max(1, target_end - audit_cursor.byte_offset)),
+        )
     elapsed_ms = (time.perf_counter() - started) * 1000
     budget.charge(chunk.bytes_read)
     chain = audit.get("chain_digest", "")
@@ -674,6 +723,10 @@ def _reconcile_audit(
         chain = extend_chain(chain, episode.identity.episode_ref)
 
     active_documents = _generation_documents(db, state)
+    active_generation_backed = (
+        state.get("episode_count") is not None
+        and len(active_documents) == state.get("episode_count")
+    )
     expected = tuple(
         document["episode_ref"]
         for document in active_documents
@@ -681,7 +734,9 @@ def _reconcile_audit(
         and document["source_position"]["end"] <= chunk.next_cursor.byte_offset
     )
     actual = tuple(episode.identity.episode_ref for episode in chunk.episodes)
-    mismatch = expected != actual
+    mismatch = (
+        active_generation_backed and expected != actual
+    ) or chunk.observed_end < target_end
     updated_audit = {
         **audit,
         "offset": chunk.next_cursor.byte_offset,
@@ -691,6 +746,7 @@ def _reconcile_audit(
         "bytes_read": audit.get("bytes_read", 0) + chunk.bytes_read,
         "elapsed_ms": audit.get("elapsed_ms", 0.0) + elapsed_ms,
     }
+    audit_complete = chunk.next_cursor.byte_offset >= target_end
     if (
         chunk.source_standing is not SourceStanding.AVAILABLE
         or chunk.error_position is not None
@@ -717,7 +773,11 @@ def _reconcile_audit(
         except _StateConflict:
             pass
         return
-    if chunk.freshness is FreshnessStanding.INCOMPLETE and not chunk.exhausted:
+    if (
+        chunk.freshness is FreshnessStanding.INCOMPLETE
+        and not chunk.exhausted
+        and not audit_complete
+    ):
         try:
             _patch_state(
                 db,
@@ -771,13 +831,26 @@ def _reconcile_audit(
             pass
         return
 
-    if chunk.exhausted:
+    if not audit_complete:
         try:
             _patch_state(
                 db,
                 enrollment,
                 member.member_id,
-                {"integrity_audit": updated_audit, "freshness": FreshnessStanding.TAIL_VALIDATED.value},
+                {
+                    "integrity_audit": updated_audit,
+                    "freshness": FreshnessStanding.TAIL_VALIDATED.value,
+                    "implementation_compatibility": (
+                        "pending" if implementation_changed else state.get(
+                            "implementation_compatibility"
+                        )
+                    ),
+                    "incompatible_implementation_version": (
+                        adapter.implementation_version
+                        if implementation_changed
+                        else state.get("incompatible_implementation_version")
+                    ),
+                },
                 expected_state=state,
             )
         except _StateConflict:
@@ -798,11 +871,41 @@ def _reconcile_audit(
             pass
         return
 
-    expected_chain = ""
-    for document in active_documents:
-        expected_chain = extend_chain(expected_chain, document["episode_ref"])
+    if active_generation_backed:
+        expected_chain = ""
+        for document in active_documents:
+            expected_chain = extend_chain(expected_chain, document["episode_ref"])
+        expected_count = len(active_documents)
+    else:
+        expected_chain = audit.get("trusted_chain_digest")
+        expected_count = audit.get("trusted_episode_count")
+    if expected_chain is None or expected_count is None:
+        try:
+            _patch_state(
+                db,
+                enrollment,
+                member.member_id,
+                {
+                    "integrity_audit": updated_audit,
+                    "implementation_compatibility": (
+                        "unverified" if implementation_changed else state.get(
+                            "implementation_compatibility"
+                        )
+                    ),
+                    "incompatible_implementation_version": (
+                        adapter.implementation_version
+                        if implementation_changed
+                        else state.get("incompatible_implementation_version")
+                    ),
+                    "freshness": FreshnessStanding.UNKNOWN.value,
+                },
+                expected_state=state,
+            )
+        except _StateConflict:
+            pass
+        return
     if (
-        updated_audit["episode_count"] != len(active_documents)
+        updated_audit["episode_count"] != expected_count
         or updated_audit["chain_digest"] != expected_chain
     ):
         if implementation_changed:
@@ -842,20 +945,31 @@ def _reconcile_audit(
             pass
         return
 
+    completed_audit = {
+        **updated_audit,
+        "trusted_chain_digest": updated_audit["chain_digest"],
+        "trusted_episode_count": updated_audit["episode_count"],
+    }
+    source_has_tail = chunk.observed_end > target_end
     try:
         _patch_state(
             db,
             enrollment,
             member.member_id,
             {
-                "integrity_audit": updated_audit,
+                "integrity_audit": completed_audit,
                 "validated_at": _timestamp(budget.now),
                 "member_generation": generation,
                 "implementation_version": adapter.implementation_version,
                 "implementation_compatibility": "compatible",
                 "incompatible_implementation_version": None,
                 "source_standing": chunk.source_standing.value,
-                "freshness": FreshnessStanding.CURRENT.value,
+                "observed_end": chunk.observed_end,
+                "freshness": (
+                    FreshnessStanding.TAIL_VALIDATED.value
+                    if source_has_tail
+                    else FreshnessStanding.CURRENT.value
+                ),
             },
             expected_state=state,
         )
@@ -875,6 +989,8 @@ def _mark_due_audit(
         and state.get("freshness") == FreshnessStanding.CURRENT.value
         and _audit_due(enrollment, member, state, now)
     ):
+        adapter_version = get_adapter(enrollment.adapter).implementation_version
+        implementation_changed = state.get("implementation_version") != adapter_version
         audit = _restart_audit(state, _stat(member))
         audit["restart_count"] = 0
         try:
@@ -885,6 +1001,16 @@ def _mark_due_audit(
                 {
                     "freshness": FreshnessStanding.TAIL_VALIDATED.value,
                     "integrity_audit": audit,
+                    "implementation_compatibility": (
+                        "pending" if implementation_changed else state.get(
+                            "implementation_compatibility"
+                        )
+                    ),
+                    "incompatible_implementation_version": (
+                        adapter_version
+                        if implementation_changed
+                        else state.get("incompatible_implementation_version")
+                    ),
                 },
                 expected_state=state,
             )
@@ -912,7 +1038,8 @@ def _member_standing(
         if missing
         else state.get("source_standing", SourceStanding.UNKNOWN.value)
     )
-    incompatible = state.get("implementation_compatibility") == "incompatible"
+    compatibility = state.get("implementation_compatibility")
+    incompatible = compatibility not in {None, "compatible"}
     if (
         state.get("active_generation_id")
         and _active_generation_backed(db, state)
@@ -1015,7 +1142,19 @@ def reconcile_registry(
             if _audit_due(source, member, state, budget.now):
                 audit_candidates.append((_parse_timestamp(state.get("validated_at")) or datetime.min.replace(tzinfo=UTC), source, member))
     for _, source, member in sorted(audit_candidates, key=lambda item: (item[0], item[1].corpus_id, item[1].source_id, item[2].member_id)):
+        before_audit = _member_state(db, source, member.member_id)
         _reconcile_audit(db, source, member, budget)
+        after_audit = _member_state(db, source, member.member_id)
+        adapter_version = get_adapter(source.adapter).implementation_version
+        if (
+            before_audit
+            and after_audit
+            and before_audit.get("implementation_version") != adapter_version
+            and after_audit.get("implementation_version") == adapter_version
+            and after_audit.get("implementation_compatibility") == "compatible"
+        ):
+            _reconcile_tail(db, source, member, budget)
+            _reconcile_audit(db, source, member, budget)
 
     corpus_reports = []
     for corpus_id in sorted({source.corpus_id for source in sources}):
