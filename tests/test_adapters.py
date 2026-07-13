@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_memory.adapters import SourceMember, get_adapter
+from llm_memory.adapters import ScanCursor, SourceMember, get_adapter
 from llm_memory.contract import ContractError, FreshnessStanding, SourceStanding
 from llm_memory.enrollment import SourceEnrollment
 
@@ -432,3 +432,97 @@ def test_source_member_is_frozen():
 
     with pytest.raises(FrozenInstanceError):
         member.member_id = "changed"
+
+
+def test_gateway_chunk_scan_preserves_sequence_state_and_matches_full_scan(tmp_path):
+    path = tmp_path / "gateway-chunks.jsonl"
+    data = write_jsonl(
+        path,
+        [
+            {
+                "type": "request_metrics",
+                "session_id": "session-a",
+                "messages_full": [{"role": "user", "content": "one"}],
+                "response_text": "first",
+            },
+            {
+                "type": "request_metrics",
+                "session_id": "session-a",
+                "messages_full": [{"role": "user", "content": "two"}],
+                "response_text": "second",
+            },
+        ],
+    )
+    declared = enrollment("gateway_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    first = adapter.scan_chunk(declared, member, None, 1)
+    second = adapter.scan_chunk(declared, member, first.next_cursor, 1)
+    complete = adapter.scan(declared, member)
+
+    assert first.bytes_read == first.next_cursor.byte_offset
+    assert first.exhausted is True
+    assert first.next_cursor.adapter_state == {"sequence_by_session": {"session-a": 1}}
+    assert second.bytes_read == len(data) - first.bytes_read
+    assert second.next_cursor.byte_offset == len(data)
+    assert second.next_cursor.adapter_state == {"sequence_by_session": {"session-a": 2}}
+    assert first.episodes + second.episodes == complete.episodes
+
+
+def test_claude_chunk_scan_preserves_conversation_state(tmp_path):
+    path = tmp_path / "claude-chunks.jsonl"
+    records = [
+        {
+            "type": "user",
+            "sessionId": "session-a",
+            "timestamp": "2026-07-12T10:00:00Z",
+            "message": {"content": "remember this"},
+        },
+        {
+            "type": "assistant",
+            "sessionId": "session-a",
+            "uuid": "answer-a",
+            "message": {"content": "I remember"},
+        },
+    ]
+    data = write_jsonl(path, records)
+    first_line_end = data.index(b"\n") + 1
+    declared = enrollment("claude_code_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    first = adapter.scan_chunk(declared, member, ScanCursor(0, {}), first_line_end)
+    second = adapter.scan_chunk(declared, member, first.next_cursor, 1)
+
+    assert first.next_cursor.adapter_state == {
+        "last_user": "remember this",
+        "last_user_ts": "2026-07-12T10:00:00Z",
+        "session_established": True,
+    }
+    assert first.episodes == ()
+    assert second.episodes[0].body.user_message == "remember this"
+    assert second.next_cursor.byte_offset == len(data)
+
+
+def test_chunk_scan_declares_single_record_overshoot_and_stops_before_next(tmp_path):
+    path = tmp_path / "oversized.jsonl"
+    data = write_jsonl(
+        path,
+        [
+            {"cycle": 1, "user_message": "x" * 200, "response_text": "one"},
+            {"cycle": 2, "user_message": "next", "response_text": "two"},
+        ],
+    )
+    first_line_end = data.index(b"\n") + 1
+    declared = enrollment("taste_open_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    chunk = adapter.scan_chunk(declared, member, None, 10)
+
+    assert chunk.bytes_read == first_line_end > 10
+    assert chunk.next_cursor.byte_offset == first_line_end
+    assert len(chunk.episodes) == 1
+    assert chunk.exhausted is True
+    assert chunk.complete_end == first_line_end

@@ -35,6 +35,26 @@ class EpisodeRecord:
 
 
 @dataclass(frozen=True)
+class ScanCursor:
+    byte_offset: int
+    adapter_state: dict
+
+
+@dataclass(frozen=True)
+class MemberChunk:
+    member: SourceMember
+    episodes: tuple[EpisodeRecord, ...]
+    next_cursor: ScanCursor
+    observed_end: int
+    complete_end: int
+    source_standing: SourceStanding
+    freshness: FreshnessStanding
+    bytes_read: int
+    exhausted: bool
+    error_position: int | None = None
+
+
+@dataclass(frozen=True)
 class MemberScan:
     member: SourceMember
     episodes: tuple[EpisodeRecord, ...]
@@ -54,6 +74,14 @@ class SourceAdapter(Protocol):
     def scan(
         self, enrollment: SourceEnrollment, member: SourceMember
     ) -> MemberScan: ...
+
+    def scan_chunk(
+        self,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        cursor: ScanCursor | None,
+        max_bytes: int,
+    ) -> MemberChunk: ...
 
 
 def turn_text(content: object) -> str:
@@ -108,49 +136,76 @@ def _record(
 RecordHandler = Callable[[dict[str, Any], int, int], EpisodeRecord | None]
 
 
-def _scan_lines(member: SourceMember, handler: RecordHandler) -> MemberScan:
+def _scan_lines_chunk(
+    member: SourceMember,
+    cursor: ScanCursor | None,
+    max_bytes: int,
+    handler: RecordHandler,
+    adapter_state: dict,
+) -> MemberChunk:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+    start_offset = cursor.byte_offset if cursor is not None else 0
     try:
         source = member.path.open("rb")
     except FileNotFoundError:
-        return MemberScan(
+        return MemberChunk(
             member,
             (),
+            ScanCursor(start_offset, adapter_state),
             0,
             0,
             SourceStanding.MISSING,
             FreshnessStanding.UNAVAILABLE,
+            0,
+            False,
         )
     except OSError:
-        return MemberScan(
+        return MemberChunk(
             member,
             (),
+            ScanCursor(start_offset, adapter_state),
             0,
             0,
             SourceStanding.UNAVAILABLE,
             FreshnessStanding.UNAVAILABLE,
+            0,
+            False,
         )
 
     try:
         observed_end = os.fstat(source.fileno()).st_size
     except OSError:
         source.close()
-        return MemberScan(
+        return MemberChunk(
             member,
             (),
+            ScanCursor(start_offset, adapter_state),
             0,
             0,
             SourceStanding.UNAVAILABLE,
             FreshnessStanding.UNAVAILABLE,
+            0,
+            False,
         )
 
     episodes: list[EpisodeRecord] = []
-    complete_end = 0
+    complete_end = min(start_offset, observed_end)
+    next_offset = complete_end
+    bytes_read = 0
     error_position = None
     incomplete = False
+    exhausted = False
     with source:
+        if complete_end:
+            source.seek(complete_end)
         while source.tell() < observed_end:
+            if bytes_read >= max_bytes:
+                exhausted = True
+                break
             start = source.tell()
             line = source.readline(observed_end - start)
+            bytes_read += len(line)
             if not line:
                 incomplete = True
                 break
@@ -171,6 +226,7 @@ def _scan_lines(member: SourceMember, handler: RecordHandler) -> MemberScan:
                 break
             if episode is not None:
                 episodes.append(episode)
+            next_offset = end
 
     if error_position is not None:
         source_standing = SourceStanding.MALFORMED
@@ -179,17 +235,32 @@ def _scan_lines(member: SourceMember, handler: RecordHandler) -> MemberScan:
         source_standing = SourceStanding.AVAILABLE
         freshness = (
             FreshnessStanding.INCOMPLETE
-            if incomplete
+            if incomplete or exhausted
             else FreshnessStanding.CURRENT
         )
-    return MemberScan(
+    return MemberChunk(
         member=member,
         episodes=tuple(episodes),
+        next_cursor=ScanCursor(next_offset, adapter_state),
         observed_end=observed_end,
         complete_end=complete_end,
         source_standing=source_standing,
         freshness=freshness,
+        bytes_read=bytes_read,
+        exhausted=exhausted,
         error_position=error_position,
+    )
+
+
+def _member_scan(chunk: MemberChunk) -> MemberScan:
+    return MemberScan(
+        member=chunk.member,
+        episodes=chunk.episodes,
+        observed_end=chunk.observed_end,
+        complete_end=chunk.complete_end,
+        source_standing=chunk.source_standing,
+        freshness=chunk.freshness,
+        error_position=chunk.error_position,
     )
 
 
@@ -208,6 +279,15 @@ class TasteOpenAdapter:
     def scan(
         self, enrollment: SourceEnrollment, member: SourceMember
     ) -> MemberScan:
+        return _member_scan(self.scan_chunk(enrollment, member, None, 2**63 - 1))
+
+    def scan_chunk(
+        self,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        cursor: ScanCursor | None,
+        max_bytes: int,
+    ) -> MemberChunk:
         def handle(record: dict[str, Any], start: int, end: int) -> EpisodeRecord:
             cycle = str(record["cycle"])
             state = record.get("state") or {}
@@ -245,7 +325,7 @@ class TasteOpenAdapter:
                 state_text=state_text,
             )
 
-        return _scan_lines(member, handle)
+        return _scan_lines_chunk(member, cursor, max_bytes, handle, {})
 
 
 @dataclass(frozen=True)
@@ -259,7 +339,17 @@ class GatewayAdapter:
     def scan(
         self, enrollment: SourceEnrollment, member: SourceMember
     ) -> MemberScan:
-        sequence_by_session: dict[str, int] = {}
+        return _member_scan(self.scan_chunk(enrollment, member, None, 2**63 - 1))
+
+    def scan_chunk(
+        self,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        cursor: ScanCursor | None,
+        max_bytes: int,
+    ) -> MemberChunk:
+        state = dict(cursor.adapter_state) if cursor is not None else {}
+        sequence_by_session = dict(state.get("sequence_by_session", {}))
 
         def handle(
             record: dict[str, Any], start: int, end: int
@@ -299,7 +389,8 @@ class GatewayAdapter:
                 end=end,
             )
 
-        return _scan_lines(member, handle)
+        state["sequence_by_session"] = sequence_by_session
+        return _scan_lines_chunk(member, cursor, max_bytes, handle, state)
 
 
 def _unresolved_member_id(relative_name: str) -> str:
@@ -352,16 +443,35 @@ class ClaudeCodeAdapter:
     def scan(
         self, enrollment: SourceEnrollment, member: SourceMember
     ) -> MemberScan:
-        last_user = ""
-        session_established = False
+        return _member_scan(self.scan_chunk(enrollment, member, None, 2**63 - 1))
+
+    def scan_chunk(
+        self,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        cursor: ScanCursor | None,
+        max_bytes: int,
+    ) -> MemberChunk:
+        state = dict(cursor.adapter_state) if cursor is not None else {}
+        last_user = state.get("last_user", "")
+        last_user_ts = state.get("last_user_ts", "")
+        session_established = state.get("session_established", False)
+        state.update(
+            {
+                "last_user": last_user,
+                "last_user_ts": last_user_ts,
+                "session_established": session_established,
+            }
+        )
 
         def handle(
             record: dict[str, Any], start: int, end: int
         ) -> EpisodeRecord | None:
-            nonlocal last_user, session_established
+            nonlocal last_user, last_user_ts, session_established
             session = record.get("sessionId")
             if isinstance(session, str) and session:
                 session_established = True
+                state["session_established"] = True
             message = record.get("message")
             if not isinstance(message, dict):
                 return None
@@ -374,6 +484,9 @@ class ClaudeCodeAdapter:
                 prose = turn_text(message.get("content"))
                 if prose.strip():
                     last_user = prose
+                    last_user_ts = record.get("timestamp") or ""
+                    state["last_user"] = last_user
+                    state["last_user_ts"] = last_user_ts
                 return None
             response = turn_text(message.get("content"))
             if not response.strip():
@@ -400,14 +513,16 @@ class ClaudeCodeAdapter:
                 end=end,
             )
 
-        result = _scan_lines(member, handle)
+        result = _scan_lines_chunk(member, cursor, max_bytes, handle, state)
         if (
             not session_established
             and result.source_standing is SourceStanding.AVAILABLE
+            and not result.exhausted
         ):
-            return MemberScan(
+            return MemberChunk(
                 member=result.member,
                 episodes=(),
+                next_cursor=result.next_cursor,
                 observed_end=result.observed_end,
                 complete_end=result.complete_end,
                 source_standing=SourceStanding.MALFORMED,
@@ -416,6 +531,8 @@ class ClaudeCodeAdapter:
                     if result.freshness is FreshnessStanding.INCOMPLETE
                     else FreshnessStanding.UNKNOWN
                 ),
+                bytes_read=result.bytes_read,
+                exhausted=result.exhausted,
                 error_position=0,
             )
         return result

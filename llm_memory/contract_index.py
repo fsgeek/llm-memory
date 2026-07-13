@@ -109,7 +109,11 @@ def write_generation(
             INSERT @identity
             UPDATE {
                 staging_generation_id: @generation_id,
-                staging_episode_count: @episode_count,
+                staging_episode_count: (
+                    OLD.staging_generation_id == @generation_id
+                    ? OLD.staging_episode_count + @episode_count
+                    : @episode_count
+                ),
                 canonicalization_version: @canonicalization_version,
                 boundary_version: @boundary_version
             }

@@ -238,6 +238,19 @@ def test_activation_rejects_a_generation_that_was_not_fully_staged(contract_stor
     assert active_states(db, (corpus_id,)) == ()
 
 
+def test_generation_can_be_staged_across_bounded_writes(contract_storage):
+    db, corpus_id, _ = contract_storage
+    enrollment = _enrollment(corpus_id)
+    member = SourceMember("member-a", Path("/unused"))
+
+    write_generation(db, enrollment, member, "bounded", [_episode(enrollment, "a")])
+    write_generation(db, enrollment, member, "bounded", [_episode(enrollment, "b")])
+    activate_generation(db, enrollment, member, "bounded", _state())
+
+    state = active_states(db, (corpus_id,))[0]
+    assert state["episode_count"] == 2
+
+
 def test_active_states_filters_corpora_and_generation_deletion_is_scoped(
     contract_storage,
 ):
