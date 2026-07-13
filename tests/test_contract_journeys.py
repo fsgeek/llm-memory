@@ -147,9 +147,19 @@ def test_cli_emits_atomic_non_content_journey_with_digests_and_counts(tmp_path):
             "total_matches": 1,
             "total_standing": "exact",
         }
-        assert report["timing"]["search_with_count_elapsed_ms"] >= 0
-        assert report["timing"]["count_elapsed_ms"] is None
-        assert report["timing"]["count_timing_standing"] == "combined_with_search"
+        assert (
+            report["timing"][
+                "automatic_reconciliation_plus_search_count_elapsed_ms"
+            ]
+            >= 0
+        )
+        assert report["timing"]["operation_timing_standing"] == "inclusive"
+        assert report["timing"]["provider_search_count_elapsed_ms"] is None
+        assert (
+            report["timing"]["provider_search_count_timing_standing"]
+            == "unavailable_not_instrumented"
+        )
+        assert "search_with_count_elapsed_ms" not in serialized
         assert report["results"] == [
             {
                 "episode_ref_digest": hashlib.sha256(episode_ref.encode()).hexdigest(),

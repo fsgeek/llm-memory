@@ -28,8 +28,8 @@ _LIMITATIONS = (
     "and episode content are redacted.",
     "Serialized-byte projection is an AQL representation measurement, not "
     "storage-engine disk usage.",
-    "The provider obtains result and count outcomes in one query, so standalone "
-    "count latency is unavailable.",
+    "The measured search operation includes automatic reconciliation; the "
+    "provider search-and-count query is not independently instrumented.",
 )
 
 
@@ -102,14 +102,14 @@ def run_journey(
     after_reconciliation = _projection(db, corpus_ids)
 
     search_budget = WorkBudget(_RECONCILIATION_MAX_BYTES, now)
-    search_started = time.perf_counter()
+    operation_started = time.perf_counter()
     search = search_history(
         db,
         registry,
         SearchRequest.create(query, corpus_ids, limit=limit),
         search_budget,
     )
-    search_elapsed_ms = (time.perf_counter() - search_started) * 1_000
+    operation_elapsed_ms = (time.perf_counter() - operation_started) * 1_000
     after = _projection(db, corpus_ids)
 
     opening = None
@@ -129,7 +129,7 @@ def run_journey(
             "automatic_search_bytes_read": search_budget.bytes_read,
         },
         "search": search,
-        "search_elapsed_ms": search_elapsed_ms,
+        "automatic_search_operation_elapsed_ms": operation_elapsed_ms,
         "opening": opening,
         "index_before": before,
         "index_after_reconciliation": after_reconciliation,
@@ -257,9 +257,14 @@ def redact_journey(result: dict) -> dict:
             ],
         },
         "timing": {
-            "search_with_count_elapsed_ms": result["search_elapsed_ms"],
-            "count_elapsed_ms": None,
-            "count_timing_standing": "combined_with_search",
+            "automatic_reconciliation_plus_search_count_elapsed_ms": result[
+                "automatic_search_operation_elapsed_ms"
+            ],
+            "operation_timing_standing": "inclusive",
+            "provider_search_count_elapsed_ms": None,
+            "provider_search_count_timing_standing": (
+                "unavailable_not_instrumented"
+            ),
         },
         "index_growth": {
             "documents": after["documents"] - before["documents"],
