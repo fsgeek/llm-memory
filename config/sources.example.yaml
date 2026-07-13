@@ -1,0 +1,18 @@
+contract_version: 1
+sources:
+  - corpus_id: project-history
+    source_id: claude-sessions
+    adapter: claude_code_jsonl
+    boundary_version: 1
+    canonicalization_version: 1
+    locator: /srv/llm-memory/sources/claude-code
+    enabled: true
+    full_validation_max_age_seconds: 86400
+  - corpus_id: project-history
+    source_id: gateway-log
+    adapter: gateway_jsonl
+    boundary_version: 1
+    canonicalization_version: 1
+    locator: /srv/llm-memory/sources/gateway.jsonl
+    enabled: true
+    full_validation_max_age_seconds: 86400

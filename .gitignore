@@ -1,4 +1,5 @@
 config/db-config.ini
+config/sources.yaml
 
 # Python
 __pycache__/
