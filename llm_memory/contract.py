@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 CONTRACT_VERSION = 1
 STRATEGY = "lexical_bm25_text_en_v1"
 MAX_LIMIT = 100
+_CORPUS_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 
 
 class ContractError(ValueError):
@@ -128,6 +129,14 @@ def _require_text(name: str, value: str) -> str:
     return value
 
 
+def _require_corpus_id(value: str) -> str:
+    if not isinstance(value, str) or _CORPUS_ID_PATTERN.fullmatch(value) is None:
+        raise ContractError(
+            "corpus_id must contain only URL-safe letters, digits, '.', '_', '~', or '-'"
+        )
+    return value
+
+
 def _require_positive_version(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ContractError(f"{name} must be a positive integer")
@@ -139,6 +148,9 @@ class EpisodeReference:
     corpus_id: str
     session_id: str
     episode_id: str
+
+    def __post_init__(self) -> None:
+        _require_corpus_id(self.corpus_id)
 
     @classmethod
     def build(
@@ -152,7 +164,7 @@ class EpisodeReference:
         event_token: str,
         content_digest: str,
     ) -> EpisodeReference:
-        _require_text("corpus_id", corpus_id)
+        _require_corpus_id(corpus_id)
         _require_text("source_id", source_id)
         _require_text("native_session_id", native_session_id)
         _require_text("event_token", event_token)
@@ -175,6 +187,8 @@ class EpisodeReference:
     def parse(cls, episode_ref: str) -> EpisodeReference:
         if not isinstance(episode_ref, str):
             raise ContractError("episode_ref must be a string")
+        if any(character.isspace() for character in episode_ref):
+            raise ContractError("episode_ref must not contain whitespace")
         try:
             parsed = urlsplit(episode_ref)
         except ValueError as exc:
@@ -182,7 +196,6 @@ class EpisodeReference:
         segments = parsed.path.split("/")
         if (
             parsed.scheme != "episode"
-            or not parsed.netloc
             or len(segments) != 3
             or segments[0]
             or not all(segments[1:])
@@ -308,16 +321,15 @@ class SearchRequest:
             corpora = tuple(corpus_ids)
         except TypeError as exc:
             raise ContractError("corpus_ids must be an iterable of strings") from exc
-        if (
-            not corpora
-            or any(not isinstance(item, str) or not item.strip() for item in corpora)
-            or any(item.strip().lower() in {"*", "all"} for item in corpora)
-        ):
+        if not corpora:
             raise ContractError("corpus_ids must contain concrete corpus identifiers")
-        normalized_corpora = tuple(item.strip() for item in corpora)
-        if len(set(normalized_corpora)) != len(normalized_corpora):
+        for corpus_id in corpora:
+            _require_corpus_id(corpus_id)
+            if corpus_id.lower() == "all":
+                raise ContractError("corpus_ids must contain concrete corpus identifiers")
+        if len(set(corpora)) != len(corpora):
             raise ContractError("corpus_ids must be unique")
-        return cls(clean_query, normalized_corpora, limit, strategy)
+        return cls(clean_query, corpora, limit, strategy)
 
 
 @dataclass(frozen=True)
