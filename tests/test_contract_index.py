@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -12,6 +14,7 @@ from llm_memory.contract import EpisodeBody, build_identity, reference_key
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
     CONTRACT_VIEW,
+    GenerationStateConflict,
     SOURCE_STATES,
     SUPERSESSIONS,
     active_states,
@@ -263,6 +266,32 @@ def test_generation_writes_are_idempotent_and_count_stored_documents(contract_st
     activate_generation(db, enrollment, member, "retryable", _state())
 
     assert active_states(db, (corpus_id,))[0]["episode_count"] == 1
+
+
+def test_parallel_generation_writers_expose_only_contract_conflicts(contract_storage):
+    db, corpus_id, _ = contract_storage
+    enrollment = _enrollment(corpus_id)
+    member = SourceMember("member-a", Path("/unused"))
+    episode = _episode(enrollment)
+    barrier = Barrier(8)
+
+    def write_from_independent_handle(_):
+        worker_db = get_database()
+        barrier.wait()
+        try:
+            write_generation(
+                worker_db, enrollment, member, "parallel", [episode]
+            )
+        except GenerationStateConflict:
+            return "conflict"
+        return "written"
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(executor.map(write_from_independent_handle, range(8)))
+
+    assert "written" in outcomes
+    write_generation(db, enrollment, member, "parallel", [episode])
+    assert db.collection(CONTRACT_EPISODES).count() >= 1
 
 
 def test_generation_retry_rejects_conflicting_deterministic_document(contract_storage):

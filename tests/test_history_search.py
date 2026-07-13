@@ -377,16 +377,6 @@ def test_unavailable_member_index_keeps_hits_but_makes_population_unknown(monkey
         aql = AQL()
 
     monkeypatch.setattr("llm_memory.history.reconcile_registry", lambda *args: report)
-    monkeypatch.setattr(
-        "llm_memory.history.active_states",
-        lambda *args: (
-            {
-                "corpus_id": corpus_id,
-                "source_id": "available",
-                "active_generation_id": "generation-a",
-            },
-        ),
-    )
 
     response = search_history(DB(), registry, request(corpus_id), WorkBudget(1, NOW))
     corpus = response["corpus_standing"][0]
@@ -440,28 +430,16 @@ def test_active_generations_are_limited_to_enabled_sources(monkeypatch):
 
     class AQL:
         def execute(self, query, *, bind_vars):
-            assert bind_vars["active_generations"] == ["enabled-generation"]
+            assert "FOR state IN @@states" in query
+            assert bind_vars["enabled_source_keys"] == [
+                f"{corpus_id}\0enabled"
+            ]
             return iter([{"total_matches": 0, "corpus_totals": [], "results": []}])
 
     class DB:
         aql = AQL()
 
     monkeypatch.setattr("llm_memory.history.reconcile_registry", lambda *args: report)
-    monkeypatch.setattr(
-        "llm_memory.history.active_states",
-        lambda *args: (
-            {
-                "corpus_id": corpus_id,
-                "source_id": "disabled",
-                "active_generation_id": "disabled-generation",
-            },
-            {
-                "corpus_id": corpus_id,
-                "source_id": "enabled",
-                "active_generation_id": "enabled-generation",
-            },
-        ),
-    )
 
     response = search_history(DB(), registry, request(corpus_id), WorkBudget(1, NOW))
 
@@ -508,7 +486,9 @@ def test_noncurrent_available_indexes_remain_searchable_with_member_standing(
 
     class AQL:
         def execute(self, query, *, bind_vars):
-            assert bind_vars["active_generations"] == ["generation-a"]
+            assert bind_vars["enabled_source_keys"] == [
+                f"{corpus_id}\0source-a"
+            ]
             return iter(
                 [
                     {
@@ -533,16 +513,6 @@ def test_noncurrent_available_indexes_remain_searchable_with_member_standing(
         aql = AQL()
 
     monkeypatch.setattr("llm_memory.history.reconcile_registry", lambda *args: report)
-    monkeypatch.setattr(
-        "llm_memory.history.active_states",
-        lambda *args: (
-            {
-                "corpus_id": corpus_id,
-                "source_id": "source-a",
-                "active_generation_id": "generation-a",
-            },
-        ),
-    )
 
     response = search_history(DB(), registry, request(corpus_id), WorkBudget(1, NOW))
 

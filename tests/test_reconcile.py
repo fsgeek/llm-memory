@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -241,6 +243,28 @@ def test_work_budget_validation_and_initial_build_reaches_current(reconciliation
     assert len(active_documents(db, corpus_id)) == 2
 
 
+def test_parallel_reconcilers_degrade_database_races_to_retryable_state(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "parallel-reconcile.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    barrier = Barrier(8)
+
+    def reconcile_from_independent_handle(_):
+        worker_db = get_database()
+        barrier.wait()
+        return run(worker_db, source)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        reports = list(executor.map(reconcile_from_independent_handle, range(8)))
+
+    assert len(reports) == 8
+    final = run(db, source)
+    assert members(final)[0]["freshness"] == "current"
+
+
 def test_append_and_partial_or_malformed_tail_preserve_exact_position(reconciliation_storage, tmp_path):
     db, prefix = reconciliation_storage
     path = tmp_path / "tail.jsonl"
@@ -328,6 +352,29 @@ def test_activation_failure_never_leaves_tail_only_build_current(
     assert active_states(db, (corpus_id,))[0]["active_generation_id"] == (
         original_generation
     )
+
+
+def test_append_seed_does_not_materialize_active_generation_in_python(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "server-seed.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    with path.open("ab") as stream:
+        stream.write(json.dumps(taste(2, "two", "reply")).encode() + b"\n")
+
+    def forbid_full_generation_read(*args, **kwargs):
+        raise AssertionError("append seeding materialized the active generation")
+
+    monkeypatch.setattr(
+        reconcile_module, "_generation_documents", forbid_full_generation_read
+    )
+    report = run(db, source, max_bytes=1)
+
+    assert members(report)[0]["freshness"] == "tail_validated"
+    assert len(active_documents(db, corpus_id)) == 2
 
 
 @pytest.mark.parametrize("failure", ["missing", "malformed"])

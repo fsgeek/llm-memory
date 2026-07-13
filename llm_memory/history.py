@@ -13,7 +13,12 @@ from llm_memory.contract import (
     SearchRequest,
     SourceStanding,
 )
-from llm_memory.contract_index import CONTRACT_VIEW, SUPERSESSIONS, active_states
+from llm_memory.contract_index import (
+    CONTRACT_EPISODES,
+    CONTRACT_VIEW,
+    SOURCE_STATES,
+    SUPERSESSIONS,
+)
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
 from llm_memory.reconcile import WorkBudget, reconcile_registry
 from llm_memory.search import _matched_field
@@ -23,6 +28,24 @@ _ANALYZER = "text_en"
 _SNIPPET_LIMIT = 200
 
 _SEARCH_AQL = """
+LET active_generations = (
+  FOR state IN @@states
+    FILTER state.corpus_id IN @corpus_ids
+    FILTER CONCAT(state.corpus_id, @source_key_separator, state.source_id)
+      IN @enabled_source_keys
+    FILTER state.active_generation_id != null
+    FILTER state.active_generation_integrity != "invalid"
+    LET stored_episode_count = LENGTH(
+      FOR episode IN @@episodes
+        FILTER episode.corpus_id == state.corpus_id
+        FILTER episode.source_id == state.source_id
+        FILTER episode.member_id == state.member_id
+        FILTER episode.generation_id == state.active_generation_id
+        RETURN 1
+    )
+    FILTER stored_episode_count == state.episode_count
+    RETURN state.active_generation_id
+)
 LET matches = (
   FOR doc IN @@view
     SEARCH ANALYZER(
@@ -33,7 +56,7 @@ LET matches = (
     )
     OPTIONS { waitForSync: true }
     FILTER doc.corpus_id IN @corpus_ids
-    FILTER doc.generation_id IN @active_generations
+    FILTER doc.generation_id IN active_generations
     LET score = BM25(doc)
     SORT score DESC, doc.episode_ref ASC
     RETURN MERGE(doc, {score})
@@ -307,28 +330,22 @@ def search_history(
     scoped_registry = _scoped_registry(registry, validated.corpus_ids)
 
     reconciliation = reconcile_registry(db, scoped_registry, budget)
-    states = active_states(db, validated.corpus_ids)
-    enabled_sources = {
-        (source.corpus_id, source.source_id) for source in scoped_registry.sources
-    }
-    active_generations = sorted(
-        {
-            state["active_generation_id"]
-            for state in states
-            if (state["corpus_id"], state["source_id"]) in enabled_sources
-            and state.get("active_generation_backed", True)
-            and state.get("active_generation_integrity") != "invalid"
-        }
+    enabled_source_keys = sorted(
+        f"{source.corpus_id}\0{source.source_id}"
+        for source in scoped_registry.sources
     )
     population = list(
         db.aql.execute(
             _SEARCH_AQL,
             bind_vars={
                 "@view": CONTRACT_VIEW,
+                "@states": SOURCE_STATES,
+                "@episodes": CONTRACT_EPISODES,
                 "query": validated.query,
                 "analyzer": _ANALYZER,
                 "corpus_ids": list(validated.corpus_ids),
-                "active_generations": active_generations,
+                "enabled_source_keys": enabled_source_keys,
+                "source_key_separator": "\0",
                 "limit": validated.limit,
             },
         )

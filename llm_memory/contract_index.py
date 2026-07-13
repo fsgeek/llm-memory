@@ -4,6 +4,8 @@ import hashlib
 from collections.abc import Iterable
 from typing import Any
 
+from arango.exceptions import AQLQueryExecuteError, DocumentInsertError
+
 from llm_memory.adapters import EpisodeRecord, SourceMember
 from llm_memory.contract import reference_key
 from llm_memory.enrollment import SourceEnrollment
@@ -26,6 +28,15 @@ class GenerationDocumentConflict(ValueError):
     def __init__(self, document: dict[str, Any]):
         self.error_position = document["source_position"]["start"]
         super().__init__(f"conflicting generation document {document['_key']!r}")
+
+
+def _same_stored_document(existing: dict[str, Any] | None, document: dict) -> bool:
+    if existing is None:
+        return False
+    stored = {
+        key: value for key, value in existing.items() if key not in {"_id", "_rev"}
+    }
+    return stored == document
 
 
 def _view_properties() -> dict[str, Any]:
@@ -128,14 +139,16 @@ def write_generation(
     for document in documents:
         existing = collection.get(document["_key"])
         if existing is None:
-            collection.insert(document)
+            try:
+                collection.insert(document)
+            except DocumentInsertError as exc:
+                if exc.error_code != 1210:
+                    raise
+                existing = collection.get(document["_key"])
+                if not _same_stored_document(existing, document):
+                    raise GenerationDocumentConflict(document) from exc
             continue
-        stored = {
-            key: value
-            for key, value in existing.items()
-            if key not in {"_id", "_rev"}
-        }
-        if stored != document:
+        if not _same_stored_document(existing, document):
             raise GenerationDocumentConflict(document)
 
     bind_vars = {
@@ -222,12 +235,145 @@ def write_generation(
                 ),
             }
         )
-    published = list(db.aql.execute(query, bind_vars=bind_vars))
+    try:
+        published = list(db.aql.execute(query, bind_vars=bind_vars))
+    except AQLQueryExecuteError as exc:
+        if exc.error_code not in {1200, 1210}:
+            raise
+        raise GenerationStateConflict(
+            f"generation {generation_id!r} publication raced"
+        ) from exc
     if not published:
         raise GenerationStateConflict(
             f"generation {generation_id!r} lost staging ownership"
         )
     return len(documents)
+
+
+def generation_count(db, state: dict, generation_id: str | None = None) -> int:
+    generation_id = generation_id or state.get("active_generation_id")
+    if not generation_id:
+        return 0
+    return next(
+        iter(
+            db.aql.execute(
+                """
+                RETURN LENGTH(
+                    FOR episode IN @@episodes
+                        FILTER episode.corpus_id == @corpus_id
+                        FILTER episode.source_id == @source_id
+                        FILTER episode.member_id == @member_id
+                        FILTER episode.generation_id == @generation_id
+                        RETURN 1
+                )
+                """,
+                bind_vars={
+                    "@episodes": CONTRACT_EPISODES,
+                    "corpus_id": state["corpus_id"],
+                    "source_id": state["source_id"],
+                    "member_id": state["member_id"],
+                    "generation_id": generation_id,
+                },
+            )
+        )
+    )
+
+
+def seed_generation(
+    db,
+    enrollment: SourceEnrollment,
+    member: SourceMember,
+    source_generation_id: str,
+    target_generation_id: str,
+    *,
+    expected_state: dict,
+) -> int:
+    state_key = _source_state_key(
+        enrollment.corpus_id, enrollment.source_id, member.member_id
+    )
+    bind_vars = {
+        "@episodes": CONTRACT_EPISODES,
+        "@states": SOURCE_STATES,
+        "key": state_key,
+        "corpus_id": enrollment.corpus_id,
+        "source_id": enrollment.source_id,
+        "member_id": member.member_id,
+        "source_generation_id": source_generation_id,
+        "target_generation_id": target_generation_id,
+        "key_separator": "\0",
+        "canonicalization_version": enrollment.canonicalization_version,
+        "boundary_version": enrollment.boundary_version,
+        "expected_revision": expected_state.get("_rev"),
+        "expected_active_generation_id": expected_state.get(
+            "active_generation_id"
+        ),
+        "expected_build_generation_id": expected_state.get("build_generation_id"),
+        "expected_build_cursor": expected_state.get("build_cursor"),
+        "expected_staging_generation_id": expected_state.get(
+            "staging_generation_id"
+        ),
+        "expected_staging_episode_count": expected_state.get(
+            "staging_episode_count"
+        ),
+    }
+    try:
+        published = list(
+            db.aql.execute(
+                """
+                LET copied = (
+                    FOR episode IN @@episodes
+                        FILTER episode.corpus_id == @corpus_id
+                        FILTER episode.source_id == @source_id
+                        FILTER episode.member_id == @member_id
+                        FILTER episode.generation_id == @source_generation_id
+                        LET clone = MERGE(
+                            UNSET(episode, "_id", "_rev", "_key"),
+                            {
+                                _key: SHA256(CONCAT(
+                                    @target_generation_id,
+                                    @key_separator,
+                                    episode.episode_ref
+                                )),
+                                generation_id: @target_generation_id
+                            }
+                        )
+                        UPSERT { _key: clone._key }
+                            INSERT clone
+                            UPDATE {}
+                            IN @@episodes
+                        RETURN 1
+                )
+                LET staged_count = LENGTH(copied)
+                FOR current IN @@states
+                    FILTER current._key == @key
+                    FILTER current._rev == @expected_revision
+                    FILTER current.active_generation_id == @expected_active_generation_id
+                    FILTER current.build_generation_id == @expected_build_generation_id
+                    FILTER current.build_cursor == @expected_build_cursor
+                    FILTER current.staging_generation_id == @expected_staging_generation_id
+                    FILTER current.staging_episode_count == @expected_staging_episode_count
+                    UPDATE current WITH {
+                        staging_generation_id: @target_generation_id,
+                        staging_episode_count: staged_count,
+                        staging_canonicalization_version: @canonicalization_version,
+                        staging_boundary_version: @boundary_version
+                    } IN @@states
+                    RETURN staged_count
+                """,
+                bind_vars=bind_vars,
+            )
+        )
+    except AQLQueryExecuteError as exc:
+        if exc.error_code not in {1200, 1210}:
+            raise
+        raise GenerationStateConflict(
+            f"generation {target_generation_id!r} seed raced"
+        ) from exc
+    if not published:
+        raise GenerationStateConflict(
+            f"generation {target_generation_id!r} lost seed ownership"
+        )
+    return published[0]
 
 
 def activate_generation(
@@ -254,8 +400,9 @@ def activate_generation(
         "canonicalization_version": enrollment.canonicalization_version,
         "boundary_version": enrollment.boundary_version,
     }
-    activated = list(
-        db.aql.execute(
+    try:
+        activated = list(
+            db.aql.execute(
             """
             LET episode_count = LENGTH(
                 FOR episode IN @@episodes
@@ -311,8 +458,14 @@ def activate_generation(
                     expected_state.get("build_cursor") if expected_state else None
                 ),
             },
+            )
         )
-    )
+    except AQLQueryExecuteError as exc:
+        if exc.error_code not in {1200, 1210}:
+            raise
+        raise GenerationStateConflict(
+            f"generation {generation_id!r} activation raced"
+        ) from exc
     if not activated:
         raise ValueError(f"generation {generation_id!r} is not fully staged")
 

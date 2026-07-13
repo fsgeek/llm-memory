@@ -8,16 +8,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from arango.exceptions import AQLQueryExecuteError
+
 from llm_memory.adapters import (
-    EpisodeRecord,
     MemberChunk,
     ScanCursor,
     SourceMember,
     get_adapter,
 )
 from llm_memory.contract import (
-    EpisodeBody,
-    EpisodeIdentity,
     EpisodeReference,
     FreshnessStanding,
     SourceStanding,
@@ -31,6 +30,8 @@ from llm_memory.contract_index import (
     activate_generation,
     delete_generation,
     ensure_contract_index,
+    generation_count,
+    seed_generation,
     write_generation,
 )
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
@@ -181,7 +182,14 @@ def _patch_state(
             }
         )
         bind_vars.pop("identity")
-    updated = list(db.aql.execute(query, bind_vars=bind_vars))
+    try:
+        updated = list(db.aql.execute(query, bind_vars=bind_vars))
+    except AQLQueryExecuteError as exc:
+        if exc.error_code not in {1200, 1210}:
+            raise
+        raise _StateConflict(
+            f"source state raced for {enrollment.source_id}/{member_id}"
+        ) from exc
     if not updated:
         raise _StateConflict(
             f"source state changed for {enrollment.source_id}/{member_id}"
@@ -189,7 +197,14 @@ def _patch_state(
     return updated[0]
 
 
-def _generation_documents(db, state: dict, generation_id: str | None = None) -> tuple[dict, ...]:
+def _generation_documents(
+    db,
+    state: dict,
+    generation_id: str | None = None,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+) -> tuple[dict, ...]:
     generation_id = generation_id or state.get("active_generation_id")
     if not generation_id:
         return ()
@@ -201,6 +216,8 @@ def _generation_documents(db, state: dict, generation_id: str | None = None) -> 
                 FILTER episode.source_id == @source_id
                 FILTER episode.member_id == @member_id
                 FILTER episode.generation_id == @generation_id
+                FILTER @start == null OR episode.source_position.start >= @start
+                FILTER @end == null OR episode.source_position.end <= @end
                 SORT episode.source_position.start, episode.episode_ref
                 RETURN UNSET(episode, "_id", "_rev")
             """,
@@ -210,6 +227,8 @@ def _generation_documents(db, state: dict, generation_id: str | None = None) -> 
                 "source_id": state["source_id"],
                 "member_id": state["member_id"],
                 "generation_id": generation_id,
+                "start": start,
+                "end": end,
             },
         )
     )
@@ -219,7 +238,7 @@ def _active_generation_backed(db, state: dict | None) -> bool:
     if not state or not state.get("active_generation_id"):
         return False
     expected = state.get("episode_count")
-    return expected is not None and len(_generation_documents(db, state)) == expected
+    return expected is not None and generation_count(db, state) == expected
 
 
 def _same_transition(current: dict | None, expected: dict) -> bool:
@@ -231,28 +250,6 @@ def _same_transition(current: dict | None, expected: dict) -> bool:
         and current.get("build_generation_id")
         == expected.get("build_generation_id")
         and current.get("build_cursor") == expected.get("build_cursor")
-    )
-
-
-def _episode_from_document(document: dict) -> EpisodeRecord:
-    body = EpisodeBody(
-        timestamp=document["timestamp"],
-        model=document["model"],
-        user_message=document["user_message"],
-        response=document["response"],
-        state=document["state"],
-        activity_log=document["activity_log"],
-        adapter_fields=document["adapter_fields"],
-    )
-    return EpisodeRecord(
-        identity=EpisodeIdentity(
-            EpisodeReference.parse(document["episode_ref"]),
-            document["body_digest"],
-        ),
-        body=body,
-        native_event_id=document.get("native_event_id"),
-        source_position=document["source_position"],
-        state_text=document.get("state_text", ""),
     )
 
 
@@ -413,17 +410,18 @@ def _finalize_supersessions(
     new_generation = pending["new_generation_id"]
     if state.get("active_generation_id") != new_generation:
         return
-    old_documents = _generation_documents(db, state, old_generation)
-    new_documents = _generation_documents(db, state, new_generation)
-    _record_supersessions(
-        db,
-        enrollment,
-        state["member_id"],
-        old_documents,
-        new_documents,
-        pending["reason"],
-        _parse_timestamp(pending["detected_at"]),
-    )
+    if pending["reason"] != "append":
+        old_documents = _generation_documents(db, state, old_generation)
+        new_documents = _generation_documents(db, state, new_generation)
+        _record_supersessions(
+            db,
+            enrollment,
+            state["member_id"],
+            old_documents,
+            new_documents,
+            pending["reason"],
+            _parse_timestamp(pending["detected_at"]),
+        )
     delete_generation(
         db,
         enrollment.corpus_id,
@@ -518,14 +516,13 @@ def _reconcile_tail(
     generation_id = state["build_generation_id"]
     if state["build_mode"] == "append" and not state.get("build_seeded"):
         transition = state
-        active = _generation_documents(db, state)
         try:
-            write_generation(
+            seed_generation(
                 db,
                 enrollment,
                 member,
+                state["active_generation_id"],
                 generation_id,
-                (_episode_from_document(document) for document in active),
                 expected_state=transition,
             )
         except (GenerationDocumentConflict, GenerationStateConflict):
@@ -824,10 +821,16 @@ def _reconcile_audit(
     for episode in chunk.episodes:
         chain = extend_chain(chain, episode.identity.episode_ref)
 
-    active_documents = _generation_documents(db, state)
+    stored_episode_count = generation_count(db, state)
     active_generation_backed = (
         state.get("episode_count") is not None
-        and len(active_documents) == state.get("episode_count")
+        and stored_episode_count == state.get("episode_count")
+    )
+    expected_documents = _generation_documents(
+        db,
+        state,
+        start=audit.get("offset", 0),
+        end=chunk.next_cursor.byte_offset,
     )
     expected = tuple(
         (
@@ -835,9 +838,7 @@ def _reconcile_audit(
             document["source_position"]["start"],
             document["source_position"]["end"],
         )
-        for document in active_documents
-        if document["source_position"]["start"] >= audit.get("offset", 0)
-        and document["source_position"]["end"] <= chunk.next_cursor.byte_offset
+        for document in expected_documents
     )
     actual = tuple(
         (
@@ -996,6 +997,7 @@ def _reconcile_audit(
         return
 
     if active_generation_backed:
+        active_documents = _generation_documents(db, state)
         expected_chain = ""
         for document in active_documents:
             expected_chain = extend_chain(expected_chain, document["episode_ref"])
