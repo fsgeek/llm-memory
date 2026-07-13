@@ -341,6 +341,11 @@ def _begin_build(
             "staging_episode_count": None,
             "staging_canonicalization_version": None,
             "staging_boundary_version": None,
+            "active_generation_integrity": (
+                "invalid"
+                if reason == "pending_source_change"
+                else state.get("active_generation_integrity")
+            ),
             "freshness": FreshnessStanding.STALE.value if state.get("active_generation_id") else FreshnessStanding.INCOMPLETE.value,
         },
         expected_state=expected_state,
@@ -454,6 +459,20 @@ def _tail_needed(enrollment: SourceEnrollment, member: SourceMember, state: dict
     ):
         return True, "semantic_version"
     generation = _stat(member)
+    if state.get("complete_end", 0) < state.get("observed_end", 0):
+        published = state.get("member_generation")
+        appendable = bool(
+            generation
+            and published
+            and generation.get("device") == published.get("device")
+            and generation.get("inode") == published.get("inode")
+            and generation["size"] >= published.get("size", 0)
+            and (
+                generation["size"] > published.get("size", 0)
+                or generation.get("mtime_ns") == published.get("mtime_ns")
+            )
+        )
+        return True, "append" if appendable else "pending_source_change"
     if generation and generation["size"] > state.get("complete_end", 0):
         return True, "append"
     return False, ""
@@ -578,7 +597,12 @@ def _reconcile_tail(
                 "source_standing": chunk.source_standing.value,
                 "error_position": chunk.error_position,
                 "member_generation": generation,
-                "freshness": chunk.freshness.value,
+                "freshness": (
+                    FreshnessStanding.STALE.value
+                    if state.get("active_generation_integrity") == "invalid"
+                    and chunk.source_standing is SourceStanding.AVAILABLE
+                    else chunk.freshness.value
+                ),
                 "implementation_version": adapter.implementation_version,
             },
             expected_state=state,
@@ -588,8 +612,7 @@ def _reconcile_tail(
     if chunk.exhausted:
         return
     if (
-        not state.get("active_generation_id")
-        and (
+        (
             chunk.source_standing is not SourceStanding.AVAILABLE
             or chunk.error_position is not None
         )
@@ -634,6 +657,7 @@ def _reconcile_tail(
         "build_seeded": None,
         "implementation_compatibility": None,
         "incompatible_implementation_version": None,
+        "active_generation_integrity": None,
         "validated_at": None,
         "supersession_finalization": pending_finalization,
         "integrity_audit": {
@@ -1103,10 +1127,12 @@ def _member_standing(
     )
     compatibility = state.get("implementation_compatibility")
     incompatible = compatibility not in {None, "compatible"}
+    active_integrity_invalid = state.get("active_generation_integrity") == "invalid"
     if (
         state.get("active_generation_id")
         and _active_generation_backed(db, state)
         and not incompatible
+        and not active_integrity_invalid
     ):
         index_standing = "available"
     elif (

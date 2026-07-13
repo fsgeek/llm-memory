@@ -1015,6 +1015,145 @@ def test_compatibility_completion_publishes_tail_from_final_stat(
     assert active[0]["episode_ref"] == original_ref
 
 
+def test_pending_compatibility_tail_truncation_replaces_from_zero(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "pending-tail-truncated.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    delegate = replace(
+        adapters_module.get_adapter("taste_open_jsonl"),
+        implementation_version="2",
+    )
+    appended = False
+
+    def append_after_scan(_chunk):
+        nonlocal appended
+        if not appended:
+            appended = True
+            with path.open("ab") as stream:
+                stream.write(json.dumps(taste(2, "tail", "bbb")).encode() + b"\n")
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, append_after_scan),
+    )
+    pending = run(db, source, max_bytes=1)
+    assert members(pending)[0]["freshness"] == "tail_validated"
+    path.write_bytes(b"")
+
+    recovered = run(db, source, max_bytes=1_000_000)
+    state = active_states(db, (corpus_id,))[0]
+
+    assert members(recovered)[0]["freshness"] == "current"
+    assert members(recovered)[0]["index_standing"] == "available"
+    assert state["active_generation_id"] != original_generation
+    assert state["episode_count"] == 0
+
+
+def test_pending_compatibility_tail_atomic_replacement_does_not_seed_old_prefix(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "pending-tail-replaced.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_ref = active_documents(db, corpus_id)[0]["episode_ref"]
+    delegate = replace(
+        adapters_module.get_adapter("taste_open_jsonl"),
+        implementation_version="2",
+    )
+    appended = False
+
+    def append_after_scan(_chunk):
+        nonlocal appended
+        if not appended:
+            appended = True
+            with path.open("ab") as stream:
+                stream.write(json.dumps(taste(2, "tail", "bbb")).encode() + b"\n")
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, append_after_scan),
+    )
+    run(db, source, max_bytes=1)
+    pending_state = source_state(db, corpus_id)
+    replacement = tmp_path / "replacement.jsonl"
+    write_jsonl(
+        replacement,
+        [
+            taste(10, "replacement-one", "xxx"),
+            taste(11, "replacement-two", "yyy"),
+            taste(12, "replacement-three", "zzz"),
+        ],
+    )
+    assert replacement.stat().st_size > pending_state["complete_end"]
+    os.replace(replacement, path)
+
+    recovered = run(db, source, max_bytes=1_000_000)
+    active = active_documents(db, corpus_id)
+
+    assert members(recovered)[0]["freshness"] == "current"
+    assert members(recovered)[0]["index_standing"] == "available"
+    assert len(active) == 3
+    assert original_ref not in {document["episode_ref"] for document in active}
+    assert source_state(db, corpus_id)["complete_end"] == path.stat().st_size
+
+
+def test_pending_compatibility_tail_disappearance_is_unavailable_then_recovers(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "pending-tail-missing.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_ref = active_documents(db, corpus_id)[0]["episode_ref"]
+    delegate = replace(
+        adapters_module.get_adapter("taste_open_jsonl"),
+        implementation_version="2",
+    )
+    appended = False
+
+    def append_after_scan(_chunk):
+        nonlocal appended
+        if not appended:
+            appended = True
+            with path.open("ab") as stream:
+                stream.write(json.dumps(taste(2, "tail", "bbb")).encode() + b"\n")
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, append_after_scan),
+    )
+    run(db, source, max_bytes=1)
+    path.unlink()
+
+    missing = run(db, source, max_bytes=1_000_000)
+    missing_state = source_state(db, corpus_id)
+
+    assert members(missing)[0]["source_standing"] == "missing"
+    assert members(missing)[0]["index_standing"] == "unavailable"
+    assert members(missing)[0]["freshness"] == "unavailable"
+    assert missing_state["active_generation_integrity"] == "invalid"
+    assert missing_state["build_reason"] == "pending_source_change"
+
+    write_jsonl(path, [taste(20, "replacement", "xxx")])
+    recovered = run(db, source, max_bytes=1_000_000)
+    active = active_documents(db, corpus_id)
+
+    assert members(recovered)[0]["freshness"] == "current"
+    assert len(active) == 1
+    assert active[0]["episode_ref"] != original_ref
+
+
 def test_implementation_change_checks_trusted_prefix_before_derived_loss(
     reconciliation_storage, tmp_path, monkeypatch
 ):

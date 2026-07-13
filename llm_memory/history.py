@@ -317,6 +317,7 @@ def search_history(
             for state in states
             if (state["corpus_id"], state["source_id"]) in enabled_sources
             and state.get("active_generation_backed", True)
+            and state.get("active_generation_integrity") != "invalid"
         }
     )
     population = list(
