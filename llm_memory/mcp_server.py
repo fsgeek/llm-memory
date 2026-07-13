@@ -1,22 +1,32 @@
 """Read-only MCP server over episodic memory.
 
-Two tools, both reads: `search` ranks episodes (conversation-inclusive BM25) and
-`recall` fetches one episode in full by the key a search hit carries. There is no
-write tool on purpose — episodes are written by the faithful pichay capture, not
-by the instance reaching for them, so the record stays an artifact rather than
-something the instance can edit about itself.
+`search_history` and `open_episode` expose the versioned episodic contract.
+`search` and `recall` remain legacy reduced-standing compatibility tools. There
+is no write tool on purpose — episodes are written by the faithful pichay
+capture, not by the instance reaching for them, so the record stays an artifact
+rather than something the instance can edit about itself.
 
 Run for dogfooding:  uv run python -m llm_memory.mcp_server   (stdio transport)
 """
 
+from datetime import UTC, datetime
+
 from mcp.server.fastmcp import FastMCP
 
+from llm_memory.contract import SearchRequest
 from llm_memory.db import get_database
+from llm_memory.enrollment import load_registry
+from llm_memory.history import open_episode as _open_episode
+from llm_memory.history import search_history as _search_history
 from llm_memory.recall import recall as _recall
+from llm_memory.reconcile import WorkBudget
 from llm_memory.search import search as _search
 
 mcp = FastMCP("llm-memory")
 _db = get_database()
+
+# A contract search may reconcile at most one megabyte of source data per call.
+_DEFAULT_RECONCILIATION_MAX_BYTES = 1_000_000
 
 
 @mcp.tool()
@@ -35,6 +45,28 @@ def recall(key: str) -> dict | None:
     episode (full response and user message, not the truncated snippet), or null
     if no episode has that key."""
     return _recall(_db, key)
+
+
+@mcp.tool()
+def search_history(query: str, corpus_ids: list[str], limit: int = 10) -> dict:
+    """Search enrolled episodic sources through the versioned contract.
+
+    Reconciliation reads at most 1,000,000 source bytes per invocation.
+    """
+    registry = load_registry()
+    request = SearchRequest.create(query, corpus_ids, limit=limit)
+    budget = WorkBudget(
+        _DEFAULT_RECONCILIATION_MAX_BYTES,
+        datetime.now(UTC),
+    )
+    return _search_history(_db, registry, request, budget)
+
+
+@mcp.tool()
+def open_episode(episode_ref: str, active_corpus_ids: list[str]) -> dict:
+    """Open one contract episode from its enrolled authoritative source."""
+    registry = load_registry()
+    return _open_episode(_db, registry, episode_ref, active_corpus_ids)
 
 
 if __name__ == "__main__":
