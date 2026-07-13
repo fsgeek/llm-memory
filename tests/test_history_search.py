@@ -462,7 +462,16 @@ def test_active_generations_are_limited_to_enabled_sources(monkeypatch):
             assert bind_vars["enabled_source_keys"] == [
                 f"{corpus_id}\0enabled"
             ]
-            return iter([{"total_matches": 0, "corpus_totals": [], "results": []}])
+            return iter(
+                [
+                    {
+                        "unbacked_corpora": [corpus_id],
+                        "total_matches": 0,
+                        "corpus_totals": [],
+                        "results": [],
+                    }
+                ]
+            )
 
     class DB:
         aql = AQL()
@@ -472,6 +481,8 @@ def test_active_generations_are_limited_to_enabled_sources(monkeypatch):
     response = search_history(DB(), registry, request(corpus_id), WorkBudget(1, NOW))
 
     assert response["returned_count"] == 0
+    assert response["total_matches"] is None
+    assert response["total_standing"] == "unknown"
 
 
 @pytest.mark.parametrize("freshness", ["stale", "tail_validated", "incomplete"])

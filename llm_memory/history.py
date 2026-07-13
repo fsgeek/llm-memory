@@ -28,13 +28,12 @@ _ANALYZER = "text_en"
 _SNIPPET_LIMIT = 200
 
 _SEARCH_AQL = """
-LET active_generations = (
+LET generation_states = (
   FOR state IN @@states
     FILTER state.corpus_id IN @corpus_ids
     FILTER CONCAT(state.corpus_id, @source_key_separator, state.source_id)
       IN @enabled_source_keys
     FILTER state.active_generation_id != null
-    FILTER state.active_generation_integrity != "invalid"
     LET stored_episode_count = LENGTH(
       FOR episode IN @@episodes
         FILTER episode.corpus_id == state.corpus_id
@@ -43,8 +42,23 @@ LET active_generations = (
         FILTER episode.generation_id == state.active_generation_id
         RETURN 1
     )
-    FILTER stored_episode_count == state.episode_count
-    RETURN state.active_generation_id
+    RETURN {
+      corpus_id: state.corpus_id,
+      generation_id: state.active_generation_id,
+      searchable:
+        state.active_generation_integrity != "invalid" AND
+        stored_episode_count == state.episode_count
+    }
+)
+LET active_generations = (
+  FOR selected IN generation_states
+    FILTER selected.searchable
+    RETURN selected.generation_id
+)
+LET unbacked_corpora = UNIQUE(
+  FOR selected IN generation_states
+    FILTER NOT selected.searchable
+    RETURN selected.corpus_id
 )
 LET matches = (
   FOR doc IN @@view
@@ -68,6 +82,7 @@ LET corpus_totals = (
     RETURN {corpus_id, count}
 )
 RETURN {
+  unbacked_corpora,
   total_matches: LENGTH(matches),
   corpus_totals,
   results: SLICE(matches, 0, @limit)
@@ -357,6 +372,7 @@ def search_history(
     }
     corpus_standing = []
     every_index_available = True
+    unbacked_corpora = set(population.get("unbacked_corpora", ()))
     for corpus_id in validated.corpus_ids:
         report = reports[corpus_id]
         sources = [_public_source(source) for source in report["sources"]]
@@ -367,7 +383,7 @@ def search_history(
                 for member in source["members"]
             )
             for source in sources
-        )
+        ) and corpus_id not in unbacked_corpora
         every_index_available = every_index_available and index_available
         corpus_standing.append(
             {
