@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -867,6 +868,93 @@ def test_compatible_prefix_validation_is_bounded_and_resumable(
     assert members(resumed)[0]["freshness"] == "current"
     assert state["implementation_version"] == "2"
     assert len(active_documents(db, corpus_id)) == 3
+
+
+def test_compatibility_prefix_progress_survives_repeated_tail_growth(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "growing-compatible-prefix.jsonl"
+    write_jsonl(
+        path,
+        [
+            taste(1, "one", "aaa"),
+            taste(2, "two", "bbb"),
+            taste(3, "three", "ccc"),
+        ],
+    )
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_refs = [document["episode_ref"] for document in active_documents(db, corpus_id)]
+    trusted_end = source_state(db, corpus_id)["complete_end"]
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        replace(delegate, implementation_version="2"),
+    )
+
+    offsets = []
+    for cycle in range(4, 7):
+        bounded = run(db, source, max_bytes=1)
+        state = source_state(db, corpus_id)
+        offsets.append(state["integrity_audit"]["offset"])
+        assert state["integrity_audit"]["target_end"] == trusted_end
+        with path.open("ab") as stream:
+            stream.write(
+                json.dumps(taste(cycle, f"tail-{cycle}", f"answer-{cycle}")).encode()
+                + b"\n"
+            )
+        if state["implementation_version"] == delegate.implementation_version:
+            assert members(bounded)[0]["index_standing"] == "unavailable"
+
+    assert offsets == sorted(offsets)
+    assert len(set(offsets)) == len(offsets)
+    assert offsets[-1] == trusted_end
+
+    completed = run(db, source)
+    active = active_documents(db, corpus_id)
+
+    assert members(completed)[0]["freshness"] == "current"
+    assert len(active) == 6
+    assert [document["episode_ref"] for document in active[:3]] == original_refs
+
+
+def test_compatibility_prefix_mutation_restarts_and_quarantines(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "mutated-compatible-prefix.jsonl"
+    original_records = [
+        taste(1, "one", "aaa"),
+        taste(2, "two", "bbb"),
+        taste(3, "three", "ccc"),
+    ]
+    write_jsonl(path, original_records)
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    delegate = adapters_module.get_adapter("taste_open_jsonl")
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        replace(delegate, implementation_version="2"),
+    )
+    run(db, source, max_bytes=1)
+    prior_stat = path.stat()
+    write_jsonl(path, [taste(1, "one", "xxx"), *original_records[1:]])
+    os.utime(
+        path,
+        ns=(prior_stat.st_atime_ns, prior_stat.st_mtime_ns + 1_000_000),
+    )
+
+    report = run(db, source)
+    state = source_state(db, corpus_id)
+
+    assert members(report)[0]["index_standing"] == "unavailable"
+    assert state["implementation_compatibility"] == "incompatible"
+    assert state["integrity_audit"]["restart_count"] >= 1
+    assert state["active_generation_id"] == original_generation
 
 
 def test_implementation_change_checks_trusted_prefix_before_derived_loss(

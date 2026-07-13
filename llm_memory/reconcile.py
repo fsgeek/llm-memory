@@ -260,7 +260,47 @@ def _stat(member: SourceMember) -> dict | None:
         stat = member.path.stat()
     except OSError:
         return None
-    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
+def _audit_snapshot_stable(
+    audit: dict,
+    generation: dict | None,
+    *,
+    compatibility_audit: bool,
+) -> bool:
+    if generation is None:
+        return False
+    started = {
+        "size": audit.get("start_size"),
+        "mtime_ns": audit.get("start_mtime_ns"),
+        "device": audit.get("start_device"),
+        "inode": audit.get("start_inode"),
+    }
+    if not compatibility_audit:
+        return started == generation
+
+    target_end = audit.get("target_end", 0)
+    if (
+        started["device"] is None
+        or started["inode"] is None
+        or generation["device"] != started["device"]
+        or generation["inode"] != started["inode"]
+        or generation["size"] < target_end
+        or generation["size"] < started["size"]
+    ):
+        return False
+    if generation["size"] == started["size"]:
+        return generation["mtime_ns"] == started["mtime_ns"]
+
+    # Same-inode monotonic growth is the append-only signal. An in-place prefix
+    # rewrite followed by an append is outside the external-writer contract.
+    return started["size"] >= target_end
 
 
 def _cursor(value: dict | None) -> ScanCursor:
@@ -602,11 +642,16 @@ def _reconcile_tail(
             "chain_digest": "",
             "start_size": 0,
             "start_mtime_ns": 0,
+            "start_device": None,
+            "start_inode": None,
             "start_observed_end": 0,
+            "target_end": chunk.complete_end,
             "restart_count": 0,
             "episode_count": 0,
             "bytes_read": 0,
             "elapsed_ms": 0.0,
+            "trusted_chain_digest": None,
+            "trusted_episode_count": None,
         },
     }
     try:
@@ -655,8 +700,10 @@ def _restart_audit(state: dict, member_generation: dict | None) -> dict:
         "chain_digest": "",
         "start_size": member_generation["size"] if member_generation else 0,
         "start_mtime_ns": member_generation["mtime_ns"] if member_generation else 0,
+        "start_device": member_generation["device"] if member_generation else None,
+        "start_inode": member_generation["inode"] if member_generation else None,
         "start_observed_end": member_generation["size"] if member_generation else 0,
-        "target_end": state.get("complete_end", 0),
+        "target_end": previous.get("target_end", state.get("complete_end", 0)),
         "restart_count": previous.get("restart_count", 0) + (1 if previous.get("offset") else 0),
         "episode_count": 0,
         "bytes_read": previous.get("bytes_read", 0),
@@ -675,26 +722,24 @@ def _reconcile_audit(
     state = _member_state(db, enrollment, member.member_id)
     if not _audit_due(enrollment, member, state, budget.now) or budget.exhausted:
         return
-    generation = _stat(member)
-    audit = state.get("integrity_audit") or {}
-    started_generation = {
-        "size": audit.get("start_size"),
-        "mtime_ns": audit.get("start_mtime_ns"),
-    }
-    if not audit.get("start_size") and generation and generation["size"] == 0:
-        started_generation = generation
-    if (
-        state.get("freshness") == FreshnessStanding.CURRENT.value
-        or not audit.get("start_observed_end")
-        or started_generation != generation
-    ):
-        audit = _restart_audit(state, generation)
-
-    started = time.perf_counter()
     adapter = get_adapter(enrollment.adapter)
     implementation_changed = (
         state.get("implementation_version") != adapter.implementation_version
     )
+    generation = _stat(member)
+    audit = state.get("integrity_audit") or {}
+    if (
+        state.get("freshness") == FreshnessStanding.CURRENT.value
+        or not audit.get("start_observed_end")
+        or not _audit_snapshot_stable(
+            audit,
+            generation,
+            compatibility_audit=implementation_changed,
+        )
+    ):
+        audit = _restart_audit(state, generation)
+
+    started = time.perf_counter()
     audit_cursor = _cursor(audit.get("cursor"))
     target_end = audit.get("target_end", state.get("complete_end", 0))
     if audit_cursor.byte_offset >= target_end and generation is not None:
@@ -857,8 +902,18 @@ def _reconcile_audit(
             pass
         return
 
-    if generation != _stat(member) or chunk.observed_end != updated_audit["start_observed_end"]:
-        restarted = _restart_audit({"integrity_audit": updated_audit}, _stat(member))
+    finished_generation = _stat(member)
+    if not _audit_snapshot_stable(
+        audit,
+        finished_generation,
+        compatibility_audit=implementation_changed,
+    ) or (
+        not implementation_changed
+        and chunk.observed_end != updated_audit["start_observed_end"]
+    ):
+        restarted = _restart_audit(
+            {"integrity_audit": updated_audit}, finished_generation
+        )
         try:
             _patch_state(
                 db,
