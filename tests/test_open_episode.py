@@ -283,6 +283,28 @@ def test_purged_supersession_observation_degrades_honestly(
     assert_no_content(response)
 
 
+def test_supersession_lookup_failure_is_not_silently_reported_as_content_mismatch(
+    tmp_path,
+):
+    path = tmp_path / "lookup-failure.jsonl"
+    write_jsonl(path, [taste(1, "question", "old answer")])
+    source = enrollment("lookup-failure", path)
+    old_ref = first_record(source).identity.episode_ref
+    write_jsonl(path, [taste(1, "question", "new answer")])
+
+    class FailingAQL:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("supersession store unavailable")
+
+    class FailingDB:
+        aql = FailingAQL()
+
+    with pytest.raises(RuntimeError, match="supersession store unavailable"):
+        open_episode(
+            FailingDB(), EnrollmentRegistry((source,)), old_ref, [source.corpus_id]
+        )
+
+
 def test_opening_reports_unsupported_adapter_without_content(
     opening_storage, tmp_path, monkeypatch
 ):

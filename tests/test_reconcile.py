@@ -13,6 +13,7 @@ import pytest
 
 import llm_memory.adapters as adapters_module
 import llm_memory.reconcile as reconcile_module
+from llm_memory.adapters import get_adapter
 from llm_memory.contract import EpisodeReference, build_identity
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
@@ -25,7 +26,12 @@ from llm_memory.contract_index import (
 )
 from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
-from llm_memory.reconcile import WorkBudget, extend_chain, reconcile_registry
+from llm_memory.reconcile import (
+    WorkBudget,
+    extend_chain,
+    reconcile_member,
+    reconcile_registry,
+)
 
 
 NOW = datetime(2026, 7, 12, 18, 30, tzinfo=UTC)
@@ -484,6 +490,39 @@ def test_expired_validation_is_tail_validated_until_resumable_audit_finishes(rec
 
     completed = run(db, source, max_bytes=1, now=NOW + timedelta(seconds=11))
     assert members(completed)[0]["freshness"] == "current"
+
+
+def test_direct_member_entrypoint_demotes_due_audit_before_exhausted_work(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "direct-member.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(
+        corpus_id, "taste", "taste_open_jsonl", path, max_age=10
+    )
+    run(db, source)
+    member = get_adapter(source.adapter).members(source)[0]
+    exhausted = WorkBudget(1, NOW + timedelta(seconds=11), bytes_read=1)
+
+    standing = reconcile_member(db, source, member, exhausted)
+
+    assert standing["freshness"] == "tail_validated"
+
+
+def test_shrunk_source_is_stale_before_audit_work_can_run(
+    reconciliation_storage, tmp_path
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "shrink-standing.jsonl"
+    write_jsonl(path, [taste(1, "one", "answer")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    path.write_bytes(b"")
+
+    report = run(db, source, max_bytes=1)
+
+    assert members(report)[0]["freshness"] == "stale"
 
 
 def test_tail_work_precedes_expired_audit_when_budget_is_spent(reconciliation_storage, tmp_path):
@@ -1192,7 +1231,7 @@ def test_compatibility_completion_publishes_tail_from_final_stat(
     final_stat = path.stat()
 
     assert bounded.work_exhausted is True
-    assert members(bounded)[0]["freshness"] == "tail_validated"
+    assert members(bounded)[0]["freshness"] == "incomplete"
     assert members(bounded)[0]["indexed_through"]["value"] == trusted_end
     assert members(bounded)[0]["observed_source_end"]["value"] == final_stat.st_size
     assert state["complete_end"] == trusted_end
@@ -1242,7 +1281,7 @@ def test_pending_compatibility_tail_truncation_replaces_from_zero(
         InterleavingAdapter(delegate, append_after_scan),
     )
     pending = run(db, source, max_bytes=1)
-    assert members(pending)[0]["freshness"] == "tail_validated"
+    assert members(pending)[0]["freshness"] == "incomplete"
     path.write_bytes(b"")
 
     recovered = run(db, source, max_bytes=1_000_000)

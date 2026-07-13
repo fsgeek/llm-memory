@@ -9,7 +9,9 @@ rather than something the instance can edit about itself.
 Run for dogfooding:  uv run python -m llm_memory.mcp_server   (stdio transport)
 """
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import AsyncIterator
 
 from mcp.server.fastmcp import FastMCP
 
@@ -19,14 +21,33 @@ from llm_memory.enrollment import load_registry
 from llm_memory.history import open_episode as _open_episode
 from llm_memory.history import search_history as _search_history
 from llm_memory.recall import recall as _recall
-from llm_memory.reconcile import WorkBudget
+from llm_memory.reconcile import WorkBudget, reconcile_registry
 from llm_memory.search import search as _search
-
-mcp = FastMCP("llm-memory")
-_db = get_database()
 
 # A contract search may reconcile at most one megabyte of source data per call.
 _DEFAULT_RECONCILIATION_MAX_BYTES = 1_000_000
+
+
+@asynccontextmanager
+async def _lifespan(_server) -> AsyncIterator[dict]:
+    try:
+        registry = load_registry()
+    except FileNotFoundError:
+        yield {}
+        return
+    report = reconcile_registry(
+        _db,
+        registry,
+        WorkBudget(
+            _DEFAULT_RECONCILIATION_MAX_BYTES,
+            datetime.now(UTC),
+        ),
+    )
+    yield {"startup_reconciliation": report}
+
+
+mcp = FastMCP("llm-memory", lifespan=_lifespan)
+_db = get_database()
 
 
 @mcp.tool()

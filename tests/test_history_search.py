@@ -384,7 +384,9 @@ def test_unavailable_member_index_keeps_hits_but_makes_population_unknown(monkey
 
     assert response["returned_count"] == 1
     assert response["results"][0]["corpus_id"] == corpus_id
+    assert response["total_matches"] is None
     assert response["total_standing"] == "unknown"
+    assert corpus["indexed_matches"] is None
     assert corpus["match_standing"] == "unknown"
     assert missing["members"][0]["index_standing"] == "unavailable"
 

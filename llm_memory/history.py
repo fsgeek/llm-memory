@@ -149,20 +149,17 @@ def _available_opening(
 
 
 def _replacement_ref(db, enrollment: SourceEnrollment, episode_ref: str) -> str | None:
-    try:
-        observations = list(
-            db.aql.execute(
-                _SUPERSESSION_AQL,
-                bind_vars={
-                    "@supersessions": SUPERSESSIONS,
-                    "corpus_id": enrollment.corpus_id,
-                    "source_id": enrollment.source_id,
-                    "episode_ref": episode_ref,
-                },
-            )
+    observations = list(
+        db.aql.execute(
+            _SUPERSESSION_AQL,
+            bind_vars={
+                "@supersessions": SUPERSESSIONS,
+                "corpus_id": enrollment.corpus_id,
+                "source_id": enrollment.source_id,
+                "episode_ref": episode_ref,
+            },
         )
-    except Exception:
-        return None
+    )
     return observations[0] if observations else None
 
 
@@ -372,7 +369,9 @@ def search_history(
         corpus_standing.append(
             {
                 "corpus_id": corpus_id,
-                "indexed_matches": totals.get(corpus_id, 0),
+                "indexed_matches": (
+                    totals.get(corpus_id, 0) if index_available else None
+                ),
                 "match_standing": "exact" if index_available else "unknown",
                 "sources": sources,
             }
@@ -394,7 +393,9 @@ def search_history(
         "corpus_ids_considered": list(validated.corpus_ids),
         "corpus_standing": corpus_standing,
         "returned_count": len(results),
-        "total_matches": population["total_matches"],
+        "total_matches": (
+            population["total_matches"] if every_index_available else None
+        ),
         "total_standing": "exact" if every_index_available else "unknown",
         "results": results,
     }

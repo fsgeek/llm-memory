@@ -1100,7 +1100,7 @@ def _reconcile_audit(
                 "source_standing": chunk.source_standing.value,
                 "observed_end": published_observed_end,
                 "freshness": (
-                    FreshnessStanding.TAIL_VALIDATED.value
+                    FreshnessStanding.INCOMPLETE.value
                     if source_has_tail
                     else FreshnessStanding.CURRENT.value
                 ),
@@ -1127,13 +1127,22 @@ def _mark_due_audit(
         implementation_changed = state.get("implementation_version") != adapter_version
         audit = _restart_audit(state, _stat(member))
         audit["restart_count"] = 0
+        generation = _stat(member)
+        source_shrunk = bool(
+            generation is not None
+            and generation["size"] < state.get("complete_end", 0)
+        )
         try:
             _patch_state(
                 db,
                 enrollment,
                 member.member_id,
                 {
-                    "freshness": FreshnessStanding.TAIL_VALIDATED.value,
+                    "freshness": (
+                        FreshnessStanding.STALE.value
+                        if source_shrunk
+                        else FreshnessStanding.TAIL_VALIDATED.value
+                    ),
                     "integrity_audit": audit,
                     "implementation_compatibility": (
                         "pending" if implementation_changed else state.get(
@@ -1329,6 +1338,7 @@ def reconcile_member(
     if state:
         _finalize_supersessions(db, enrollment, state)
     _reconcile_tail(db, enrollment, member, budget)
+    _mark_due_audit(db, enrollment, member, budget.now)
     _reconcile_audit(db, enrollment, member, budget)
     return _member_standing(
         db,

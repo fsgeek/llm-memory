@@ -153,3 +153,49 @@ def test_missing_config_does_not_prevent_legacy_tools_from_loading(
     assert {"search", "recall"}.issubset(names)
     with pytest.raises(FileNotFoundError, match="missing-sources.yaml"):
         reloaded.search_history("query", ["configured-corpus"])
+
+
+def test_service_startup_performs_bounded_reconciliation(monkeypatch):
+    registry = object()
+    observed = {}
+
+    def reconcile(database, declared, budget):
+        observed.update(database=database, declared=declared, budget=budget)
+        return "startup-report"
+
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+    monkeypatch.setattr(mcp_server, "reconcile_registry", reconcile)
+
+    async def enter_lifespan():
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ) as context:
+            return context
+
+    context = asyncio.run(enter_lifespan())
+
+    assert context == {"startup_reconciliation": "startup-report"}
+    assert observed["database"] is mcp_server._db
+    assert observed["declared"] is registry
+    assert observed["budget"].max_bytes == 1_000_000
+
+
+def test_service_startup_without_enrollment_config_keeps_legacy_service_available(
+    monkeypatch,
+):
+    def missing_registry():
+        raise FileNotFoundError("no enrollment config")
+
+    def forbidden_reconciliation(*args):
+        raise AssertionError("missing enrollment config reached reconciliation")
+
+    monkeypatch.setattr(mcp_server, "load_registry", missing_registry)
+    monkeypatch.setattr(mcp_server, "reconcile_registry", forbidden_reconciliation)
+
+    async def enter_lifespan():
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ) as context:
+            return context
+
+    assert asyncio.run(enter_lifespan()) == {}
