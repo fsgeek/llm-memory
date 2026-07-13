@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from llm_memory.adapter_versions import supports_semantic_versions
 from llm_memory.contract import (
     ContractError,
     EpisodeBody,
@@ -96,12 +97,26 @@ def turn_text(content: object) -> str:
     return ""
 
 
+def _require_semantic_versions(enrollment: SourceEnrollment) -> None:
+    if not supports_semantic_versions(
+        enrollment.adapter,
+        boundary_version=enrollment.boundary_version,
+        canonicalization_version=enrollment.canonicalization_version,
+    ):
+        raise ContractError(
+            "unsupported adapter semantic versions: "
+            f"{enrollment.adapter} boundary={enrollment.boundary_version} "
+            f"canonicalization={enrollment.canonicalization_version}"
+        )
+
+
 def _identity(
     enrollment: SourceEnrollment,
     native_session_id: str,
     event_token: str,
     body: EpisodeBody,
 ) -> EpisodeIdentity:
+    _require_semantic_versions(enrollment)
     return build_identity(
         corpus_id=enrollment.corpus_id,
         source_id=enrollment.source_id,
@@ -213,8 +228,8 @@ def _scan_lines_chunk(
             if not line.endswith(b"\n"):
                 incomplete = True
                 break
-            complete_end = end
             if not line.strip():
+                complete_end = end
                 next_offset = end
                 continue
             try:
@@ -222,11 +237,19 @@ def _scan_lines_chunk(
                 if not isinstance(decoded, dict):
                     raise ValueError("JSONL record must be an object")
                 episode = handler(decoded, start, end)
-            except (ContractError, KeyError, TypeError, UnicodeDecodeError, ValueError):
+            except (
+                ContractError,
+                KeyError,
+                RecursionError,
+                TypeError,
+                UnicodeDecodeError,
+                ValueError,
+            ):
                 error_position = start
                 break
             if episode is not None:
                 episodes.append(episode)
+            complete_end = end
             next_offset = end
 
     if error_position is not None:
@@ -269,6 +292,15 @@ def _file_member(enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
     return (SourceMember(enrollment.source_id, enrollment.locator),)
 
 
+def _optional_text(record: dict[str, Any], field: str) -> str:
+    value = record.get(field)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    return value
+
+
 @dataclass(frozen=True)
 class TasteOpenAdapter:
     name: str = "taste_open_jsonl"
@@ -289,15 +321,26 @@ class TasteOpenAdapter:
         cursor: ScanCursor | None,
         max_bytes: int,
     ) -> MemberChunk:
+        _require_semantic_versions(enrollment)
+
         def handle(record: dict[str, Any], start: int, end: int) -> EpisodeRecord:
-            cycle = str(record["cycle"])
-            state = record.get("state") or {}
+            native_cycle = record["cycle"]
+            if isinstance(native_cycle, bool) or not isinstance(
+                native_cycle, (int, str)
+            ):
+                raise ValueError("cycle must be an integer or string")
+            cycle = str(native_cycle)
+            state = record.get("state")
+            if state is None:
+                state = {}
             if not isinstance(state, dict):
                 raise ValueError("state must be an object")
             raw = record.get("raw_output")
             response = raw.get("response") if isinstance(raw, dict) else None
-            if not response:
-                response = record.get("response_text", "")
+            if response is None or response == "":
+                response = _optional_text(record, "response_text")
+            elif not isinstance(response, str):
+                raise ValueError("raw_output.response must be a string")
             activity_log = state.get("_activity_log", [])
             if not isinstance(activity_log, list):
                 raise ValueError("activity log must be a list")
@@ -305,10 +348,10 @@ class TasteOpenAdapter:
                 {key: value for key, value in state.items() if key != "_activity_log"}
             )
             body = EpisodeBody(
-                timestamp=record.get("timestamp") or "",
-                model=record.get("model") or "",
-                user_message=record.get("user_message") or "",
-                response=response or "",
+                timestamp=_optional_text(record, "timestamp"),
+                model=_optional_text(record, "model"),
+                user_message=_optional_text(record, "user_message"),
+                response=response,
                 state=state,
                 activity_log=activity_log,
                 adapter_fields={
@@ -349,6 +392,7 @@ class GatewayAdapter:
         cursor: ScanCursor | None,
         max_bytes: int,
     ) -> MemberChunk:
+        _require_semantic_versions(enrollment)
         state = dict(cursor.adapter_state) if cursor is not None else {}
         sequence_by_session = dict(state.get("sequence_by_session", {}))
 
@@ -361,7 +405,6 @@ class GatewayAdapter:
             if not isinstance(session, str) or not session:
                 raise ValueError("request_metrics session_id is required")
             sequence = sequence_by_session.get(session, 0)
-            sequence_by_session[session] = sequence + 1
             raw_messages = record.get("messages_full")
             messages = [] if raw_messages is None else raw_messages
             if not isinstance(messages, list):
@@ -372,15 +415,15 @@ class GatewayAdapter:
                     user_message = turn_text(message.get("content"))
                     break
             body = EpisodeBody(
-                timestamp=record.get("timestamp") or "",
-                model=record.get("model") or "",
+                timestamp=_optional_text(record, "timestamp"),
+                model=_optional_text(record, "model"),
                 user_message=user_message,
-                response=record.get("response_text") or "",
+                response=_optional_text(record, "response_text"),
                 state={},
                 activity_log=[],
                 adapter_fields={"messages_full": messages},
             )
-            return _record(
+            episode = _record(
                 enrollment,
                 native_session_id=session,
                 event_token=str(sequence),
@@ -389,6 +432,8 @@ class GatewayAdapter:
                 start=start,
                 end=end,
             )
+            sequence_by_session[session] = sequence + 1
+            return episode
 
         state["sequence_by_session"] = sequence_by_session
         return _scan_lines_chunk(member, cursor, max_bytes, handle, state)
@@ -406,6 +451,8 @@ class ClaudeCodeAdapter:
 
     def members(self, enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
         locator = enrollment.locator
+        if not locator.exists():
+            return ()
         if locator.is_dir():
             paths = sorted(locator.glob("*.jsonl"))
             return tuple(
@@ -434,6 +481,7 @@ class ClaudeCodeAdapter:
         cursor: ScanCursor | None,
         max_bytes: int,
     ) -> MemberChunk:
+        _require_semantic_versions(enrollment)
         state = dict(cursor.adapter_state) if cursor is not None else {}
         last_user = state.get("last_user", "")
         last_user_ts = state.get("last_user_ts", "")
@@ -477,8 +525,8 @@ class ClaudeCodeAdapter:
             if not isinstance(event_id, str) or not event_id:
                 raise ValueError("Claude assistant uuid is required")
             body = EpisodeBody(
-                timestamp=record.get("timestamp") or "",
-                model=message.get("model") or "",
+                timestamp=_optional_text(record, "timestamp"),
+                model=_optional_text(message, "model"),
                 user_message=last_user,
                 response=response,
                 state={},
@@ -500,6 +548,7 @@ class ClaudeCodeAdapter:
             not session_established
             and result.source_standing is SourceStanding.AVAILABLE
             and not result.exhausted
+            and result.freshness is not FreshnessStanding.INCOMPLETE
         ):
             return MemberChunk(
                 member=result.member,

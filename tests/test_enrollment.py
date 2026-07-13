@@ -125,6 +125,28 @@ def test_registry_rejects_non_positive_semantic_integers(tmp_path, field, value)
         load_registry(path)
 
 
+@pytest.mark.parametrize(
+    ("adapter", "boundary_version", "canonicalization_version"),
+    [
+        ("taste_open_jsonl", 2, 1),
+        ("gateway_jsonl", 1, 2),
+        ("claude_code_jsonl", 2, 2),
+    ],
+)
+def test_registry_rejects_unimplemented_adapter_semantic_versions(
+    tmp_path, adapter, boundary_version, canonicalization_version
+):
+    source = VALID_CONFIG["sources"][0] | {
+        "adapter": adapter,
+        "boundary_version": boundary_version,
+        "canonicalization_version": canonicalization_version,
+    }
+    path = write_config(tmp_path, VALID_CONFIG | {"sources": [source]})
+
+    with pytest.raises(ValueError, match="semantic versions"):
+        load_registry(path)
+
+
 def test_environment_overrides_default_sources_path(tmp_path, monkeypatch):
     path = write_config(tmp_path)
     monkeypatch.setenv("LLM_MEMORY_SOURCES_CONFIG", str(path))

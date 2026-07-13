@@ -100,6 +100,23 @@ def test_canonical_bytes_are_exact_sorted_compact_utf8_json():
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("timestamp", 1),
+        ("model", {}),
+        ("user_message", []),
+        ("response", False),
+        ("state", []),
+        ("activity_log", {}),
+        ("adapter_fields", []),
+    ],
+)
+def test_episode_body_rejects_wrong_field_types(field, value):
+    with pytest.raises(ContractError, match=field):
+        replace(BODY, **{field: value})
+
+
 def test_standing_enums_have_exact_contract_values():
     assert [standing.value for standing in SourceStanding] == [
         "available",

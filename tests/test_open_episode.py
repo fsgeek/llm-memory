@@ -216,7 +216,7 @@ def test_opening_reports_content_mismatch_after_rewrite(opening_storage, tmp_pat
 
 
 def test_opening_reports_verified_supersession_with_replacement_ref(
-    opening_storage, tmp_path
+    opening_storage, tmp_path, enable_semantic_version
 ):
     db, corpus_id = opening_storage
     path = tmp_path / "superseded.jsonl"
@@ -224,6 +224,7 @@ def test_opening_reports_verified_supersession_with_replacement_ref(
     original = enrollment(corpus_id, path)
     reconcile_registry(db, EnrollmentRegistry((original,)), WorkBudget(1_000_000, NOW))
     old_ref = first_record(original).identity.episode_ref
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     replacement = replace(original, canonicalization_version=2)
     reconcile_registry(
         db,

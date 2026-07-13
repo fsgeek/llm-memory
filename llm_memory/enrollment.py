@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from llm_memory.adapter_versions import supports_semantic_versions
 from llm_memory.contract import CONTRACT_VERSION, validate_corpus_id
 
 
@@ -117,7 +118,7 @@ def _parse_source(value: object) -> SourceEnrollment:
     locator = source["locator"]
     if not isinstance(locator, str) or not locator:
         raise ValueError("locator must be a non-empty string")
-    return SourceEnrollment(
+    enrollment = SourceEnrollment(
         corpus_id=source["corpus_id"],
         source_id=source["source_id"],
         adapter=source["adapter"],
@@ -129,6 +130,17 @@ def _parse_source(value: object) -> SourceEnrollment:
             "full_validation_max_age_seconds"
         ],
     )
+    if not supports_semantic_versions(
+        enrollment.adapter,
+        boundary_version=enrollment.boundary_version,
+        canonicalization_version=enrollment.canonicalization_version,
+    ):
+        raise ValueError(
+            "unsupported adapter semantic versions: "
+            f"{enrollment.adapter} boundary={enrollment.boundary_version} "
+            f"canonicalization={enrollment.canonicalization_version}"
+        )
+    return enrollment
 
 
 def load_registry(path: Path | None = None) -> EnrollmentRegistry:

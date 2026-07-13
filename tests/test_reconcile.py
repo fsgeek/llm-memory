@@ -431,7 +431,13 @@ def test_prefix_rewrite_activates_replacement_after_full_audit(reconciliation_st
 
 
 @pytest.mark.parametrize("version_field", ["canonicalization_version", "boundary_version"])
-def test_version_changes_preserve_or_supersede_references(reconciliation_storage, tmp_path, monkeypatch, version_field):
+def test_version_changes_preserve_or_supersede_references(
+    reconciliation_storage,
+    tmp_path,
+    monkeypatch,
+    enable_semantic_version,
+    version_field,
+):
     db, prefix = reconciliation_storage
     path = tmp_path / "versions.jsonl"
     write_jsonl(path, [taste(1, "one", "answer")])
@@ -449,6 +455,9 @@ def test_version_changes_preserve_or_supersede_references(reconciliation_storage
     assert members(implementation)[0]["freshness"] == "current"
     assert active_documents(db, prefix)[0]["episode_ref"] == original
 
+    versions = {"boundary": 1, "canonicalization": 1}
+    versions[version_field.removesuffix("_version")] = 2
+    enable_semantic_version("taste_open_jsonl", **versions)
     semantic_source = replace(source, **{version_field: 2})
     semantic = run(db, semantic_source)
     assert members(semantic)[0]["freshness"] == "current"
@@ -529,7 +538,7 @@ def test_missing_active_episode_triggers_replacement_rebuild(
 
 
 def test_semantic_version_change_restarts_in_progress_bounded_build(
-    reconciliation_storage, tmp_path
+    reconciliation_storage, tmp_path, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "semantic-mid-build.jsonl"
@@ -538,6 +547,7 @@ def test_semantic_version_change_restarts_in_progress_bounded_build(
     run(db, first_version, max_bytes=1)
     abandoned_generation = source_state(db, corpus_id)["staging_generation_id"]
 
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     second_version = replace(first_version, canonicalization_version=2)
     report = run(db, second_version)
 
@@ -625,7 +635,7 @@ def test_bounded_build_state_patch_retries_are_idempotent(
 
 
 def test_supersession_finalization_resumes_after_activation_failure(
-    reconciliation_storage, tmp_path, monkeypatch
+    reconciliation_storage, tmp_path, monkeypatch, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "supersession-resume.jsonl"
@@ -633,6 +643,7 @@ def test_supersession_finalization_resumes_after_activation_failure(
     source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
     run(db, source)
     old_generation = active_states(db, (corpus_id,))[0]["active_generation_id"]
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     changed = replace(source, canonicalization_version=2)
     original_finalize = reconcile_module._record_supersessions
     failed = False
@@ -666,13 +677,14 @@ def test_supersession_finalization_resumes_after_activation_failure(
 
 
 def test_supersession_intent_does_not_finalize_before_activation(
-    reconciliation_storage, tmp_path, monkeypatch
+    reconciliation_storage, tmp_path, monkeypatch, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "supersession-before-activation.jsonl"
     write_jsonl(path, [taste(1, "one", "answer")])
     source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
     run(db, source)
+    enable_semantic_version("taste_open_jsonl", boundary=2)
     changed = replace(source, boundary_version=2)
 
     def fail_activation(*args, **kwargs):
@@ -694,7 +706,7 @@ def test_supersession_intent_does_not_finalize_before_activation(
 
 
 def test_gateway_supersessions_match_native_session_and_event_token(
-    reconciliation_storage, tmp_path
+    reconciliation_storage, tmp_path, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "gateway-sessions.jsonl"
@@ -702,6 +714,7 @@ def test_gateway_supersessions_match_native_session_and_event_token(
     source = enrollment(corpus_id, "gateway", "gateway_jsonl", path)
     run(db, source)
 
+    enable_semantic_version("gateway_jsonl", boundary=2)
     changed = replace(source, boundary_version=2)
     run(db, changed)
     supersessions = list(
@@ -720,7 +733,7 @@ def test_gateway_supersessions_match_native_session_and_event_token(
 
 
 def test_incompatible_implementation_audit_preserves_active_references(
-    reconciliation_storage, tmp_path, monkeypatch
+    reconciliation_storage, tmp_path, monkeypatch, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "incompatible-implementation.jsonl"
@@ -764,6 +777,7 @@ def test_incompatible_implementation_audit_preserves_active_references(
         document["episode_ref"] for document in active_documents(db, corpus_id)
     ] == original_refs
 
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     semantic_change = replace(source, canonicalization_version=2)
     rebuilt = run(db, semantic_change)
 
@@ -1352,7 +1366,7 @@ def test_stale_writer_cannot_publish_staging_after_competing_build_takes_ownersh
 
 
 def test_zero_document_replacement_recovers_after_abandoned_staging_and_crash(
-    reconciliation_storage, tmp_path, monkeypatch
+    reconciliation_storage, tmp_path, monkeypatch, enable_semantic_version
 ):
     db, corpus_id = reconciliation_storage
     path = tmp_path / "zero-replacement-recovery.jsonl"
@@ -1361,6 +1375,7 @@ def test_zero_document_replacement_recovers_after_abandoned_staging_and_crash(
     run(db, source, max_bytes=1)
     abandoned = source_state(db, corpus_id)["staging_generation_id"]
     path.write_bytes(b"")
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     changed = replace(source, canonicalization_version=2)
     original_activate = reconcile_module.activate_generation
     failed = False

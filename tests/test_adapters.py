@@ -14,8 +14,8 @@ def enrollment(adapter, locator, *, source_id="declared-stream"):
         corpus_id="portable-history",
         source_id=source_id,
         adapter=adapter,
-        boundary_version=2,
-        canonicalization_version=3,
+        boundary_version=1,
+        canonicalization_version=1,
         locator=Path(locator),
         enabled=True,
         full_validation_max_age_seconds=3600,
@@ -48,6 +48,18 @@ def test_adapter_registry_is_explicit_and_metadata_is_immutable(tmp_path):
         adapter.implementation_version = "changed"
     with pytest.raises(ContractError, match="unsupported adapter: mystery"):
         get_adapter("mystery")
+
+
+def test_adapter_rejects_unimplemented_semantic_versions(tmp_path):
+    path = tmp_path / "taste.jsonl"
+    write_jsonl(path, [{"cycle": 1, "user_message": "q"}])
+    declared = replace(
+        enrollment("taste_open_jsonl", path), canonicalization_version=2
+    )
+    adapter = get_adapter(declared.adapter)
+
+    with pytest.raises(ContractError, match="semantic versions"):
+        adapter.scan(declared, adapter.members(declared)[0])
 
 
 def test_taste_open_uses_declared_stream_and_native_cycle(tmp_path):
@@ -153,6 +165,28 @@ def test_gateway_rejects_falsey_non_list_provenance(tmp_path, messages_full):
     assert result.episodes == ()
     assert result.source_standing is SourceStanding.MALFORMED
     assert result.error_position == 0
+
+
+def test_gateway_malformed_record_does_not_consume_synthesized_sequence(tmp_path):
+    path = tmp_path / "gateway.jsonl"
+    write_jsonl(
+        path,
+        [
+            {
+                "type": "request_metrics",
+                "session_id": "session-a",
+                "messages_full": {},
+            }
+        ],
+    )
+    declared = enrollment("gateway_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    result = adapter.scan_chunk(declared, member, None, 1000)
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert result.next_cursor.adapter_state == {"sequence_by_session": {}}
 
 
 def test_claude_reuses_user_prose_for_repeated_assistants_and_skips_non_episodes(tmp_path):
@@ -310,6 +344,58 @@ def test_malformed_complete_line_reports_its_byte_position(tmp_path, bad_line):
     assert result.freshness is FreshnessStanding.UNKNOWN
 
 
+def test_deeply_nested_complete_record_is_visibly_malformed(tmp_path):
+    path = tmp_path / "nested.jsonl"
+    path.write_bytes(b"[" * 2000 + b"]" * 2000 + b"\n")
+
+    result = scan(path, "taste_open_jsonl")
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert result.error_position == 0
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "record"),
+    [
+        (
+            "taste_open_jsonl",
+            {"cycle": True, "user_message": "question", "response_text": "answer"},
+        ),
+        (
+            "taste_open_jsonl",
+            {"cycle": 1, "user_message": {"not": "text"}},
+        ),
+        (
+            "gateway_jsonl",
+            {
+                "type": "request_metrics",
+                "session_id": "session-a",
+                "messages_full": [],
+                "response_text": 42,
+            },
+        ),
+        (
+            "claude_code_jsonl",
+            {
+                "type": "assistant",
+                "sessionId": "session-a",
+                "uuid": "event-a",
+                "timestamp": 42,
+                "message": {"content": "answer"},
+            },
+        ),
+    ],
+)
+def test_wrong_typed_evidence_fields_are_malformed(tmp_path, adapter_name, record):
+    path = tmp_path / "wrong-type.jsonl"
+    write_jsonl(path, [record])
+
+    result = scan(path, adapter_name)
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert result.error_position == 0
+
+
 def test_relocating_identical_source_does_not_change_episode_references(tmp_path):
     record = {
         "type": "request_metrics",
@@ -363,6 +449,23 @@ def test_claude_member_without_any_native_session_is_visibly_malformed(tmp_path)
     assert result.freshness is FreshnessStanding.UNKNOWN
     assert result.error_position == 0
     assert result.episodes == ()
+
+
+def test_claude_partial_first_line_is_incomplete_not_malformed(tmp_path):
+    path = tmp_path / "session.jsonl"
+    path.write_bytes(b'{"type":"assistant","sessionId":')
+
+    result = scan(path, "claude_code_jsonl")
+
+    assert result.source_standing is SourceStanding.AVAILABLE
+    assert result.freshness is FreshnessStanding.INCOMPLETE
+    assert result.error_position is None
+
+
+def test_claude_missing_locator_has_no_phantom_member(tmp_path):
+    declared = enrollment("claude_code_jsonl", tmp_path / "vanished")
+
+    assert get_adapter(declared.adapter).members(declared) == ()
 
 
 def test_claude_native_session_may_begin_with_unresolved_prefix(tmp_path):

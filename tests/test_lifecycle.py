@@ -338,7 +338,7 @@ def test_invalid_purge_classes_fail_before_deletion(lifecycle_storage, classes):
 
 
 def test_purging_supersessions_degrades_old_reference_standing_honestly(
-    lifecycle_storage, tmp_path
+    lifecycle_storage, tmp_path, enable_semantic_version
 ):
     db, corpus_id = lifecycle_storage
     source_path = tmp_path / "supersession.jsonl"
@@ -355,6 +355,7 @@ def test_purging_supersessions_degrades_old_reference_standing_honestly(
     )
     run(db, EnrollmentRegistry((original,)))
     old_ref = first_ref(original)
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     replacement = replace(original, canonicalization_version=2)
     run(db, EnrollmentRegistry((replacement,)))
     assert open_episode(
@@ -410,7 +411,7 @@ def test_reenrollment_validates_retained_state_then_rebuilds_changed_source(
 
 
 def test_reenrollment_with_new_semantic_version_rebuilds_retained_state(
-    lifecycle_storage, tmp_path
+    lifecycle_storage, tmp_path, enable_semantic_version
 ):
     db, corpus_id = lifecycle_storage
     source_path = tmp_path / "semantic.jsonl"
@@ -424,6 +425,7 @@ def test_reenrollment_with_new_semantic_version_rebuilds_retained_state(
     original_ref = first_ref(original.sources[0])
 
     unenroll_source(config_path, corpus_id, "taste")
+    enable_semantic_version("taste_open_jsonl", canonicalization=2)
     write_config(
         config_path,
         source_mapping(

@@ -72,6 +72,17 @@ class EpisodeBody:
     activity_log: list[Any]
     adapter_fields: dict[str, Any]
 
+    def __post_init__(self) -> None:
+        for name in ("timestamp", "model", "user_message", "response"):
+            if not isinstance(getattr(self, name), str):
+                raise ContractError(f"{name} must be a string")
+        if not isinstance(self.state, dict):
+            raise ContractError("state must be an object")
+        if not isinstance(self.activity_log, list):
+            raise ContractError("activity_log must be a list")
+        if not isinstance(self.adapter_fields, dict):
+            raise ContractError("adapter_fields must be an object")
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp,
