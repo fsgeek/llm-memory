@@ -60,6 +60,7 @@ def _validated_request(request: SearchRequest) -> SearchRequest:
         request.corpus_ids,
         limit=request.limit,
         strategy=request.strategy,
+        contract_version=request.contract_version,
     )
     if validated.strategy != STRATEGY:
         raise ContractError(f"unsupported strategy: {validated.strategy!r}")

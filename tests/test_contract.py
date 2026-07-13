@@ -155,6 +155,22 @@ def test_search_request_rejects_invalid_limit(limit):
         SearchRequest.create("query", ["corpus-a"], limit=limit)
 
 
+def test_search_request_carries_contract_version_one():
+    defaulted = SearchRequest.create("query", ["corpus-a"])
+    explicit = SearchRequest.create("query", ["corpus-a"], contract_version=1)
+
+    assert defaulted.contract_version == 1
+    assert explicit.contract_version == 1
+
+
+@pytest.mark.parametrize("contract_version", [True, 0, 2])
+def test_search_request_rejects_unsupported_contract_version(contract_version):
+    with pytest.raises(ContractError, match="contract_version must be 1"):
+        SearchRequest.create(
+            "query", ["corpus-a"], contract_version=contract_version
+        )
+
+
 def test_search_request_requires_concrete_unique_corpora():
     with pytest.raises(ContractError):
         SearchRequest.create("query", [])

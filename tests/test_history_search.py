@@ -8,7 +8,6 @@ from uuid import uuid4
 import pytest
 
 from llm_memory.contract import (
-    CONTRACT_VERSION,
     STRATEGY,
     ContractError,
     SearchRequest,
@@ -146,6 +145,23 @@ def test_unknown_and_disabled_corpora_fail_before_aql():
         )
 
 
+@pytest.mark.parametrize("contract_version", [True, 0, 2])
+def test_invalid_direct_request_version_fails_before_aql(contract_version):
+    registry = EnrollmentRegistry(
+        (
+            enrollment(
+                "corpus-a", "source-a", "taste_open_jsonl", Path("/unused")
+            ),
+        )
+    )
+    search_request = SearchRequest(
+        "query", ("corpus-a",), 10, STRATEGY, contract_version
+    )
+
+    with pytest.raises(ContractError, match="contract_version must be 1"):
+        search_history(FailBeforeAQL(), registry, search_request, WorkBudget(1, NOW))
+
+
 def test_capabilities_and_search_response_are_contract_version_one(
     history_storage, tmp_path
 ):
@@ -159,7 +175,7 @@ def test_capabilities_and_search_response_are_contract_version_one(
 
     response = run_search(db, registry, search_request)
 
-    assert CONTRACT_VERSION == 1
+    assert search_request.contract_version == 1
     assert response["contract_version"] == 1
     assert provider_capabilities() == {
         "contract_versions": [1],

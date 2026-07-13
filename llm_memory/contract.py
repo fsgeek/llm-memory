@@ -301,6 +301,7 @@ class SearchRequest:
     corpus_ids: tuple[str, ...]
     limit: int
     strategy: str
+    contract_version: int = CONTRACT_VERSION
 
     @classmethod
     def create(
@@ -310,6 +311,7 @@ class SearchRequest:
         *,
         limit: int = 10,
         strategy: str = STRATEGY,
+        contract_version: int = CONTRACT_VERSION,
     ) -> SearchRequest:
         if not isinstance(query, str) or not (clean_query := query.strip()):
             raise ContractError("query must be a non-empty string")
@@ -317,6 +319,12 @@ class SearchRequest:
             raise ContractError(f"limit must be an integer from 1 to {MAX_LIMIT}")
         if not isinstance(strategy, str) or not strategy:
             raise ContractError("strategy must be a non-empty string")
+        if (
+            isinstance(contract_version, bool)
+            or not isinstance(contract_version, int)
+            or contract_version != CONTRACT_VERSION
+        ):
+            raise ContractError(f"contract_version must be {CONTRACT_VERSION}")
         try:
             corpora = tuple(corpus_ids)
         except TypeError as exc:
@@ -329,7 +337,7 @@ class SearchRequest:
                 raise ContractError("corpus_ids must contain concrete corpus identifiers")
         if len(set(corpora)) != len(corpora):
             raise ContractError("corpus_ids must be unique")
-        return cls(clean_query, corpora, limit, strategy)
+        return cls(clean_query, corpora, limit, strategy, contract_version)
 
 
 @dataclass(frozen=True)
