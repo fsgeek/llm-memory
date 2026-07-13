@@ -957,6 +957,64 @@ def test_compatibility_prefix_mutation_restarts_and_quarantines(
     assert state["active_generation_id"] == original_generation
 
 
+def test_compatibility_completion_publishes_tail_from_final_stat(
+    reconciliation_storage, tmp_path, monkeypatch
+):
+    db, corpus_id = reconciliation_storage
+    path = tmp_path / "compatibility-completion-window.jsonl"
+    write_jsonl(path, [taste(1, "one", "aaa")])
+    source = enrollment(corpus_id, "taste", "taste_open_jsonl", path)
+    run(db, source)
+    original_state = active_states(db, (corpus_id,))[0]
+    original_ref = active_documents(db, corpus_id)[0]["episode_ref"]
+    trusted_end = source_state(db, corpus_id)["complete_end"]
+    delegate = replace(
+        adapters_module.get_adapter("taste_open_jsonl"),
+        implementation_version="2",
+    )
+    appended = False
+
+    def append_after_scan(_chunk):
+        nonlocal appended
+        if appended:
+            return
+        appended = True
+        with path.open("ab") as stream:
+            stream.write(json.dumps(taste(2, "tail", "bbb")).encode() + b"\n")
+
+    monkeypatch.setitem(
+        adapters_module._ADAPTERS,
+        "taste_open_jsonl",
+        InterleavingAdapter(delegate, append_after_scan),
+    )
+
+    bounded = run(db, source, max_bytes=1)
+    state = source_state(db, corpus_id)
+    final_stat = path.stat()
+
+    assert bounded.work_exhausted is True
+    assert members(bounded)[0]["freshness"] == "tail_validated"
+    assert members(bounded)[0]["indexed_through"]["value"] == trusted_end
+    assert members(bounded)[0]["observed_source_end"]["value"] == final_stat.st_size
+    assert state["complete_end"] == trusted_end
+    assert state["observed_end"] == final_stat.st_size
+    assert state["member_generation"] == {
+        "size": final_stat.st_size,
+        "mtime_ns": final_stat.st_mtime_ns,
+        "device": final_stat.st_dev,
+        "inode": final_stat.st_ino,
+    }
+    assert state["active_generation_id"] == original_state["active_generation_id"]
+    assert active_documents(db, corpus_id)[0]["episode_ref"] == original_ref
+
+    completed = run(db, source, max_bytes=1_000_000)
+    active = active_documents(db, corpus_id)
+
+    assert members(completed)[0]["freshness"] == "current"
+    assert len(active) == 2
+    assert active[0]["episode_ref"] == original_ref
+
+
 def test_implementation_change_checks_trusted_prefix_before_derived_loss(
     reconciliation_storage, tmp_path, monkeypatch
 ):

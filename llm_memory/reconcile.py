@@ -1005,7 +1005,15 @@ def _reconcile_audit(
         "trusted_chain_digest": updated_audit["chain_digest"],
         "trusted_episode_count": updated_audit["episode_count"],
     }
-    source_has_tail = chunk.observed_end > target_end
+    published_generation = (
+        finished_generation if implementation_changed else generation
+    )
+    published_observed_end = (
+        published_generation["size"]
+        if implementation_changed
+        else chunk.observed_end
+    )
+    source_has_tail = published_observed_end > target_end
     try:
         _patch_state(
             db,
@@ -1014,12 +1022,12 @@ def _reconcile_audit(
             {
                 "integrity_audit": completed_audit,
                 "validated_at": _timestamp(budget.now),
-                "member_generation": generation,
+                "member_generation": published_generation,
                 "implementation_version": adapter.implementation_version,
                 "implementation_compatibility": "compatible",
                 "incompatible_implementation_version": None,
                 "source_standing": chunk.source_standing.value,
-                "observed_end": chunk.observed_end,
+                "observed_end": published_observed_end,
                 "freshness": (
                     FreshnessStanding.TAIL_VALIDATED.value
                     if source_has_tail
