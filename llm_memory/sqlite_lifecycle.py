@@ -86,6 +86,22 @@ def purge(
                 parameters,
             )
             counts[state_class] = cursor.rowcount
+        if (
+            "episodes" in validated_classes
+            and "reconciliation" not in validated_classes
+        ):
+            active_predicate = f"{predicate} AND" if predicate else " WHERE"
+            connection.execute(
+                "UPDATE source_states SET revision = revision + 1, "
+                "state_json = json_set("
+                "state_json, "
+                "'$.active_generation_integrity', 'invalid', "
+                "'$.freshness', 'stale'"
+                ")"
+                f"{active_predicate} "
+                "json_extract(state_json, '$.active_generation_id') IS NOT NULL",
+                parameters,
+            )
     return counts
 
 
@@ -139,6 +155,7 @@ def _row_counts(store: SQLiteStore, scope: PurgeScope) -> dict[str, int | str | 
 
 def measure(store: SQLiteStore, scope: PurgeScope) -> ProviderMeasurement:
     validated_scope = _validated_scope(scope)
+    store.validate_path()
     paths = {
         "database": store.path,
         "wal": Path(f"{store.path}-wal"),
@@ -184,9 +201,29 @@ def remove_provider_file(store: SQLiteStore) -> dict[str, object]:
         Path(f"{store.path}-wal"),
         Path(f"{store.path}-shm"),
     )
+    if store.path.is_symlink():
+        residual = [path.name for path in candidates if _path_present(path)]
+        return {
+            "removed_paths": [],
+            "residual_paths": residual,
+            "residual_reasons": {
+                name: (
+                    "configured SQLite database path is a symlink"
+                    if name == store.path.name
+                    else "not removed because configured SQLite database path "
+                    "is a symlink"
+                )
+                for name in residual
+            },
+            "declared_losses": [
+                "retained supersession observations",
+                "non-reproducible evaluation state",
+            ],
+            "retained": ["enrollment configuration", "source locators"],
+        }
 
     operation_connection = None
-    if store.path.exists():
+    if _path_present(store.path):
         try:
             operation_connection = store.connect()
         except (sqlite3.Error, ProviderUnavailable, ProviderUnsupported, OSError):
@@ -196,23 +233,40 @@ def remove_provider_file(store: SQLiteStore) -> dict[str, object]:
                 operation_connection.close()
 
     removed = []
+    removal_failures = {}
     for path in candidates:
-        if not path.exists():
+        if not _path_present(path):
             continue
         try:
             path.unlink()
             removed.append(path.name)
         except FileNotFoundError:
             pass
-        except OSError:
+        except OSError as exc:
+            removal_failures[path.name] = str(exc)
             continue
-    residual = [path.name for path in candidates if path.exists()]
+    residual = [path.name for path in candidates if _path_present(path)]
     return {
         "removed_paths": removed,
         "residual_paths": residual,
+        "residual_reasons": {
+            name: removal_failures[name]
+            for name in residual
+            if name in removal_failures
+        },
         "declared_losses": [
             "retained supersession observations",
             "non-reproducible evaluation state",
         ],
         "retained": ["enrollment configuration", "source locators"],
     }
+
+
+def _path_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True

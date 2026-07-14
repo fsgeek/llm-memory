@@ -7,10 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from llm_memory.contract import SearchRequest
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
-from llm_memory.provider import PurgeScope
+from llm_memory.provider import ProviderUnsupported, PurgeScope
 from llm_memory.reconcile import WorkBudget
-from llm_memory.sqlite_history import _backed_generations, _results, encode_fts5_query
+from llm_memory.sqlite_history import (
+    SQLITE_STRATEGY,
+    _backed_generations,
+    _results,
+    encode_fts5_query,
+    search_history,
+)
 from llm_memory.sqlite_lifecycle import measure, purge, remove_provider_file
 from llm_memory.sqlite_reconcile import reconcile_registry
 from llm_memory.sqlite_store import SQLiteStore
@@ -289,6 +296,80 @@ def test_reconciliation_rebuilds_source_after_derived_purge(
     assert source.locator.read_bytes() == source_bytes
 
 
+def test_episode_only_purge_invalidates_then_immediate_search_rebuilds_source(
+    sqlite_store, populated_fixture
+):
+    source = next(
+        source
+        for source in populated_fixture["sources"]
+        if (source.corpus_id, source.source_id) == ("local", "selected")
+    )
+    original = sqlite_store.member_state(source, source.source_id)
+    retained_source = next(
+        enrolled
+        for enrolled in populated_fixture["sources"]
+        if (enrolled.corpus_id, enrolled.source_id) == ("local", "retained")
+    )
+    retained_state = sqlite_store.member_state(
+        retained_source, retained_source.source_id
+    )
+    source_bytes = source.locator.read_bytes()
+
+    assert purge(
+        sqlite_store,
+        PurgeScope("local", "selected"),
+        frozenset({"episodes"}),
+    ) == {"episodes": 1}
+
+    invalidated = sqlite_store.member_state(source, source.source_id)
+    assert invalidated["active_generation_id"] == original["active_generation_id"]
+    assert invalidated["revision"] == original["revision"] + 1
+    assert invalidated["active_generation_integrity"] == "invalid"
+    assert invalidated["freshness"] == "stale"
+    assert (
+        sqlite_store.member_state(retained_source, retained_source.source_id)
+        == retained_state
+    )
+    response = search_history(
+        sqlite_store,
+        EnrollmentRegistry((source,)),
+        SearchRequest.create(
+            "selected",
+            ["local"],
+            strategy=SQLITE_STRATEGY,
+        ),
+        WorkBudget(1_000_000, NOW),
+    )
+    recovered = sqlite_store.member_state(source, source.source_id)
+    assert recovered["active_generation_id"] != original["active_generation_id"]
+    assert recovered["active_generation_integrity"] == "valid"
+    assert response["total_matches"] == 1
+    assert response["total_standing"] == "exact"
+    assert response["returned_count"] == 1
+    assert response["results"][0]["corpus_id"] == "local"
+    assert source.locator.read_bytes() == source_bytes
+
+
+def test_episode_purge_and_state_invalidation_roll_back_together(
+    sqlite_store, populated_fixture
+):
+    before = _counts(sqlite_store)
+    with sqlite_store.write_transaction() as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_state_invalidation BEFORE UPDATE ON source_states "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic invalidation failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="invalidation failure"):
+        purge(
+            sqlite_store,
+            PurgeScope("local", "selected"),
+            frozenset({"episodes"}),
+        )
+
+    assert _counts(sqlite_store) == before
+
+
 def test_measure_reports_physical_files_and_scoped_query_counts_separately(
     sqlite_store, populated_fixture
 ):
@@ -350,6 +431,9 @@ def test_full_removal_handles_database_wal_shm_and_preserves_sources(
         source.locator: source.locator.read_bytes()
         for source in populated_fixture["sources"]
     }
+    config = sqlite_store.path.parent / "enrollment.yaml"
+    config_bytes = b"sources:\n  - corpus_id: local\n    source_id: selected\n"
+    config.write_bytes(config_bytes)
     held_connection = sqlite_store.connect()
     held_connection.execute("BEGIN IMMEDIATE")
     held_connection.execute(
@@ -376,6 +460,7 @@ def test_full_removal_handles_database_wal_shm_and_preserves_sources(
     assert report["retained"] == ["enrollment configuration", "source locators"]
     assert not any((sqlite_store.path.parent / name).exists() for name in candidates)
     assert all(path.read_bytes() == content for path, content in source_bytes.items())
+    assert config.read_bytes() == config_bytes
 
 
 def test_full_removal_is_idempotent_when_provider_files_are_absent(tmp_path):
@@ -407,3 +492,46 @@ def test_full_removal_reports_residual_path_when_unlink_fails(
     assert sqlite_store.path.name not in report["removed_paths"]
     assert report["residual_paths"] == [sqlite_store.path.name]
     assert sqlite_store.path.exists()
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_symlink_provider_measurement_and_removal_refuse_to_follow_or_unlink(
+    tmp_path, target_exists
+):
+    target = tmp_path / "unexpected-target.sqlite3"
+    if target_exists:
+        target.write_bytes(b"unexpected target bytes")
+    link = tmp_path / "configured.sqlite3"
+    link.symlink_to(target)
+    companions = (Path(f"{link}-wal"), Path(f"{link}-shm"))
+    for companion in companions:
+        companion.write_bytes(b"unexpected companion bytes")
+    store = SQLiteStore(link)
+    target_before = target.read_bytes() if target_exists else None
+
+    with pytest.raises(ProviderUnsupported, match="symlink"):
+        measure(store, PurgeScope())
+
+    report = remove_provider_file(store)
+    assert report["removed_paths"] == []
+    assert report["residual_paths"] == [
+        link.name,
+        *(companion.name for companion in companions),
+    ]
+    assert report["residual_reasons"] == {
+        link.name: "configured SQLite database path is a symlink",
+        **{
+            companion.name: (
+                "not removed because configured SQLite database path is a symlink"
+            )
+            for companion in companions
+        },
+    }
+    assert link.is_symlink()
+    assert all(
+        companion.read_bytes() == b"unexpected companion bytes"
+        for companion in companions
+    )
+    assert target.exists() is target_exists
+    if target_exists:
+        assert target.read_bytes() == target_before

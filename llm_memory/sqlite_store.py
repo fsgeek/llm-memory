@@ -260,7 +260,14 @@ class SQLiteStore:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
 
+    def validate_path(self) -> None:
+        if self.path.is_symlink():
+            raise ProviderUnsupported(
+                "configured SQLite database path must not be a symlink"
+            )
+
     def connect(self) -> sqlite3.Connection:
+        self.validate_path()
         try:
             connection = sqlite3.connect(self.path, timeout=0, isolation_level=None)
             connection.row_factory = sqlite3.Row

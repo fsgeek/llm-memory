@@ -275,6 +275,23 @@ def test_connect_rejects_runtime_that_cannot_establish_wal():
         SQLiteStore(":memory:").connect()
 
 
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_connect_rejects_live_and_dangling_database_symlinks(
+    tmp_path, target_exists
+):
+    target = tmp_path / "unexpected-target.sqlite3"
+    if target_exists:
+        target.write_bytes(b"unexpected target bytes")
+    link = tmp_path / "configured.sqlite3"
+    link.symlink_to(target)
+
+    with pytest.raises(ProviderUnsupported, match="symlink"):
+        SQLiteStore(link).connect()
+
+    assert link.is_symlink()
+    assert target.exists() is target_exists
+
+
 def test_episode_triggers_keep_fts_copy_transactional(sqlite_store, episode_row):
     with sqlite_store.write_transaction() as connection:
         rowid = sqlite_store.insert_episode(connection, episode_row)
