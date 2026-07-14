@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-import llm_memory.history as history_module
+import llm_memory.opening as opening_module
 from llm_memory.adapters import get_adapter
 from llm_memory.contract import ContractError
 from llm_memory.contract_index import (
@@ -20,6 +20,7 @@ from llm_memory.contract_index import (
 from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
 from llm_memory.history import open_episode
+from llm_memory.opening import open_episode as source_open_episode
 from llm_memory.reconcile import WorkBudget, reconcile_registry
 
 
@@ -56,10 +57,16 @@ def opening_storage():
             )
 
 
-def enrollment(corpus_id: str, path: Path, *, canonicalization_version: int = 1):
+def enrollment(
+    corpus_id: str,
+    path: Path,
+    *,
+    source_id: str = "taste",
+    canonicalization_version: int = 1,
+):
     return SourceEnrollment(
         corpus_id=corpus_id,
-        source_id="taste",
+        source_id=source_id,
         adapter="taste_open_jsonl",
         boundary_version=1,
         canonicalization_version=canonicalization_version,
@@ -93,6 +100,35 @@ def first_record(source: SourceEnrollment):
     return adapter.scan(source, adapter.members(source)[0]).episodes[0]
 
 
+@pytest.fixture
+def registry(tmp_path):
+    path = tmp_path / "shared-opening.jsonl"
+    write_jsonl(path, [taste(2, "new question", "new answer")])
+    source = enrollment("local", path, source_id="synthetic")
+    return EnrollmentRegistry((source,))
+
+
+@pytest.fixture
+def new_ref(registry):
+    return first_record(registry.sources[0]).identity.episode_ref
+
+
+@pytest.fixture
+def exact_episode_ref(new_ref):
+    return new_ref
+
+
+@pytest.fixture
+def old_ref(registry):
+    source = registry.sources[0]
+    current_source = source.locator.read_bytes()
+    write_jsonl(source.locator, [taste(1, "old question", "old answer")])
+    try:
+        return first_record(source).identity.episode_ref
+    finally:
+        source.locator.write_bytes(current_source)
+
+
 def assert_standing(response: dict, episode_ref: str, standing: str) -> None:
     assert response["contract_version"] == 1
     assert response["episode_ref"] == episode_ref
@@ -107,6 +143,33 @@ def assert_no_content(response: dict) -> None:
 class UnavailableDatabase:
     def __getattr__(self, name):
         raise OSError(f"database is unavailable: {name}")
+
+
+def test_exact_open_never_calls_supersession_resolver(registry, exact_episode_ref):
+    def forbidden(_enrollment, _old_ref):
+        raise AssertionError("exact source-backed opening must not consult provider state")
+
+    response = source_open_episode(registry, exact_episode_ref, ["local"], forbidden)
+    assert response["standing"] == "available"
+
+
+def test_missing_open_uses_only_selected_supersession_resolver(
+    registry, old_ref, new_ref
+):
+    calls = []
+    response = source_open_episode(
+        registry,
+        old_ref,
+        ["local"],
+        lambda enrollment, ref: calls.append((enrollment.source_id, ref)) or new_ref,
+    )
+    assert response == {
+        "contract_version": 1,
+        "episode_ref": old_ref,
+        "standing": "superseded",
+        "replacement_ref": new_ref,
+    }
+    assert calls == [("synthetic", old_ref)]
 
 
 def test_available_opening_is_recomputed_from_source_without_arango(tmp_path):
@@ -317,7 +380,7 @@ def test_opening_reports_unsupported_adapter_without_content(
     def unsupported(_name):
         raise ContractError("unsupported adapter")
 
-    monkeypatch.setattr(history_module, "get_adapter", unsupported)
+    monkeypatch.setattr(opening_module, "get_adapter", unsupported)
     response = open_episode(db, EnrollmentRegistry((source,)), episode_ref, [corpus_id])
 
     assert_standing(response, episode_ref, "unsupported_adapter")

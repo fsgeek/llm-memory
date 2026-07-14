@@ -8,10 +8,8 @@ from llm_memory.contract_index import (
     SUPERSESSIONS,
     ensure_contract_index,
 )
-from llm_memory.history import (
-    _replacement_ref as arango_replacement_ref,
-    search_history as arango_search,
-)
+from llm_memory.enrollment import SourceEnrollment
+from llm_memory.history import search_history as arango_search
 from llm_memory.lifecycle import purge_derived
 from llm_memory.provider import ProviderDescriptor, ProviderMeasurement, PurgeScope
 from llm_memory.reconcile import reconcile_registry
@@ -38,6 +36,33 @@ _MEASUREMENT_COLLECTIONS = {
     "source_state_documents": SOURCE_STATES,
     "supersession_documents": SUPERSESSIONS,
 }
+
+_SUPERSESSION_AQL = """
+FOR observation IN @@supersessions
+    FILTER observation.corpus_id == @corpus_id
+    FILTER observation.source_id == @source_id
+    FILTER observation.old_ref == @episode_ref
+    SORT observation.detected_at DESC, observation.new_ref
+    LIMIT 1
+    RETURN observation.new_ref
+"""
+
+
+def arango_replacement_ref(
+    db, enrollment: SourceEnrollment, episode_ref: str
+) -> str | None:
+    observations = list(
+        db.aql.execute(
+            _SUPERSESSION_AQL,
+            bind_vars={
+                "@supersessions": SUPERSESSIONS,
+                "corpus_id": enrollment.corpus_id,
+                "source_id": enrollment.source_id,
+                "episode_ref": episode_ref,
+            },
+        )
+    )
+    return observations[0] if observations else None
 
 
 def _validated_classes(classes: frozenset[str]) -> frozenset[str]:

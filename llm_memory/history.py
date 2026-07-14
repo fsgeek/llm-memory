@@ -2,24 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from llm_memory.adapters import EpisodeRecord, get_adapter
 from llm_memory.contract import (
     CONTRACT_VERSION,
     STRATEGY,
     ContractError,
-    EpisodeReference,
-    OpenStanding,
     ProviderCapabilities,
     SearchRequest,
-    SourceStanding,
 )
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
     CONTRACT_VIEW,
     SOURCE_STATES,
-    SUPERSESSIONS,
 )
-from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
+from llm_memory.enrollment import EnrollmentRegistry
+from llm_memory.opening import open_episode as open_source_episode
 from llm_memory.reconcile import WorkBudget, reconcile_registry
 from llm_memory.search import _matched_field
 
@@ -89,93 +85,9 @@ RETURN {
 }
 """
 
-_SUPERSESSION_AQL = """
-FOR observation IN @@supersessions
-    FILTER observation.corpus_id == @corpus_id
-    FILTER observation.source_id == @source_id
-    FILTER observation.old_ref == @episode_ref
-    SORT observation.detected_at DESC, observation.new_ref
-    LIMIT 1
-    RETURN observation.new_ref
-"""
-
 
 def provider_capabilities() -> dict[str, Any]:
     return ProviderCapabilities().as_dict()
-
-
-def _open_response(
-    episode_ref: str, standing: OpenStanding, **details: Any
-) -> dict[str, Any]:
-    return {
-        "contract_version": CONTRACT_VERSION,
-        "episode_ref": episode_ref,
-        "standing": standing.value,
-        **details,
-    }
-
-
-def _opening_enrollment(
-    registry: EnrollmentRegistry,
-    reference: EpisodeReference,
-    active_corpus_ids: list[str] | tuple[str, ...],
-) -> SourceEnrollment:
-    if not isinstance(registry, EnrollmentRegistry):
-        raise ContractError("registry must be an EnrollmentRegistry")
-    if not isinstance(active_corpus_ids, (list, tuple)):
-        raise ContractError("active_corpus_ids must be a list or tuple")
-    if active_corpus_ids.count(reference.corpus_id) != 1:
-        raise ContractError("episode corpus must appear exactly once in active corpus scope")
-
-    declarations = tuple(
-        source
-        for source in registry.sources
-        if source.enabled
-        and source.corpus_id == reference.corpus_id
-        and source.source_id == reference.source_id
-    )
-    if len(declarations) != 1:
-        raise ContractError("episode source is not uniquely enrolled and enabled")
-    return declarations[0]
-
-
-def _available_opening(
-    episode_ref: str,
-    enrollment: SourceEnrollment,
-    implementation_version: str,
-    episode: EpisodeRecord,
-) -> dict[str, Any]:
-    return _open_response(
-        episode_ref,
-        OpenStanding.AVAILABLE,
-        **episode.body.as_dict(),
-        provenance={
-            "corpus_id": enrollment.corpus_id,
-            "source_id": enrollment.source_id,
-            "adapter": enrollment.adapter,
-            "implementation_version": implementation_version,
-            "canonicalization_version": enrollment.canonicalization_version,
-            "boundary_version": enrollment.boundary_version,
-            "native_event_id": episode.native_event_id,
-            "source_position": episode.source_position,
-            "content_digest": episode.identity.body_digest,
-        },
-    )
-
-
-def _replacement_ref(db, enrollment: SourceEnrollment, episode_ref: str) -> str | None:
-    observations = list(
-        db.aql.execute(
-            _SUPERSESSION_AQL,
-            bind_vars={
-                "@supersessions": SUPERSESSIONS,
-                "corpus_id": enrollment.corpus_id,
-                "source_id": enrollment.source_id,
-                "episode_ref": episode_ref,
-            },
-        )
-    )
-    return observations[0] if observations else None
 
 
 def open_episode(
@@ -184,61 +96,14 @@ def open_episode(
     episode_ref: str,
     active_corpus_ids: list[str] | tuple[str, ...],
 ) -> dict:
-    reference = EpisodeReference.parse(episode_ref)
-    enrollment = _opening_enrollment(registry, reference, active_corpus_ids)
-    try:
-        adapter = get_adapter(enrollment.adapter)
-    except ContractError:
-        return _open_response(episode_ref, OpenStanding.UNSUPPORTED_ADAPTER)
+    from llm_memory.arango_provider import arango_replacement_ref
 
-    try:
-        members = adapter.members(enrollment)
-    except OSError:
-        return _open_response(episode_ref, OpenStanding.SOURCE_UNAVAILABLE)
-
-    available_episodes: list[EpisodeRecord] = []
-    standings: list[SourceStanding] = []
-    try:
-        for member in members:
-            scan = adapter.scan(enrollment, member)
-            standings.append(scan.source_standing)
-            if scan.source_standing is SourceStanding.AVAILABLE:
-                available_episodes.extend(scan.episodes)
-    except OSError:
-        return _open_response(episode_ref, OpenStanding.SOURCE_UNAVAILABLE)
-
-    by_ref = {
-        episode.identity.episode_ref: episode for episode in available_episodes
-    }
-    exact = by_ref.get(episode_ref)
-    if exact is not None:
-        return _available_opening(
-            episode_ref,
-            enrollment,
-            adapter.implementation_version,
-            exact,
-        )
-
-    if SourceStanding.MALFORMED in standings:
-        return _open_response(episode_ref, OpenStanding.MALFORMED_SOURCE)
-    if any(standing is not SourceStanding.AVAILABLE for standing in standings):
-        return _open_response(episode_ref, OpenStanding.SOURCE_UNAVAILABLE)
-
-    replacement_ref = _replacement_ref(db, enrollment, episode_ref)
-    if replacement_ref in by_ref:
-        return _open_response(
-            episode_ref,
-            OpenStanding.SUPERSEDED,
-            replacement_ref=replacement_ref,
-        )
-
-    same_event = any(
-        episode.identity.reference.native_session_id == reference.native_session_id
-        and episode.identity.reference.event_token == reference.event_token
-        for episode in available_episodes
+    return open_source_episode(
+        registry,
+        episode_ref,
+        active_corpus_ids,
+        lambda enrollment, old_ref: arango_replacement_ref(db, enrollment, old_ref),
     )
-    standing = OpenStanding.CONTENT_MISMATCH if same_event else OpenStanding.MISSING
-    return _open_response(episode_ref, standing)
 
 
 def _validated_request(request: SearchRequest) -> SearchRequest:
