@@ -95,11 +95,34 @@ def purge(
                 "UPDATE source_states SET revision = revision + 1, "
                 "state_json = json_set("
                 "state_json, "
-                "'$.active_generation_integrity', 'invalid', "
-                "'$.freshness', 'stale'"
+                "'$.active_generation_integrity', "
+                "CASE WHEN json_extract(state_json, '$.active_generation_id') "
+                "IS NOT NULL THEN 'invalid' ELSE NULL END, "
+                "'$.freshness', "
+                "CASE WHEN json_extract(state_json, '$.active_generation_id') "
+                "IS NOT NULL THEN 'stale' ELSE 'incomplete' END, "
+                "'$.staging_generation_id', NULL, "
+                "'$.staging_episode_count', NULL, "
+                "'$.staging_canonicalization_version', NULL, "
+                "'$.staging_boundary_version', NULL, "
+                "'$.build_generation_id', NULL, "
+                "'$.build_mode', NULL, "
+                "'$.build_reason', NULL, "
+                "'$.build_cursor', NULL, "
+                "'$.build_chain_digest', NULL, "
+                "'$.build_seeded', NULL, "
+                "'$.build_canonicalization_version', NULL, "
+                "'$.build_boundary_version', NULL, "
+                "'$.build_source_snapshot', NULL, "
+                "'$.build_observed_end', NULL, "
+                "'$.build_complete_end', NULL, "
+                "'$.build_bytes_read', NULL, "
+                "'$.build_elapsed_ms', NULL"
                 ")"
                 f"{active_predicate} "
-                "json_extract(state_json, '$.active_generation_id') IS NOT NULL",
+                "(json_extract(state_json, '$.active_generation_id') IS NOT NULL "
+                "OR json_extract(state_json, '$.staging_generation_id') IS NOT NULL "
+                "OR json_extract(state_json, '$.build_generation_id') IS NOT NULL)",
                 parameters,
             )
     return counts
@@ -156,10 +179,11 @@ def _row_counts(store: SQLiteStore, scope: PurgeScope) -> dict[str, int | str | 
 def measure(store: SQLiteStore, scope: PurgeScope) -> ProviderMeasurement:
     validated_scope = _validated_scope(scope)
     store.validate_path()
+    database, wal, shm = store.file_paths()
     paths = {
-        "database": store.path,
-        "wal": Path(f"{store.path}-wal"),
-        "shm": Path(f"{store.path}-shm"),
+        "database": database,
+        "wal": wal,
+        "shm": shm,
     }
     physical = {name: _physical_observation(path) for name, path in paths.items()}
     rows = (
@@ -195,24 +219,28 @@ def measure(store: SQLiteStore, scope: PurgeScope) -> ProviderMeasurement:
     )
 
 
+def _symlink_residual_reason(
+    name: str, database_name: str, symlinks: frozenset[str]
+) -> str:
+    if name in symlinks:
+        if name == database_name:
+            return "configured SQLite database path is a symlink"
+        return "configured SQLite companion path is a symlink"
+    if database_name in symlinks:
+        return "not removed because configured SQLite database path is a symlink"
+    return "not removed because SQLite provider file set contains a symlink"
+
+
 def remove_provider_file(store: SQLiteStore) -> dict[str, object]:
-    candidates = (
-        store.path,
-        Path(f"{store.path}-wal"),
-        Path(f"{store.path}-shm"),
-    )
-    if store.path.is_symlink():
+    candidates = store.file_paths()
+    symlinks = frozenset(path.name for path in candidates if path.is_symlink())
+    if symlinks:
         residual = [path.name for path in candidates if _path_present(path)]
         return {
             "removed_paths": [],
             "residual_paths": residual,
             "residual_reasons": {
-                name: (
-                    "configured SQLite database path is a symlink"
-                    if name == store.path.name
-                    else "not removed because configured SQLite database path "
-                    "is a symlink"
-                )
+                name: _symlink_residual_reason(name, store.path.name, symlinks)
                 for name in residual
             },
             "declared_losses": [

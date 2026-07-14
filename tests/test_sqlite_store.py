@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -289,6 +290,26 @@ def test_connect_rejects_live_and_dangling_database_symlinks(
         SQLiteStore(link).connect()
 
     assert link.is_symlink()
+    assert target.exists() is target_exists
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_connect_rejects_live_and_dangling_companion_symlinks(
+    tmp_path, suffix, target_exists
+):
+    store = SQLiteStore(tmp_path / "configured.sqlite3")
+    store.ensure()
+    target = tmp_path / f"unexpected-target{suffix}"
+    if target_exists:
+        target.write_bytes(b"unexpected target bytes")
+    companion = Path(f"{store.path}{suffix}")
+    companion.symlink_to(target)
+
+    with pytest.raises(ProviderUnsupported, match="symlink"):
+        store.connect()
+
+    assert companion.is_symlink()
     assert target.exists() is target_exists
 
 

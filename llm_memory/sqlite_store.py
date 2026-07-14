@@ -260,10 +260,19 @@ class SQLiteStore:
         self.path = Path(path)
         self.busy_timeout_ms = busy_timeout_ms
 
+    def file_paths(self) -> tuple[Path, ...]:
+        return (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        )
+
     def validate_path(self) -> None:
-        if self.path.is_symlink():
+        symlinks = [path.name for path in self.file_paths() if path.is_symlink()]
+        if symlinks:
             raise ProviderUnsupported(
-                "configured SQLite database path must not be a symlink"
+                "configured SQLite provider paths must not be symlinks: "
+                + ", ".join(repr(name) for name in symlinks)
             )
 
     def connect(self) -> sqlite3.Connection:

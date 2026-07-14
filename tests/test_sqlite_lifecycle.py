@@ -370,6 +370,121 @@ def test_episode_purge_and_state_invalidation_roll_back_together(
     assert _counts(sqlite_store) == before
 
 
+def test_episode_purge_resets_partial_staging_before_immediate_rebuild(
+    sqlite_store, tmp_path
+):
+    path = tmp_path / "partial-append.jsonl"
+    _write_source(path, "first active lifecycle answer")
+    source = _source("local", "partial-append", path)
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1_000_000, NOW))
+    with path.open("ab") as stream:
+        for cycle in (2, 3):
+            stream.write(
+                json.dumps(
+                    {
+                        "cycle": cycle,
+                        "user_message": f"synthetic lifecycle question {cycle}",
+                        "response_text": f"staged lifecycle answer {cycle}",
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+    reconcile_registry(sqlite_store, registry, WorkBudget(1, NOW))
+    partial = sqlite_store.member_state(source, source.source_id)
+    assert partial["active_generation_id"]
+    assert partial["staging_generation_id"]
+    assert partial["build_generation_id"] == partial["staging_generation_id"]
+    assert partial["build_cursor"]["byte_offset"] > 0
+    assert partial["staging_episode_count"] > 0
+    staged_count = sqlite_store.staging_episode_count("local", source.source_id)
+    assert staged_count > 0
+
+    assert purge(
+        sqlite_store,
+        PurgeScope("local", source.source_id),
+        frozenset({"episodes"}),
+    ) == {"episodes": staged_count + 1}
+
+    reset = sqlite_store.member_state(source, source.source_id)
+    assert reset["active_generation_id"] == partial["active_generation_id"]
+    assert reset["active_generation_integrity"] == "invalid"
+    assert reset["freshness"] == "stale"
+    for key in (
+        "staging_generation_id",
+        "staging_episode_count",
+        "build_generation_id",
+        "build_cursor",
+        "build_mode",
+        "build_reason",
+    ):
+        assert reset[key] is None
+
+    response = search_history(
+        sqlite_store,
+        registry,
+        SearchRequest.create(
+            "lifecycle",
+            ["local"],
+            strategy=SQLITE_STRATEGY,
+        ),
+        WorkBudget(1_000_000, NOW),
+    )
+    recovered = sqlite_store.member_state(source, source.source_id)
+    assert recovered["active_generation_integrity"] == "valid"
+    assert recovered["active_generation_id"] != partial["active_generation_id"]
+    assert len(sqlite_store.active_episode_refs("local", source.source_id)) == 3
+    assert response["total_standing"] == "exact"
+    assert response["total_matches"] == 3
+
+
+def test_episode_purge_resets_staging_only_state_before_initial_rebuild(
+    sqlite_store, tmp_path
+):
+    path = tmp_path / "partial-initial.jsonl"
+    with path.open("wb") as stream:
+        for cycle in (1, 2):
+            stream.write(
+                json.dumps(
+                    {
+                        "cycle": cycle,
+                        "user_message": f"initial lifecycle question {cycle}",
+                        "response_text": f"initial lifecycle answer {cycle}",
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+    source = _source("local", "partial-initial", path)
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1, NOW))
+    partial = sqlite_store.member_state(source, source.source_id)
+    assert partial.get("active_generation_id") is None
+    assert partial["staging_generation_id"]
+    assert partial["build_generation_id"] == partial["staging_generation_id"]
+    assert partial["build_cursor"]["byte_offset"] > 0
+    staged_count = sqlite_store.staging_episode_count("local", source.source_id)
+    assert staged_count > 0
+
+    assert purge(
+        sqlite_store,
+        PurgeScope("local", source.source_id),
+        frozenset({"episodes"}),
+    ) == {"episodes": staged_count}
+
+    reset = sqlite_store.member_state(source, source.source_id)
+    assert reset.get("active_generation_id") is None
+    assert reset["active_generation_integrity"] is None
+    assert reset["freshness"] == "incomplete"
+    assert reset["staging_generation_id"] is None
+    assert reset["staging_episode_count"] is None
+    assert reset["build_generation_id"] is None
+    assert reset["build_cursor"] is None
+    reconcile_registry(sqlite_store, registry, WorkBudget(1_000_000, NOW))
+    assert len(sqlite_store.active_episode_refs("local", source.source_id)) == 2
+
+
 def test_measure_reports_physical_files_and_scoped_query_counts_separately(
     sqlite_store, populated_fixture
 ):
@@ -532,6 +647,36 @@ def test_symlink_provider_measurement_and_removal_refuse_to_follow_or_unlink(
         companion.read_bytes() == b"unexpected companion bytes"
         for companion in companions
     )
+    assert target.exists() is target_exists
+    if target_exists:
+        assert target.read_bytes() == target_before
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_companion_symlink_blocks_measurement_and_removal_without_target_access(
+    tmp_path, suffix, target_exists
+):
+    store = SQLiteStore(tmp_path / "configured.sqlite3")
+    store.ensure()
+    database_bytes = store.path.read_bytes()
+    target = tmp_path / f"unexpected-target{suffix}"
+    if target_exists:
+        target.write_bytes(b"unexpected target bytes")
+    companion = Path(f"{store.path}{suffix}")
+    companion.symlink_to(target)
+    target_before = target.read_bytes() if target_exists else None
+
+    with pytest.raises(ProviderUnsupported, match="symlink"):
+        measure(store, PurgeScope())
+
+    report = remove_provider_file(store)
+    assert report["removed_paths"] == []
+    assert store.path.name in report["residual_paths"]
+    assert companion.name in report["residual_paths"]
+    assert "symlink" in report["residual_reasons"][companion.name]
+    assert companion.is_symlink()
+    assert store.path.read_bytes() == database_bytes
     assert target.exists() is target_exists
     if target_exists:
         assert target.read_bytes() == target_before

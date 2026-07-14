@@ -464,6 +464,10 @@ def _reconcile_member(
         if budget.exhausted:
             return
         state = _begin_build(store, enrollment, member, state, "initial")
+    elif state.get("active_generation_integrity") == "invalid":
+        if budget.exhausted:
+            return
+        state = _begin_build(store, enrollment, member, state, "derived_loss")
     elif state.get("build_generation_id"):
         if (
             state.get("build_canonicalization_version")
@@ -488,10 +492,6 @@ def _reconcile_member(
             state = _begin_build(
                 store, enrollment, member, state, "semantic_version"
             )
-        elif state.get("active_generation_integrity") == "invalid":
-            if budget.exhausted:
-                return
-            state = _begin_build(store, enrollment, member, state, "derived_loss")
         else:
             generation = _stat(member)
             if _audit_due(enrollment, member, state, budget.now):
