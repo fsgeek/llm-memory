@@ -31,6 +31,21 @@ _COUNT_FIELDS = frozenset(
         "supersession_documents",
     }
 )
+_PROVIDER_COUNT_FIELDS = {
+    "arango": frozenset(
+        {
+            "episode_documents",
+            "source_state_documents",
+            "supersession_documents",
+        }
+    ),
+    "sqlite": _COUNT_FIELDS,
+}
+_SQLITE_PHYSICAL_FIELDS = frozenset(
+    f"{artifact}_{suffix}"
+    for artifact in ("database", "wal", "shm")
+    for suffix in ("bytes", "stat_standing")
+)
 _DESCRIPTORS: dict[str, dict[str, object]] = {
     "arango": {
         "provider": "arango",
@@ -174,6 +189,81 @@ def _unavailable_search_total(token: str) -> dict[str, object]:
     }
 
 
+def _valid_count(value: object, *, nullable: bool) -> bool:
+    return (value is None and nullable) or (
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    )
+
+
+def _validated_measurement(
+    name: str, observed: object
+) -> ProviderMeasurement:
+    if (
+        not isinstance(observed, ProviderMeasurement)
+        or observed.provider != name
+        or observed.standing not in {"available", "unavailable"}
+        or not isinstance(observed.observations, dict)
+    ):
+        raise ValueError("invalid provider measurement")
+    observations = observed.observations
+    count_fields = _PROVIDER_COUNT_FIELDS[name]
+    nullable_counts = observed.standing == "unavailable"
+    if not count_fields <= observations.keys() or not all(
+        _valid_count(observations[field], nullable=nullable_counts)
+        for field in count_fields
+    ):
+        raise ValueError("invalid provider measurement counts")
+
+    if name == "arango":
+        if set(observations) != count_fields:
+            raise ValueError("invalid Arango measurement shape")
+        return observed
+
+    expected = count_fields | _SQLITE_PHYSICAL_FIELDS | {
+        "scope",
+        "corpus_id",
+        "source_id",
+        "query_standing",
+        "fts_representation",
+    }
+    if set(observations) != expected or (
+        observations["scope"] != "global"
+        or observations["corpus_id"] is not None
+        or observations["source_id"] is not None
+        or observations["query_standing"] not in {"available", "unavailable"}
+        or observations["fts_representation"] != "self_contained_duplicate"
+    ):
+        raise ValueError("invalid SQLite measurement shape")
+    if not all(
+        _valid_count(observations[f"{artifact}_bytes"], nullable=False)
+        and observations[f"{artifact}_stat_standing"]
+        in {"available", "absent", "unavailable"}
+        for artifact in ("database", "wal", "shm")
+    ):
+        raise ValueError("invalid SQLite physical measurement")
+    query_available = observations["query_standing"] == "available"
+    if (
+        query_available
+        and not all(
+            _valid_count(observations[field], nullable=False)
+            for field in count_fields
+        )
+    ) or (
+        not query_available
+        and not all(observations[field] is None for field in count_fields)
+    ):
+        raise ValueError("SQLite count standing does not match count evidence")
+    expected_standing = (
+        "available"
+        if observations["database_stat_standing"] == "available"
+        and query_available
+        else "unavailable"
+    )
+    if observed.standing != expected_standing:
+        raise ValueError("SQLite measurement standing is inconsistent")
+    return observed
+
+
 def _state_counts(measurement: ProviderMeasurement | None) -> dict[str, object]:
     if measurement is None:
         return {
@@ -209,7 +299,9 @@ def _physical_bytes(measurement: ProviderMeasurement | None) -> dict[str, object
             standing, str
         ):
             artifacts[artifact] = {"standing": standing, "bytes": byte_count}
-    if not artifacts:
+    if not artifacts or any(
+        artifact["standing"] == "unavailable" for artifact in artifacts.values()
+    ):
         return {
             "standing": "unavailable",
             "basis": "provider_did_not_report_physical_bytes",
@@ -305,15 +397,7 @@ def _run_provider(
             source_bytes += search_budget.bytes_read
 
     try:
-        observed = provider.measure(PurgeScope())
-        if (
-            not isinstance(observed, ProviderMeasurement)
-            or observed.provider != name
-            or observed.standing not in {"available", "unavailable"}
-            or not isinstance(observed.observations, dict)
-        ):
-            raise ValueError("invalid provider measurement")
-        measurement = observed
+        measurement = _validated_measurement(name, provider.measure(PurgeScope()))
         if measurement.standing != "available":
             failures.append("measure")
     except Exception as exc:

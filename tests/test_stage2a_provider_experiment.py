@@ -117,6 +117,9 @@ class FakeProvider:
         }
         if self.name == "sqlite":
             observations |= {
+                "scope": "global",
+                "corpus_id": None,
+                "source_id": None,
                 "episode_fts_rows": 2,
                 "database_bytes": 123,
                 "database_stat_standing": "available",
@@ -245,6 +248,79 @@ def test_malformed_measurement_does_not_suppress_other_provider(
         "operation": None,
     }
     assert report["providers"]["sqlite"]["standing"] == "available"
+
+
+@pytest.mark.parametrize("invalid_count", [-1, True])
+def test_invalid_measurement_count_is_unavailable_without_suppressing_peer(
+    synthetic_experiment: Stage2AExperiment, invalid_count: object
+) -> None:
+    synthetic_experiment.arango.measure = lambda scope: ProviderMeasurement(
+        "arango",
+        "available",
+        {
+            "episode_documents": invalid_count,
+            "source_state_documents": 1,
+            "supersession_documents": 0,
+        },
+    )
+
+    report = run_stage2a(synthetic_experiment)
+
+    arango = report["providers"]["arango"]
+    assert arango["standing"] == "unavailable"
+    assert arango["derived_state_counts"] == {
+        "standing": "unavailable",
+        "basis": "provider_measurement",
+        "counts": {},
+    }
+    assert arango["derived_physical_bytes"] == {
+        "standing": "unavailable",
+        "basis": "provider_did_not_report_physical_bytes",
+        "total_bytes": None,
+        "artifacts": {},
+    }
+    assert report["providers"]["sqlite"]["standing"] == "available"
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid_value"),
+    [
+        ("database_bytes", -1),
+        ("database_bytes", True),
+        ("database_stat_standing", "unknown"),
+    ],
+)
+def test_invalid_physical_measurement_is_unavailable_without_suppressing_peer(
+    synthetic_experiment: Stage2AExperiment, key: str, invalid_value: object
+) -> None:
+    original_measure = synthetic_experiment.sqlite.measure
+
+    def invalid_measurement(scope) -> ProviderMeasurement:
+        valid = original_measure(scope)
+        return ProviderMeasurement(
+            valid.provider,
+            valid.standing,
+            valid.observations | {key: invalid_value},
+        )
+
+    synthetic_experiment.sqlite.measure = invalid_measurement
+
+    report = run_stage2a(synthetic_experiment)
+
+    sqlite = report["providers"]["sqlite"]
+    assert sqlite["standing"] == "unavailable"
+    assert sqlite["derived_state_counts"] == {
+        "standing": "unavailable",
+        "basis": "provider_measurement",
+        "counts": {},
+    }
+    assert sqlite["derived_physical_bytes"] == {
+        "standing": "unavailable",
+        "basis": "provider_did_not_report_physical_bytes",
+        "total_bytes": None,
+        "artifacts": {},
+    }
+    assert report["providers"]["arango"]["standing"] == "available"
 
 
 def test_provider_records_retain_independent_measurement_basis(

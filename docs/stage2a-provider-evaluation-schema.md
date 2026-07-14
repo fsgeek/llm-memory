@@ -54,8 +54,10 @@ Each provider record declares:
 - `derived_physical_bytes`: SQLite database, WAL, and SHM byte observations with
   separate artifact standings, or explicit unavailability. Arango serialized
   document sizes are not represented as physical disk use.
-- `lock_or_outage`: whether a provider operation failed and the content-free
-  operation name. Provider exception text is excluded.
+- `lock_or_outage`: whether a provider operation raised the classified,
+  retryable `ProviderUnavailable` error and the content-free operation name.
+  Other malformed evidence can make the provider unavailable without claiming
+  lock or outage evidence. Provider exception text is excluded.
 - `purge`: state-class count slots and an explicit standing.
 - `rebuild`: an explicit standing and measurement basis.
 - `full_removal`: residual count, declared losses, basis, and standing.
