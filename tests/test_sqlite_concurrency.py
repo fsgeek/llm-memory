@@ -161,15 +161,15 @@ state = json.dumps({
     "freshness": "incomplete"
 }, sort_keys=True, separators=(",", ":"))
 connection.execute(
-    "INSERT INTO source_states(" 
-    "state_key, corpus_id, source_id, member_id, revision, state_json" 
+    "INSERT INTO source_states("
+    "state_key, corpus_id, source_id, member_id, revision, state_json"
     ") VALUES (?, ?, ?, ?, ?, ?)",
     ("crash-state", "crash-corpus", "crash-source", "crash-member", 1, state),
 )
 connection.execute(
-    "INSERT INTO episode_documents(" 
+    "INSERT INTO episode_documents("
     "storage_key, corpus_id, source_id, member_id, generation_id, episode_ref, "
-    "reference_key, timestamp, user_message, response, state_text, document_json" 
+    "reference_key, timestamp, user_message, response, state_text, document_json"
     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     (
         "crash-storage", "crash-corpus", "crash-source", "crash-member",

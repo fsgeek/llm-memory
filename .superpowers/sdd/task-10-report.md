@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented and verified at implementation commit `0b85164` (`test: verify portable episodic providers`).
+Implemented and verified at implementation commit `0b85164` (`test: verify portable episodic providers`), with a later whitespace-only cleanup to the embedded crash script.
 
 ## RED / GREEN
 
@@ -57,7 +57,7 @@ The same file also verifies:
 
 - Existing plus portable provider suites: `104 passed in 18.69s`.
 - Final full suite: `410 passed in 31.49s` (exit code 0; baseline was 404).
-- `git diff --check`: clean before implementation commit.
+- `git show --check`: clean after self-review of the committed implementation.
 
 ## Files
 
