@@ -330,6 +330,8 @@ class SearchRequest:
     ) -> SearchRequest:
         if not isinstance(query, str) or not (clean_query := query.strip()):
             raise ContractError("query must be a non-empty string")
+        if "\0" in clean_query:
+            raise ContractError("query must not contain NUL")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
             raise ContractError(f"limit must be an integer from 1 to {MAX_LIMIT}")
         if not isinstance(strategy, str) or not strategy:
