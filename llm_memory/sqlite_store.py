@@ -639,6 +639,8 @@ class SQLiteStore:
         *,
         expected_count: int,
         expected_state: Mapping[str, Any],
+        state_values: Mapping[str, Any] | None = None,
+        supersession_observations: Iterable[Mapping[str, Any]] = (),
     ) -> None:
         _require_transaction(connection)
         state_key = _state_key(
@@ -673,23 +675,58 @@ class SQLiteStore:
             raise SQLiteDocumentConflict(
                 f"generation {generation_id!r} is incomplete or unindexed"
             )
+        for observation in supersession_observations:
+            connection.execute(
+                "INSERT OR IGNORE INTO supersessions("
+                "observation_key, corpus_id, source_id, member_id, event_token, "
+                "old_ref, new_ref, reason, detected_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                tuple(
+                    observation[key]
+                    for key in (
+                        "observation_key",
+                        "corpus_id",
+                        "source_id",
+                        "member_id",
+                        "event_token",
+                        "old_ref",
+                        "new_ref",
+                        "reason",
+                        "detected_at",
+                    )
+                ),
+            )
+        values = {
+            "active_generation_id": generation_id,
+            "staging_generation_id": None,
+            "staging_episode_count": None,
+            "staging_canonicalization_version": None,
+            "staging_boundary_version": None,
+            "episode_count": expected_count,
+            "active_generation_integrity": "valid",
+            "freshness": "current",
+            "canonicalization_version": enrollment.canonicalization_version,
+            "boundary_version": enrollment.boundary_version,
+        }
+        if state_values:
+            values.update(state_values)
+        values.update(
+            {
+                "active_generation_id": generation_id,
+                "staging_generation_id": None,
+                "staging_episode_count": None,
+                "episode_count": expected_count,
+                "active_generation_integrity": "valid",
+                "canonicalization_version": enrollment.canonicalization_version,
+                "boundary_version": enrollment.boundary_version,
+            }
+        )
         self._cas_state_in_transaction(
             connection,
             enrollment,
             member.member_id,
             expected_state,
-            {
-                "active_generation_id": generation_id,
-                "staging_generation_id": None,
-                "staging_episode_count": None,
-                "staging_canonicalization_version": None,
-                "staging_boundary_version": None,
-                "episode_count": expected_count,
-                "active_generation_integrity": "valid",
-                "freshness": "current",
-                "canonicalization_version": enrollment.canonicalization_version,
-                "boundary_version": enrollment.boundary_version,
-            },
+            values,
         )
 
     def delete_generation(
@@ -755,3 +792,92 @@ class SQLiteStore:
             if _is_busy(exc):
                 raise _unavailable(exc) from exc
             raise
+
+    def active_episode_refs(
+        self, corpus_id: str, source_id: str
+    ) -> tuple[str, ...]:
+        with self.read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT episode.episode_ref "
+                "FROM episode_documents AS episode "
+                "JOIN source_states AS state "
+                "ON state.corpus_id = episode.corpus_id "
+                "AND state.source_id = episode.source_id "
+                "AND state.member_id = episode.member_id "
+                "AND json_extract(state.state_json, '$.active_generation_id') "
+                "= episode.generation_id "
+                "WHERE episode.corpus_id = ? AND episode.source_id = ? "
+                "ORDER BY episode.member_id, "
+                "json_extract(episode.document_json, '$.source_position.start'), "
+                "episode.episode_ref",
+                (corpus_id, source_id),
+            ).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def staging_episode_count(self, corpus_id: str, source_id: str) -> int:
+        with self.read_transaction() as connection:
+            return connection.execute(
+                "SELECT count(*) FROM episode_documents AS episode "
+                "JOIN source_states AS state "
+                "ON state.corpus_id = episode.corpus_id "
+                "AND state.source_id = episode.source_id "
+                "AND state.member_id = episode.member_id "
+                "AND json_extract(state.state_json, '$.staging_generation_id') "
+                "= episode.generation_id "
+                "WHERE episode.corpus_id = ? AND episode.source_id = ?",
+                (corpus_id, source_id),
+            ).fetchone()[0]
+
+    def generation_documents(
+        self,
+        enrollment: SourceEnrollment,
+        member_id: str,
+        generation_id: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        clauses = [
+            "corpus_id = ?",
+            "source_id = ?",
+            "member_id = ?",
+            "generation_id = ?",
+        ]
+        parameters: list[Any] = [
+            enrollment.corpus_id,
+            enrollment.source_id,
+            member_id,
+            generation_id,
+        ]
+        if start is not None:
+            clauses.append(
+                "json_extract(document_json, '$.source_position.start') >= ?"
+            )
+            parameters.append(start)
+        if end is not None:
+            clauses.append(
+                "json_extract(document_json, '$.source_position.end') <= ?"
+            )
+            parameters.append(end)
+        with self.read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT document_json FROM episode_documents WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY "
+                "json_extract(document_json, '$.source_position.start'), "
+                "episode_ref",
+                tuple(parameters),
+            ).fetchall()
+        return tuple(json.loads(row[0]) for row in rows)
+
+    def resolve_supersession(
+        self, enrollment: SourceEnrollment, old_ref: str
+    ) -> str | None:
+        with self.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT new_ref FROM supersessions "
+                "WHERE corpus_id = ? AND source_id = ? AND old_ref = ? "
+                "ORDER BY detected_at DESC, new_ref LIMIT 1",
+                (enrollment.corpus_id, enrollment.source_id, old_ref),
+            ).fetchone()
+        return None if row is None else row[0]
