@@ -139,7 +139,7 @@ def test_append_seeds_in_database_and_charges_only_appended_source_bytes(
     )
 
     after = sqlite_store.member_state(source, source.source_id)
-    assert _member(report)["freshness"] == "current"
+    assert _member(report)["freshness"] == "tail_validated"
     assert report.bytes_read == len(appended)
     assert after["active_generation_id"] != before["active_generation_id"]
     assert _member(report)["database_work"]["seeded_episode_count"] == 1
@@ -508,3 +508,207 @@ def test_supported_semantic_version_rebuilds_and_records_supersession(
     assert _member(report)["freshness"] == "current"
     assert new_ref != old_ref
     assert sqlite_store.resolve_supersession(changed, old_ref) == new_ref
+
+
+def test_due_audit_precedes_rewrite_plus_append_optimization(
+    sqlite_store, tmp_path
+):
+    path = tmp_path / "rewrite-plus-append.jsonl"
+    _write_jsonl(
+        path,
+        [_taste(1, "first", "aaa"), _taste(2, "second", "bbb")],
+    )
+    source = _enrollment(
+        "local", "rewrite-append", "taste_open_jsonl", path, max_age=10
+    )
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1_000_000, NOW))
+    original_refs = sqlite_store.active_episode_refs("local", "rewrite-append")
+    _write_jsonl(
+        path,
+        [
+            _taste(1, "first", "ccc"),
+            _taste(2, "second", "ddd"),
+            _taste(3, "third", "eee"),
+        ],
+    )
+
+    report = reconcile_registry(
+        sqlite_store,
+        registry,
+        WorkBudget(1_000_000, NOW + timedelta(seconds=11)),
+    )
+
+    state = sqlite_store.member_state(source, source.source_id)
+    assert _member(report)["freshness"] == "stale"
+    assert state["build_mode"] == "replace"
+    assert sqlite_store.active_episode_refs("local", "rewrite-append") == original_refs
+
+
+def test_ordinary_append_publishes_no_stronger_than_tail_validated(
+    sqlite_store, tmp_path
+):
+    path = tmp_path / "tail-validated-append.jsonl"
+    _write_jsonl(path, [_taste(1, "first", "answer")])
+    source = _enrollment("local", "tail-append", "taste_open_jsonl", path)
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1_000_000, NOW))
+    with path.open("ab") as stream:
+        stream.write(
+            json.dumps(
+                _taste(2, "second", "reply"), separators=(",", ":")
+            ).encode()
+            + b"\n"
+        )
+
+    report = reconcile_registry(
+        sqlite_store, registry, WorkBudget(1_000_000, NOW)
+    )
+    audited = reconcile_registry(
+        sqlite_store, registry, WorkBudget(1_000_000, NOW)
+    )
+
+    assert _member(report)["freshness"] == "tail_validated"
+    assert len(sqlite_store.active_episode_refs("local", "tail-append")) == 2
+    assert _member(audited)["freshness"] == "current"
+
+
+def test_source_replacement_between_bounded_calls_restarts_without_hybrid(
+    sqlite_store, tmp_path
+):
+    path = tmp_path / "snapshot-resume.jsonl"
+    _write_jsonl(
+        path,
+        [_taste(1, "first", "old-a"), _taste(2, "second", "old-b")],
+    )
+    source = _enrollment("local", "snapshot", "taste_open_jsonl", path)
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1, NOW))
+    first_state = sqlite_store.member_state(source, source.source_id)
+    old_staged_ref = sqlite_store.generation_documents(
+        source,
+        source.source_id,
+        first_state["staging_generation_id"],
+    )[0]["episode_ref"]
+    _write_jsonl(
+        path,
+        [_taste(1, "first", "new-a"), _taste(2, "second", "new-b")],
+    )
+
+    resumed = reconcile_registry(sqlite_store, registry, WorkBudget(1, NOW))
+    resumed_state = sqlite_store.member_state(source, source.source_id)
+    for _ in range(4):
+        completed = reconcile_registry(sqlite_store, registry, WorkBudget(1, NOW))
+        if _member(completed)["freshness"] == "current":
+            break
+
+    assert resumed_state["staging_generation_id"] != first_state[
+        "staging_generation_id"
+    ]
+    with sqlite_store.read_transaction() as connection:
+        assert (
+            sqlite_store.generation_count(
+                connection, first_state["staging_generation_id"]
+            )
+            == 0
+        )
+    assert old_staged_ref not in sqlite_store.active_episode_refs(
+        "local", "snapshot"
+    )
+    assert _member(completed)["freshness"] == "current"
+
+
+def test_completion_state_is_not_published_before_activation(
+    sqlite_store, tmp_path, monkeypatch
+):
+    path = tmp_path / "activation-observer.jsonl"
+    _write_jsonl(path, [_taste(1, "question", "answer")])
+    source = _enrollment("local", "activation-observer", "taste_open_jsonl", path)
+    original = sqlite_store.activate_generation
+    observed = {}
+
+    def stop_before_activation(*args, **kwargs):
+        observed.update(sqlite_store.member_state(source, source.source_id))
+        raise RuntimeError("stop before activation")
+
+    monkeypatch.setattr(sqlite_store, "activate_generation", stop_before_activation)
+
+    with pytest.raises(RuntimeError, match="stop before activation"):
+        reconcile_registry(
+            sqlite_store,
+            EnrollmentRegistry((source,)),
+            WorkBudget(1_000_000, NOW),
+        )
+
+    monkeypatch.setattr(sqlite_store, "activate_generation", original)
+    assert observed.get("active_generation_id") is None
+    assert observed["freshness"] == "incomplete"
+    assert observed.get("validated_at") is None
+    assert observed.get("integrity_audit") is None
+
+
+def test_disabled_only_known_corpus_is_reported_with_empty_sources(
+    sqlite_store, tmp_path
+):
+    source = SourceEnrollment(
+        corpus_id="disabled-corpus",
+        source_id="disabled",
+        adapter="taste_open_jsonl",
+        boundary_version=1,
+        canonicalization_version=1,
+        locator=tmp_path / "disabled.jsonl",
+        enabled=False,
+        full_validation_max_age_seconds=3600,
+    )
+
+    report = reconcile_registry(
+        sqlite_store, EnrollmentRegistry((source,)), WorkBudget(1_000_000, NOW)
+    )
+
+    assert report.corpus_standing == (
+        {"corpus_id": "disabled-corpus", "sources": ()},
+    )
+
+
+@pytest.mark.parametrize("loss", ["document", "fts"])
+def test_derived_loss_blocks_append_clone_and_enters_rebuild(
+    sqlite_store, tmp_path, loss
+):
+    path = tmp_path / f"derived-loss-{loss}.jsonl"
+    _write_jsonl(path, [_taste(1, "first", "answer")])
+    source = _enrollment("local", f"derived-{loss}", "taste_open_jsonl", path)
+    registry = EnrollmentRegistry((source,))
+    reconcile_registry(sqlite_store, registry, WorkBudget(1_000_000, NOW))
+    state = sqlite_store.member_state(source, source.source_id)
+    generation_id = state["active_generation_id"]
+    with sqlite_store.write_transaction() as connection:
+        rowid = connection.execute(
+            "SELECT rowid FROM episode_documents WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()[0]
+        table = "episode_documents" if loss == "document" else "episode_fts"
+        connection.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+    with path.open("ab") as stream:
+        stream.write(
+            json.dumps(
+                _taste(2, "second", "reply"), separators=(",", ":")
+            ).encode()
+            + b"\n"
+        )
+
+    report = reconcile_registry(
+        sqlite_store, registry, WorkBudget(1_000_000, NOW)
+    )
+
+    rebuilt = sqlite_store.member_state(source, source.source_id)
+    assert _member(report)["freshness"] == "stale"
+    assert _member(report)["index_standing"] == "rebuilding"
+    assert rebuilt["build_reason"] == "derived_loss"
+    assert rebuilt["build_mode"] == "replace"
+    assert sqlite_store.staging_episode_count("local", source.source_id) == 0
+
+    recovered = reconcile_registry(
+        sqlite_store, registry, WorkBudget(1_000_000, NOW)
+    )
+    assert _member(recovered)["freshness"] == "current"
+    assert len(sqlite_store.active_episode_refs("local", source.source_id)) == 2

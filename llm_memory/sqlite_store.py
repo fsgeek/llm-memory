@@ -530,6 +530,128 @@ class SQLiteStore:
             self._insert_immutable_document(connection, document)
         return len(documents)
 
+    def _require_staging_owner(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        generation_id: str,
+        expected_state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        _require_transaction(connection)
+        state_key = _state_key(
+            enrollment.corpus_id, enrollment.source_id, member.member_id
+        )
+        row = self._state_row(connection, state_key)
+        current = None if row is None else self._deserialize_state(row)
+        if (
+            expected_state.get("revision") is None
+            or expected_state.get("staging_generation_id") != generation_id
+            or current is None
+            or current["revision"] != expected_state["revision"]
+            or current.get("staging_generation_id") != generation_id
+        ):
+            raise SQLiteStateConflict(
+                f"generation {generation_id!r} lost staging ownership"
+            )
+        return current
+
+    def write_staging_chunk(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        generation_id: str,
+        episodes: Iterable[EpisodeRecord],
+        *,
+        expected_state: Mapping[str, Any],
+        state_values: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        self._require_staging_owner(
+            connection,
+            enrollment,
+            member,
+            generation_id,
+            expected_state,
+        )
+        written = self.write_generation(
+            connection, enrollment, member, generation_id, episodes
+        )
+        state = self._cas_state_in_transaction(
+            connection,
+            enrollment,
+            member.member_id,
+            expected_state,
+            state_values,
+        )
+        return state, written
+
+    def seed_staging_generation(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        source_generation_id: str,
+        target_generation_id: str,
+        *,
+        expected_state: Mapping[str, Any],
+        state_values: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], int, float]:
+        current = self._require_staging_owner(
+            connection,
+            enrollment,
+            member,
+            target_generation_id,
+            expected_state,
+        )
+        expected_count = current.get("episode_count")
+        owned_count = connection.execute(
+            "SELECT count(*) FROM episode_documents "
+            "WHERE corpus_id = ? AND source_id = ? AND member_id = ? "
+            "AND generation_id = ?",
+            (
+                enrollment.corpus_id,
+                enrollment.source_id,
+                member.member_id,
+                source_generation_id,
+            ),
+        ).fetchone()[0]
+        if (
+            current.get("active_generation_id") != source_generation_id
+            or expected_count is None
+            or owned_count != expected_count
+            or not self.verify_generation(
+                connection,
+                source_generation_id,
+                expected_count=expected_count,
+            )
+        ):
+            raise SQLiteDocumentConflict(
+                f"active generation {source_generation_id!r} failed integrity"
+            )
+        copied_count, elapsed_ms = self.seed_generation(
+            connection,
+            enrollment,
+            member,
+            source_generation_id,
+            target_generation_id,
+        )
+        state = self._cas_state_in_transaction(
+            connection,
+            enrollment,
+            member.member_id,
+            expected_state,
+            dict(state_values)
+            | {
+                "staging_episode_count": copied_count,
+                "database_work": {
+                    "seeded_episode_count": copied_count,
+                    "seed_elapsed_ms": elapsed_ms,
+                },
+            },
+        )
+        return state, copied_count, elapsed_ms
+
     def _insert_immutable_document(
         self, connection: sqlite3.Connection, document: Mapping[str, Any]
     ) -> None:

@@ -11,7 +11,11 @@ from llm_memory.contract import EpisodeReference, FreshnessStanding, SourceStand
 from llm_memory.enrollment import EnrollmentRegistry, SourceEnrollment
 from llm_memory.provider import ProviderUnavailable
 from llm_memory.reconcile import ReconcileReport, WorkBudget, extend_chain
-from llm_memory.sqlite_store import SQLiteStateConflict, SQLiteStore
+from llm_memory.sqlite_store import (
+    SQLiteDocumentConflict,
+    SQLiteStateConflict,
+    SQLiteStore,
+)
 
 
 def _timestamp(value: datetime) -> str:
@@ -57,6 +61,7 @@ def _begin_build(
     old_staging = previous.get("staging_generation_id")
     mode = "append" if reason == "append" else "replace"
     generation_id = uuid4().hex
+    source_snapshot = _stat(member)
     updated = store.compare_and_swap_state(
         enrollment,
         member.member_id,
@@ -86,11 +91,29 @@ def _begin_build(
             "build_seeded": False,
             "build_canonicalization_version": enrollment.canonicalization_version,
             "build_boundary_version": enrollment.boundary_version,
+            "build_source_snapshot": source_snapshot,
+            "build_observed_end": (
+                previous.get("observed_end", 0) if mode == "append" else 0
+            ),
+            "build_complete_end": (
+                previous.get("complete_end", 0) if mode == "append" else 0
+            ),
+            "build_bytes_read": 0,
+            "build_elapsed_ms": 0.0,
             "database_work": {
                 "seeded_episode_count": 0,
                 "seed_elapsed_ms": 0.0,
             },
-            "source_standing": SourceStanding.UNKNOWN.value,
+            "source_standing": (
+                previous.get("source_standing", SourceStanding.UNKNOWN.value)
+                if previous.get("active_generation_id")
+                else SourceStanding.UNKNOWN.value
+            ),
+            "active_generation_integrity": (
+                "invalid"
+                if reason == "derived_loss"
+                else previous.get("active_generation_integrity")
+            ),
             "freshness": (
                 FreshnessStanding.TAIL_VALIDATED.value
                 if previous.get("active_generation_id") and mode == "append"
@@ -117,11 +140,31 @@ def _audit_due(
     audit = state.get("integrity_audit") or {}
     if audit.get("in_progress"):
         return True
+    if state.get("implementation_version") != get_adapter(
+        enrollment.adapter
+    ).implementation_version:
+        return True
+    generation = _stat(member)
+    complete_end = state.get("complete_end", 0)
+    if (
+        state.get("freshness") == FreshnessStanding.TAIL_VALIDATED.value
+        and generation is not None
+        and generation["size"] > complete_end
+        and audit.get("prefix_validated_through") == complete_end
+        and generation == state.get("member_generation")
+    ):
+        return False
+    if state.get("freshness") != FreshnessStanding.CURRENT.value:
+        return True
     validated = _parse_timestamp(state.get("validated_at"))
     expired = validated is None or (
         now - validated
     ).total_seconds() > enrollment.full_validation_max_age_seconds
-    return expired or _stat(member) != state.get("member_generation")
+    if expired or generation is None:
+        return True
+    if generation["size"] > complete_end:
+        return False
+    return generation != state.get("member_generation")
 
 
 def _start_audit(
@@ -131,6 +174,7 @@ def _start_audit(
     state: dict,
 ) -> dict:
     generation = _stat(member)
+    previous_audit = state.get("integrity_audit") or {}
     shrunk = bool(
         generation is not None
         and generation["size"] < state.get("complete_end", 0)
@@ -155,11 +199,11 @@ def _start_audit(
                 "start_generation": generation,
                 "bytes_read": 0,
                 "elapsed_ms": 0.0,
-                "restart_count": 0,
-                "trusted_chain_digest": (state.get("integrity_audit") or {}).get(
+                "restart_count": previous_audit.get("restart_count", 0),
+                "trusted_chain_digest": previous_audit.get(
                     "trusted_chain_digest"
                 ),
-                "trusted_episode_count": (state.get("integrity_audit") or {}).get(
+                "trusted_episode_count": previous_audit.get(
                     "trusted_episode_count"
                 ),
             },
@@ -305,9 +349,11 @@ def _reconcile_audit(
     completed_audit = {
         **updated_audit,
         "in_progress": False,
+        "prefix_validated_through": target_end,
         "trusted_chain_digest": updated_audit["chain_digest"],
         "trusted_episode_count": updated_audit["episode_count"],
     }
+    source_has_tail = chunk.observed_end > target_end
     store.compare_and_swap_state(
         enrollment,
         member.member_id,
@@ -316,9 +362,16 @@ def _reconcile_audit(
             "integrity_audit": completed_audit,
             "validated_at": _timestamp(budget.now),
             "member_generation": finished_generation,
+            "implementation_version": get_adapter(
+                enrollment.adapter
+            ).implementation_version,
             "source_standing": chunk.source_standing.value,
             "observed_end": chunk.observed_end,
-            "freshness": FreshnessStanding.CURRENT.value,
+            "freshness": (
+                FreshnessStanding.TAIL_VALIDATED.value
+                if source_has_tail
+                else FreshnessStanding.CURRENT.value
+            ),
             "error_position": None,
         },
     )
@@ -411,12 +464,17 @@ def _reconcile_member(
         if budget.exhausted:
             return
         state = _begin_build(store, enrollment, member, state, "initial")
-    elif state.get("build_generation_id") and (
-        state.get("build_canonicalization_version")
-        != enrollment.canonicalization_version
-        or state.get("build_boundary_version") != enrollment.boundary_version
-    ):
-        state = _begin_build(store, enrollment, member, state, "semantic_version")
+    elif state.get("build_generation_id"):
+        if (
+            state.get("build_canonicalization_version")
+            != enrollment.canonicalization_version
+            or state.get("build_boundary_version") != enrollment.boundary_version
+        ):
+            state = _begin_build(
+                store, enrollment, member, state, "semantic_version"
+            )
+        elif _stat(member) != state.get("build_source_snapshot"):
+            state = _begin_build(store, enrollment, member, state, "source_drift")
     elif not state.get("build_generation_id"):
         if not state.get("active_generation_id"):
             if budget.exhausted:
@@ -432,13 +490,7 @@ def _reconcile_member(
             )
         else:
             generation = _stat(member)
-            if (
-                _audit_due(enrollment, member, state, budget.now)
-                and (
-                    generation is None
-                    or generation["size"] <= state.get("complete_end", 0)
-                )
-            ):
+            if _audit_due(enrollment, member, state, budget.now):
                 _reconcile_audit(store, enrollment, member, state, budget)
                 return
             if generation is None or generation["size"] <= state.get(
@@ -454,67 +506,83 @@ def _reconcile_member(
 
     generation_id = state["staging_generation_id"]
     if state.get("build_mode") == "append" and not state.get("build_seeded"):
-        with store.write_transaction() as connection:
-            copied_count, database_elapsed_ms = store.seed_generation(
-                connection,
-                enrollment,
-                member,
-                state["active_generation_id"],
-                generation_id,
-            )
-        state = store.compare_and_swap_state(
-            enrollment,
-            member.member_id,
-            state,
-            {
-                "build_seeded": True,
-                "staging_episode_count": copied_count,
-                "database_work": {
-                    "seeded_episode_count": copied_count,
-                    "seed_elapsed_ms": database_elapsed_ms,
-                },
-            },
-        )
+        try:
+            with store.write_transaction() as connection:
+                state, _, _ = store.seed_staging_generation(
+                    connection,
+                    enrollment,
+                    member,
+                    state["active_generation_id"],
+                    generation_id,
+                    expected_state=state,
+                    state_values={"build_seeded": True},
+                )
+        except SQLiteDocumentConflict:
+            _begin_build(store, enrollment, member, state, "derived_loss")
+            return
 
     adapter = get_adapter(enrollment.adapter)
+    started = time.monotonic()
     chunk = adapter.scan_chunk(
         enrollment, member, _cursor(state.get("build_cursor")), budget.remaining
     )
+    elapsed_ms = (time.monotonic() - started) * 1000
     budget.charge(chunk.bytes_read)
-    with store.write_transaction() as connection:
-        store.write_generation(
-            connection, enrollment, member, generation_id, chunk.episodes
-        )
+    if _stat(member) != state.get("build_source_snapshot"):
+        _begin_build(store, enrollment, member, state, "source_drift")
+        return
     chain = state.get("build_chain_digest", "")
     for episode in chunk.episodes:
         chain = extend_chain(chain, episode.identity.episode_ref)
-    state = store.compare_and_swap_state(
-        enrollment,
-        member.member_id,
-        state,
-        {
+    if chunk.source_standing in {
+        SourceStanding.MISSING,
+        SourceStanding.UNAVAILABLE,
+    }:
+        building_freshness = FreshnessStanding.UNAVAILABLE.value
+    elif (
+        chunk.source_standing is not SourceStanding.AVAILABLE
+        or chunk.error_position is not None
+    ):
+        building_freshness = FreshnessStanding.UNKNOWN.value
+    elif state.get("active_generation_id") and state.get("build_mode") != "append":
+        building_freshness = FreshnessStanding.STALE.value
+    elif state.get("active_generation_id"):
+        building_freshness = (
+            FreshnessStanding.INCOMPLETE.value
+            if chunk.exhausted
+            or chunk.freshness is FreshnessStanding.INCOMPLETE
+            else FreshnessStanding.TAIL_VALIDATED.value
+        )
+    else:
+        building_freshness = FreshnessStanding.INCOMPLETE.value
+    state_values = {
             "build_cursor": _cursor_dict(chunk.next_cursor),
             "build_chain_digest": chain,
             "staging_episode_count": state.get("staging_episode_count", 0)
             + len(chunk.episodes),
-            "observed_end": chunk.observed_end,
-            "complete_end": chunk.complete_end,
+            "build_observed_end": chunk.observed_end,
+            "build_complete_end": chunk.complete_end,
+            "build_bytes_read": state.get("build_bytes_read", 0)
+            + chunk.bytes_read,
+            "build_elapsed_ms": state.get("build_elapsed_ms", 0.0) + elapsed_ms,
             "source_standing": chunk.source_standing.value,
-            "freshness": (
-                FreshnessStanding.INCOMPLETE.value
-                if chunk.exhausted
-                or chunk.freshness is FreshnessStanding.INCOMPLETE
-                else chunk.freshness.value
-            ),
+            "freshness": building_freshness,
             "error_position": chunk.error_position,
-            "member_generation": _stat(member),
-            "implementation_version": adapter.implementation_version,
             "database_work": state.get(
                 "database_work",
                 {"seeded_episode_count": 0, "seed_elapsed_ms": 0.0},
             ),
-        },
-    )
+    }
+    with store.write_transaction() as connection:
+        state, _ = store.write_staging_chunk(
+            connection,
+            enrollment,
+            member,
+            generation_id,
+            chunk.episodes,
+            expected_state=state,
+            state_values=state_values,
+        )
     complete = (
         not chunk.exhausted
         and chunk.source_standing is SourceStanding.AVAILABLE
@@ -524,13 +592,16 @@ def _reconcile_member(
     )
     if not complete:
         return
+    if _stat(member) != state.get("build_source_snapshot"):
+        _begin_build(store, enrollment, member, state, "source_drift")
+        return
     audit = {
         "offset": chunk.complete_end,
         "cursor": _cursor_dict(chunk.next_cursor),
         "chain_digest": chain,
         "episode_count": state["staging_episode_count"],
-        "bytes_read": state["complete_end"],
-        "elapsed_ms": 0.0,
+        "bytes_read": state.get("build_bytes_read", 0),
+        "elapsed_ms": state.get("build_elapsed_ms", 0.0),
         "restart_count": 0,
         "trusted_chain_digest": chain,
         "trusted_episode_count": state["staging_episode_count"],
@@ -547,6 +618,16 @@ def _reconcile_member(
         )
         if old_generation and state.get("build_mode") != "append"
         else ()
+    )
+    final_freshness = (
+        FreshnessStanding.TAIL_VALIDATED.value
+        if state.get("build_mode") == "append"
+        else FreshnessStanding.CURRENT.value
+    )
+    validated_at = (
+        state.get("validated_at")
+        if state.get("build_mode") == "append"
+        else _timestamp(budget.now)
     )
     with store.write_transaction() as connection:
         store.activate_generation(
@@ -565,10 +646,21 @@ def _reconcile_member(
                 "build_seeded": None,
                 "build_canonicalization_version": None,
                 "build_boundary_version": None,
+                "build_source_snapshot": None,
+                "build_observed_end": None,
+                "build_complete_end": None,
+                "build_bytes_read": None,
+                "build_elapsed_ms": None,
                 "tail_cursor": _cursor_dict(chunk.next_cursor),
                 "integrity_audit": audit,
-                "validated_at": _timestamp(budget.now),
-                "freshness": FreshnessStanding.CURRENT.value,
+                "validated_at": validated_at,
+                "observed_end": chunk.observed_end,
+                "complete_end": chunk.complete_end,
+                "member_generation": state["build_source_snapshot"],
+                "implementation_version": adapter.implementation_version,
+                "source_standing": chunk.source_standing.value,
+                "error_position": chunk.error_position,
+                "freshness": final_freshness,
             },
             supersession_observations=observations,
         )
@@ -606,6 +698,7 @@ def _member_standing(
             if state.get("active_generation_id")
             and state.get("source_standing")
             != SourceStanding.UNSUPPORTED_ADAPTER.value
+            and state.get("active_generation_integrity") != "invalid"
             else "rebuilding"
             if state.get("source_standing") == SourceStanding.AVAILABLE.value
             and state.get("staging_generation_id")
@@ -618,11 +711,19 @@ def _member_standing(
         ),
         "indexed_through": {
             "kind": "byte_offset",
-            "value": state.get("complete_end", 0),
+            "value": (
+                state.get("complete_end", 0)
+                if state.get("active_generation_id")
+                else state.get("build_complete_end", 0)
+            ),
         },
         "observed_source_end": {
             "kind": "byte_offset",
-            "value": state.get("observed_end", 0),
+            "value": (
+                state.get("observed_end", 0)
+                if state.get("active_generation_id")
+                else state.get("build_observed_end", 0)
+            ),
         },
         "error_position": state.get("error_position"),
         "integrity": {
@@ -709,7 +810,7 @@ def reconcile_registry(
             )
 
     corpus_reports = []
-    for corpus_id in sorted({source.corpus_id for source in sources}):
+    for corpus_id in sorted(registry.known_corpora):
         corpus_reports.append(
             {
                 "corpus_id": corpus_id,

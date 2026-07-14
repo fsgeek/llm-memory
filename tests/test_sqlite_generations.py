@@ -559,3 +559,83 @@ def test_connection_mutations_require_an_explicit_transaction(
     with sqlite_store.connect() as connection:
         with pytest.raises(RuntimeError, match="active explicit transaction"):
             mutation(sqlite_store, connection, enrollment, member, episodes)
+
+
+def test_stale_staging_owner_cannot_commit_episode_rows(
+    sqlite_store, enrollment, member, episodes
+):
+    stale = _stage_generation(
+        sqlite_store, enrollment, member, "generation-stale"
+    )
+    newer = sqlite_store.compare_and_swap_state(
+        enrollment,
+        member.member_id,
+        stale,
+        {"staging_generation_id": "generation-newer"},
+    )
+
+    with pytest.raises(SQLiteStateConflict):
+        with sqlite_store.write_transaction() as connection:
+            sqlite_store.write_staging_chunk(
+                connection,
+                enrollment,
+                member,
+                "generation-stale",
+                episodes,
+                expected_state=stale,
+                state_values={"build_cursor": {"byte_offset": 29}},
+            )
+
+    assert sqlite_store.member_state(enrollment, member.member_id) == newer
+    with sqlite_store.read_transaction() as connection:
+        assert sqlite_store.generation_count(connection, "generation-stale") == 0
+
+
+def test_stale_staging_owner_cannot_commit_seed_rows(
+    sqlite_store, enrollment, member, episodes
+):
+    active_expected = _stage_generation(
+        sqlite_store, enrollment, member, "generation-active"
+    )
+    with sqlite_store.write_transaction() as connection:
+        sqlite_store.write_generation(
+            connection, enrollment, member, "generation-active", episodes
+        )
+        sqlite_store.activate_generation(
+            connection,
+            enrollment,
+            member,
+            "generation-active",
+            expected_count=2,
+            expected_state=active_expected,
+        )
+    active = sqlite_store.member_state(enrollment, member.member_id)
+    stale = _stage_generation(
+        sqlite_store,
+        enrollment,
+        member,
+        "generation-stale",
+        expected=active,
+    )
+    newer = sqlite_store.compare_and_swap_state(
+        enrollment,
+        member.member_id,
+        stale,
+        {"staging_generation_id": "generation-newer"},
+    )
+
+    with pytest.raises(SQLiteStateConflict):
+        with sqlite_store.write_transaction() as connection:
+            sqlite_store.seed_staging_generation(
+                connection,
+                enrollment,
+                member,
+                "generation-active",
+                "generation-stale",
+                expected_state=stale,
+                state_values={"build_seeded": True},
+            )
+
+    assert sqlite_store.member_state(enrollment, member.member_id) == newer
+    with sqlite_store.read_transaction() as connection:
+        assert sqlite_store.generation_count(connection, "generation-stale") == 0
