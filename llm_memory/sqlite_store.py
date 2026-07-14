@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
-from collections.abc import Iterator, Mapping
+import time
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from llm_memory.adapters import EpisodeRecord, SourceMember
+from llm_memory.contract import reference_key
+from llm_memory.enrollment import SourceEnrollment
 from llm_memory.provider import ProviderUnavailable, ProviderUnsupported
 
 
@@ -188,6 +194,67 @@ def _is_document_conflict(exc: sqlite3.IntegrityError) -> bool:
     )
 
 
+def _canonical_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _state_key(corpus_id: str, source_id: str, member_id: str) -> str:
+    identity = f"{corpus_id}/{source_id}/{member_id}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _generation_storage_key(generation_id: str, episode_ref: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(generation_id.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(episode_ref.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _episode_document(
+    enrollment: SourceEnrollment,
+    member: SourceMember,
+    generation_id: str,
+    episode: EpisodeRecord,
+) -> dict[str, Any]:
+    episode_ref = episode.identity.episode_ref
+    return {
+        "storage_key": _generation_storage_key(generation_id, episode_ref),
+        "episode_ref": episode_ref,
+        "reference_key": reference_key(episode_ref),
+        "corpus_id": enrollment.corpus_id,
+        "source_id": enrollment.source_id,
+        "member_id": member.member_id,
+        "generation_id": generation_id,
+        "canonicalization_version": enrollment.canonicalization_version,
+        "boundary_version": enrollment.boundary_version,
+        "body_digest": episode.identity.body_digest,
+        "native_event_id": episode.native_event_id,
+        "source_position": episode.source_position,
+        **episode.body.as_dict(),
+        "state_text": episode.state_text,
+    }
+
+
+def _require_transaction(connection: sqlite3.Connection) -> None:
+    if not connection.in_transaction:
+        raise RuntimeError("mutation requires an active explicit transaction")
+
+
+def _same_episode_row(
+    existing: sqlite3.Row | None,
+    document: Mapping[str, Any],
+    serialized: str,
+) -> bool:
+    if existing is None:
+        return False
+    return all(
+        existing[column]
+        == (serialized if column == "document_json" else document[column])
+        for column in _EPISODE_COLUMNS
+    )
+
+
 class SQLiteStore:
     def __init__(self, path: Path, *, busy_timeout_ms: int = 250):
         self.path = Path(path)
@@ -349,9 +416,304 @@ class SQLiteStore:
         finally:
             connection.close()
 
+    def source_states(self, enrollment: SourceEnrollment) -> tuple[dict[str, Any], ...]:
+        with self.read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT revision, state_json FROM source_states "
+                "WHERE corpus_id = ? AND source_id = ? ORDER BY member_id",
+                (enrollment.corpus_id, enrollment.source_id),
+            ).fetchall()
+        return tuple(self._deserialize_state(row) for row in rows)
+
+    def member_state(
+        self, enrollment: SourceEnrollment, member_id: str
+    ) -> dict[str, Any] | None:
+        state_key = _state_key(enrollment.corpus_id, enrollment.source_id, member_id)
+        with self.read_transaction() as connection:
+            row = self._state_row(connection, state_key)
+        return None if row is None else self._deserialize_state(row)
+
+    def compare_and_swap_state(
+        self,
+        enrollment: SourceEnrollment,
+        member_id: str,
+        expected: Mapping[str, Any] | None,
+        values: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        with self.write_transaction() as connection:
+            return self._cas_state_in_transaction(
+                connection, enrollment, member_id, expected, values
+            )
+
+    def _state_row(
+        self, connection: sqlite3.Connection, state_key: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT revision, state_json FROM source_states WHERE state_key = ?",
+            (state_key,),
+        ).fetchone()
+
+    @staticmethod
+    def _deserialize_state(row: sqlite3.Row) -> dict[str, Any]:
+        state = json.loads(row["state_json"])
+        state["revision"] = row["revision"]
+        return state
+
+    def _cas_state_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member_id: str,
+        expected: Mapping[str, Any] | None,
+        values: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        _require_transaction(connection)
+        state_key = _state_key(enrollment.corpus_id, enrollment.source_id, member_id)
+        row = self._state_row(connection, state_key)
+        current = None if row is None else self._deserialize_state(row)
+        expected_revision = None if expected is None else expected["revision"]
+        current_revision = None if current is None else current["revision"]
+        if current_revision != expected_revision:
+            raise SQLiteStateConflict(f"source state changed for {state_key}")
+
+        state = {} if current is None else dict(current)
+        state.pop("revision", None)
+        state.update(values)
+        state.pop("revision", None)
+        state.update(
+            {
+                "corpus_id": enrollment.corpus_id,
+                "source_id": enrollment.source_id,
+                "member_id": member_id,
+            }
+        )
+        revision = 1 if current_revision is None else current_revision + 1
+        serialized = _canonical_json(state)
+        if current_revision is None:
+            connection.execute(
+                "INSERT INTO source_states("
+                "state_key, corpus_id, source_id, member_id, revision, state_json"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    state_key,
+                    enrollment.corpus_id,
+                    enrollment.source_id,
+                    member_id,
+                    revision,
+                    serialized,
+                ),
+            )
+        else:
+            cursor = connection.execute(
+                "UPDATE source_states SET revision = ?, state_json = ? "
+                "WHERE state_key = ? AND revision = ?",
+                (revision, serialized, state_key, current_revision),
+            )
+            if cursor.rowcount != 1:
+                raise SQLiteStateConflict(f"source state changed for {state_key}")
+        return state | {"revision": revision}
+
+    def write_generation(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        generation_id: str,
+        episodes: Iterable[EpisodeRecord],
+    ) -> int:
+        _require_transaction(connection)
+        documents = [
+            _episode_document(enrollment, member, generation_id, episode)
+            for episode in episodes
+        ]
+        for document in documents:
+            self._insert_immutable_document(connection, document)
+        return len(documents)
+
+    def _insert_immutable_document(
+        self, connection: sqlite3.Connection, document: Mapping[str, Any]
+    ) -> None:
+        serialized = _canonical_json(document)
+        existing = connection.execute(
+            f"SELECT {', '.join(_EPISODE_COLUMNS)} FROM episode_documents "
+            "WHERE (generation_id = ? AND episode_ref = ?) OR storage_key = ?",
+            (
+                document["generation_id"],
+                document["episode_ref"],
+                document["storage_key"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            if _same_episode_row(existing, document, serialized):
+                return
+            raise SQLiteDocumentConflict(
+                f"conflicting episode document {document['storage_key']!r}"
+            )
+
+        row = dict(document)
+        row["document_json"] = serialized
+        try:
+            self.insert_episode(connection, row)
+        except SQLiteDocumentConflict:
+            existing = connection.execute(
+                f"SELECT {', '.join(_EPISODE_COLUMNS)} FROM episode_documents "
+                "WHERE (generation_id = ? AND episode_ref = ?) OR storage_key = ?",
+                (
+                    document["generation_id"],
+                    document["episode_ref"],
+                    document["storage_key"],
+                ),
+            ).fetchone()
+            if _same_episode_row(existing, document, serialized):
+                return
+            raise
+
+    def seed_generation(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        source_generation_id: str,
+        target_generation_id: str,
+    ) -> tuple[int, float]:
+        _require_transaction(connection)
+        state_key = _state_key(
+            enrollment.corpus_id, enrollment.source_id, member.member_id
+        )
+        state_row = self._state_row(connection, state_key)
+        state = None if state_row is None else self._deserialize_state(state_row)
+        if state is None or state.get("active_generation_id") != source_generation_id:
+            raise SQLiteStateConflict(
+                f"generation {source_generation_id!r} is not active for {state_key}"
+            )
+        started = time.perf_counter()
+        rows = connection.execute(
+            "SELECT document_json FROM episode_documents "
+            "WHERE corpus_id = ? AND source_id = ? AND member_id = ? "
+            "AND generation_id = ? ORDER BY episode_ref",
+            (
+                enrollment.corpus_id,
+                enrollment.source_id,
+                member.member_id,
+                source_generation_id,
+            ),
+        ).fetchall()
+        for row in rows:
+            clone = json.loads(row["document_json"])
+            clone["generation_id"] = target_generation_id
+            clone["storage_key"] = _generation_storage_key(
+                target_generation_id, clone["episode_ref"]
+            )
+            self._insert_immutable_document(connection, clone)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        return len(rows), elapsed_ms
+
+    def generation_count(
+        self, connection: sqlite3.Connection, generation_id: str
+    ) -> int:
+        return connection.execute(
+            "SELECT count(*) FROM episode_documents WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()[0]
+
+    def verify_generation(
+        self,
+        connection: sqlite3.Connection,
+        generation_id: str,
+        *,
+        expected_count: int,
+    ) -> bool:
+        actual_count = self.generation_count(connection, generation_id)
+        indexed_count = connection.execute(
+            "SELECT count(*) FROM episode_fts WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()[0]
+        return (actual_count, indexed_count) == (expected_count, expected_count)
+
+    def activate_generation(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        generation_id: str,
+        *,
+        expected_count: int,
+    ) -> None:
+        _require_transaction(connection)
+        owned_count = connection.execute(
+            "SELECT count(*) FROM episode_documents "
+            "WHERE corpus_id = ? AND source_id = ? AND member_id = ? "
+            "AND generation_id = ?",
+            (
+                enrollment.corpus_id,
+                enrollment.source_id,
+                member.member_id,
+                generation_id,
+            ),
+        ).fetchone()[0]
+        if owned_count != expected_count or not self.verify_generation(
+            connection, generation_id, expected_count=expected_count
+        ):
+            raise SQLiteDocumentConflict(
+                f"generation {generation_id!r} is incomplete or unindexed"
+            )
+        state_key = _state_key(
+            enrollment.corpus_id, enrollment.source_id, member.member_id
+        )
+        row = self._state_row(connection, state_key)
+        expected = None if row is None else self._deserialize_state(row)
+        self._cas_state_in_transaction(
+            connection,
+            enrollment,
+            member.member_id,
+            expected,
+            {
+                "active_generation_id": generation_id,
+                "staging_generation_id": None,
+                "staging_episode_count": None,
+                "staging_canonicalization_version": None,
+                "staging_boundary_version": None,
+                "episode_count": expected_count,
+                "active_generation_integrity": "valid",
+                "freshness": "current",
+                "canonicalization_version": enrollment.canonicalization_version,
+                "boundary_version": enrollment.boundary_version,
+            },
+        )
+
+    def delete_generation(
+        self,
+        connection: sqlite3.Connection,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        generation_id: str,
+    ) -> int:
+        _require_transaction(connection)
+        state_key = _state_key(
+            enrollment.corpus_id, enrollment.source_id, member.member_id
+        )
+        state_row = self._state_row(connection, state_key)
+        if state_row is not None:
+            state = self._deserialize_state(state_row)
+            if state.get("active_generation_id") == generation_id:
+                return 0
+        cursor = connection.execute(
+            "DELETE FROM episode_documents "
+            "WHERE corpus_id = ? AND source_id = ? AND member_id = ? "
+            "AND generation_id = ?",
+            (
+                enrollment.corpus_id,
+                enrollment.source_id,
+                member.member_id,
+                generation_id,
+            ),
+        )
+        return cursor.rowcount
+
     def insert_episode(
         self, connection: sqlite3.Connection, document: Mapping[str, Any]
     ) -> int:
+        _require_transaction(connection)
         values = tuple(document[column] for column in _EPISODE_COLUMNS)
         placeholders = ", ".join("?" for _ in _EPISODE_COLUMNS)
         columns = ", ".join(_EPISODE_COLUMNS)
@@ -369,6 +731,7 @@ class SQLiteStore:
         return cursor.lastrowid
 
     def delete_episode(self, connection: sqlite3.Connection, rowid: int) -> None:
+        _require_transaction(connection)
         connection.execute("DELETE FROM episode_documents WHERE rowid = ?", (rowid,))
 
     def fts_row(self, rowid: int) -> sqlite3.Row | None:
