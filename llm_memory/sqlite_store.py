@@ -112,6 +112,16 @@ _SCHEMA_STATEMENTS = (
     END
     """,
 )
+_SCHEMA_OBJECTS = (
+    ("table", "provider_meta", _SCHEMA_STATEMENTS[0]),
+    ("table", "source_states", _SCHEMA_STATEMENTS[1]),
+    ("table", "episode_documents", _SCHEMA_STATEMENTS[2]),
+    ("table", "episode_fts", _SCHEMA_STATEMENTS[3]),
+    ("table", "supersessions", _SCHEMA_STATEMENTS[4]),
+    ("trigger", "episode_ai", _SCHEMA_STATEMENTS[5]),
+    ("trigger", "episode_ad", _SCHEMA_STATEMENTS[6]),
+    ("trigger", "episode_au", _SCHEMA_STATEMENTS[7]),
+)
 
 
 @dataclass(frozen=True)
@@ -137,8 +147,34 @@ def _is_busy(exc: sqlite3.OperationalError) -> bool:
     return "locked" in message or "busy" in message
 
 
+def _is_missing_fts(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return any(
+        evidence in message
+        for evidence in (
+            "no such module: fts5",
+            "no such tokenizer",
+            "unknown tokenizer",
+            "error in tokenizer constructor",
+            "parse error in tokenize directive",
+        )
+    )
+
+
 def _unavailable(exc: sqlite3.OperationalError) -> ProviderUnavailable:
     return ProviderUnavailable(f"SQLite operation unavailable: {exc}")
+
+
+def _normalized_sql(sql: str) -> str:
+    return "".join(sql.lower().split()).replace("ifnotexists", "")
+
+
+def _is_document_conflict(exc: sqlite3.IntegrityError) -> bool:
+    return str(exc) in {
+        "UNIQUE constraint failed: episode_documents.storage_key",
+        "UNIQUE constraint failed: episode_documents.generation_id, "
+        "episode_documents.episode_ref",
+    }
 
 
 class SQLiteStore:
@@ -150,9 +186,14 @@ class SQLiteStore:
         try:
             connection = sqlite3.connect(self.path, timeout=0, isolation_level=None)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            connection.execute("PRAGMA foreign_keys = ON")
+            journal_mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if journal_mode.lower() != "wal":
+                connection.close()
+                raise ProviderUnsupported(
+                    f"SQLite WAL journal mode is unavailable: {journal_mode}"
+                )
             return connection
         except sqlite3.OperationalError as exc:
             if "connection" in locals():
@@ -171,9 +212,11 @@ class SQLiteStore:
         except sqlite3.OperationalError as exc:
             if _is_busy(exc):
                 raise _unavailable(exc) from exc
-            raise ProviderUnsupported(
-                "SQLite FTS5 porter/unicode61 is unavailable"
-            ) from exc
+            if _is_missing_fts(exc):
+                raise ProviderUnsupported(
+                    "SQLite FTS5 porter/unicode61 is unavailable"
+                ) from exc
+            raise
 
     def ensure(self) -> SQLiteSchemaStanding:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +229,9 @@ class SQLiteStore:
                 "WHERE type = 'table' AND name = 'provider_meta'"
             ).fetchone()
             if has_meta:
+                self._validate_schema_object(
+                    connection, "table", "provider_meta", _SCHEMA_STATEMENTS[0]
+                )
                 version = connection.execute(
                     "SELECT value FROM provider_meta WHERE key = 'schema_version'"
                 ).fetchone()
@@ -195,13 +241,23 @@ class SQLiteStore:
                     raise ProviderUnsupported(
                         f"unsupported SQLite schema version {version[0]}"
                     )
-
-            for statement in _SCHEMA_STATEMENTS:
-                connection.execute(statement)
-            connection.execute(
-                "INSERT OR IGNORE INTO provider_meta(key, value) VALUES (?, ?)",
-                ("schema_version", str(SCHEMA_VERSION)),
-            )
+                self._validate_schema(connection)
+            else:
+                existing = connection.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+                ).fetchone()
+                if existing is not None:
+                    raise ProviderUnsupported(
+                        f"cannot adopt preexisting schema object {existing[0]!r}"
+                    )
+                for statement in _SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO provider_meta(key, value) VALUES (?, ?)",
+                    ("schema_version", str(SCHEMA_VERSION)),
+                )
+                self._validate_schema(connection)
             connection.commit()
             return SQLiteSchemaStanding()
         except sqlite3.OperationalError as exc:
@@ -214,6 +270,27 @@ class SQLiteStore:
             raise
         finally:
             connection.close()
+
+    def _validate_schema(self, connection: sqlite3.Connection) -> None:
+        for object_type, name, sql in _SCHEMA_OBJECTS:
+            self._validate_schema_object(connection, object_type, name, sql)
+
+    def _validate_schema_object(
+        self,
+        connection: sqlite3.Connection,
+        object_type: str,
+        name: str,
+        expected_sql: str,
+    ) -> None:
+        actual = connection.execute(
+            "SELECT type, sql FROM sqlite_schema WHERE name = ?", (name,)
+        ).fetchone()
+        if (
+            actual is None
+            or actual[0] != object_type
+            or _normalized_sql(actual[1]) != _normalized_sql(expected_sql)
+        ):
+            raise ProviderUnsupported(f"incompatible SQLite schema object {name!r}")
 
     @contextmanager
     def read_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -255,9 +332,11 @@ class SQLiteStore:
                 values,
             )
         except sqlite3.IntegrityError as exc:
-            raise SQLiteDocumentConflict(
-                f"conflicting episode document {document['storage_key']!r}"
-            ) from exc
+            if _is_document_conflict(exc):
+                raise SQLiteDocumentConflict(
+                    f"conflicting episode document {document['storage_key']!r}"
+                ) from exc
+            raise
         return cursor.lastrowid
 
     def delete_episode(self, connection: sqlite3.Connection, rowid: int) -> None:
