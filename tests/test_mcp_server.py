@@ -254,6 +254,54 @@ def test_contract_search_uses_lifespan_provider_registry_and_declared_strategy(
     assert search_call[3].max_bytes == 1_000_000
 
 
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        {},
+        {"strategies": "provider-strategy"},
+        {"strategies": []},
+        {"strategies": ["first", "second"]},
+        {"strategies": [" "]},
+        {"strategies": [1]},
+    ],
+    ids=(
+        "capabilities-wrong-type",
+        "strategies-missing",
+        "strategies-wrong-type",
+        "strategies-empty",
+        "strategies-multiple",
+        "strategy-blank",
+        "strategy-wrong-type",
+    ),
+)
+def test_contract_search_rejects_invalid_sole_strategy_before_request_or_search(
+    capabilities, monkeypatch
+):
+    registry = object()
+    provider = RecordingProvider()
+    provider.capabilities = lambda: capabilities
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+    monkeypatch.setattr(
+        mcp_server.SearchRequest,
+        "create",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid capabilities reached SearchRequest.create")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="exactly one nonempty string strategy",
+    ):
+        _run_in_lifespan(
+            lambda: mcp_server.search_history("query", ["configured-corpus"])
+        )
+
+    assert all(call[0] != "search" for call in provider.calls)
+
+
 def test_open_episode_uses_only_lifespan_provider_supersession_resolver(monkeypatch):
     registry = object()
     provider = RecordingProvider()
@@ -294,6 +342,105 @@ def test_contract_runtime_is_cleared_after_lifespan_exit(monkeypatch):
         mcp_server._contract_runtime()
     with pytest.raises(RuntimeError, match="lifespan is not active"):
         mcp_server.open_episode("episode://corpus/session/episode", ["corpus"])
+
+
+def test_nested_lifespan_cannot_overwrite_active_runtime(monkeypatch):
+    outer_provider = RecordingProvider("outer-strategy")
+    inner_provider = RecordingProvider("inner-strategy")
+    providers = iter((outer_provider, inner_provider))
+    outer_registry = object()
+    load_calls = []
+    monkeypatch.setattr(
+        mcp_server,
+        "load_provider",
+        lambda: load_calls.append("provider") or next(providers),
+    )
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: outer_registry)
+
+    async def run():
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ):
+            outer_runtime = mcp_server._contract_runtime()
+            with pytest.raises(RuntimeError, match="lifespan is already active"):
+                async with mcp_server.mcp._mcp_server.lifespan(
+                    mcp_server.mcp._mcp_server
+                ):
+                    pass
+            assert mcp_server._contract_runtime() == outer_runtime
+
+    asyncio.run(run())
+
+    assert load_calls == ["provider"]
+    assert inner_provider.calls == []
+
+
+def test_missing_config_inner_lifespan_cannot_observe_outer_runtime(monkeypatch):
+    provider = RecordingProvider()
+    registry = object()
+    registry_loads = []
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+
+    def load_registry_once():
+        registry_loads.append("registry")
+        if len(registry_loads) == 1:
+            return registry
+        raise FileNotFoundError("inner enrollment missing")
+
+    monkeypatch.setattr(mcp_server, "load_registry", load_registry_once)
+
+    async def run():
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ):
+            with pytest.raises(RuntimeError, match="lifespan is already active"):
+                async with mcp_server.mcp._mcp_server.lifespan(
+                    mcp_server.mcp._mcp_server
+                ):
+                    mcp_server._contract_runtime()
+
+    asyncio.run(run())
+
+    assert registry_loads == ["registry"]
+
+
+def test_failed_lifespan_setup_permits_later_clean_lifespan(monkeypatch):
+    failed_provider = RecordingProvider("failed-strategy")
+    clean_provider = RecordingProvider("clean-strategy")
+    providers = iter((failed_provider, clean_provider))
+    clean_registry = object()
+    registry_loads = []
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: next(providers))
+
+    def load_registry_after_failure():
+        registry_loads.append("registry")
+        if len(registry_loads) == 1:
+            raise ValueError("malformed enrollment config")
+        return clean_registry
+
+    monkeypatch.setattr(mcp_server, "load_registry", load_registry_after_failure)
+
+    async def run():
+        with pytest.raises(ValueError, match="malformed enrollment config"):
+            async with mcp_server.mcp._mcp_server.lifespan(
+                mcp_server.mcp._mcp_server
+            ):
+                pass
+
+        with pytest.raises(RuntimeError, match="lifespan is not active"):
+            mcp_server._contract_runtime()
+
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ):
+            assert mcp_server._contract_runtime() == (
+                clean_provider,
+                clean_registry,
+            )
+
+    asyncio.run(run())
+
+    assert registry_loads == ["registry", "registry"]
 
 
 def test_explicit_sqlite_lifespan_never_connects_to_arango(tmp_path, monkeypatch):

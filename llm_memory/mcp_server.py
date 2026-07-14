@@ -27,6 +27,7 @@ from llm_memory.search import search as _search
 
 # A contract search may reconcile at most one megabyte of source data per call.
 _DEFAULT_RECONCILIATION_MAX_BYTES = 1_000_000
+_lifespan_active = False
 _selected_provider: EpisodicProvider | None = None
 _selected_registry: EnrollmentRegistry | None = None
 
@@ -44,22 +45,44 @@ def _contract_runtime() -> tuple[EpisodicProvider, EnrollmentRegistry]:
     return _selected_provider, _selected_registry
 
 
+def _sole_strategy(capabilities: object) -> str:
+    if not isinstance(capabilities, dict):
+        raise RuntimeError(
+            "selected provider must declare exactly one nonempty string strategy"
+        )
+    strategies = capabilities.get("strategies")
+    if (
+        not isinstance(strategies, list)
+        or len(strategies) != 1
+        or not isinstance(strategies[0], str)
+        or not strategies[0].strip()
+    ):
+        raise RuntimeError(
+            "selected provider must declare exactly one nonempty string strategy"
+        )
+    return strategies[0]
+
+
 @asynccontextmanager
 async def _lifespan(_server) -> AsyncIterator[dict]:
-    global _selected_provider, _selected_registry
+    global _lifespan_active, _selected_provider, _selected_registry
 
-    provider = load_provider()
-    provider.ensure()
+    if _lifespan_active:
+        raise RuntimeError("episodic provider lifespan is already active")
+    _lifespan_active = True
     try:
-        registry = load_registry()
-    except FileNotFoundError:
-        yield {}
-        return
-    report = provider.reconcile(registry, _budget())
-    _selected_provider, _selected_registry = provider, registry
-    try:
+        provider = load_provider()
+        provider.ensure()
+        try:
+            registry = load_registry()
+        except FileNotFoundError:
+            yield {}
+            return
+        report = provider.reconcile(registry, _budget())
+        _selected_provider, _selected_registry = provider, registry
         yield {"startup_reconciliation": report}
     finally:
+        _lifespan_active = False
         _selected_provider = _selected_registry = None
 
 
@@ -91,7 +114,7 @@ def search_history(query: str, corpus_ids: list[str], limit: int = 10) -> dict:
     Reconciliation reads at most 1,000,000 source bytes per invocation.
     """
     provider, registry = _contract_runtime()
-    strategy = provider.capabilities()["strategies"][0]
+    strategy = _sole_strategy(provider.capabilities())
     request = SearchRequest.create(
         query,
         corpus_ids,
