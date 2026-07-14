@@ -289,14 +289,10 @@ class SQLiteStore:
         expected.update(_FTS_SHADOW_OBJECTS)
         observed: dict[str, str] = {}
         for row in connection.execute(
-            "SELECT type, name, sql FROM sqlite_schema ORDER BY name"
+            "SELECT type, name FROM sqlite_schema ORDER BY name"
         ):
-            object_type, name, sql = row
-            if (
-                object_type == "index"
-                and name.startswith("sqlite_autoindex_")
-                and sql is None
-            ):
+            object_type, name = row
+            if name.startswith("sqlite_"):
                 continue
             observed[name] = object_type
             if expected.get(name) != object_type:

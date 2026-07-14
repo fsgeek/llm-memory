@@ -159,6 +159,18 @@ def test_ensure_rejects_extra_user_defined_trigger(tmp_path):
         store.ensure()
 
 
+def test_ensure_accepts_sqlite_statistics_after_analyze(tmp_path):
+    store = SQLiteStore(tmp_path / "episodes.sqlite3")
+    store.ensure()
+    with store.connect() as connection:
+        connection.execute("ANALYZE")
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_stat1'"
+        ).fetchone() is not None
+
+    assert store.ensure().index_standing == "available"
+
+
 def test_ensure_reports_unsupported_exact_fts_configuration(tmp_path, monkeypatch):
     store = SQLiteStore(tmp_path / "episodes.sqlite3")
     real_connect = sqlite3.connect
