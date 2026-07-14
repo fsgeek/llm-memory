@@ -5,3 +5,4 @@ config/sources.yaml
 __pycache__/
 *.pyc
 proto/*.duckdb
+.worktrees/
