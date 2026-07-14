@@ -74,6 +74,15 @@ def episodes(enrollment):
     return (_episode(enrollment, "event-a"), _episode(enrollment, "event-b"))
 
 
+def _stage_generation(sqlite_store, enrollment, member, generation_id, expected=None):
+    return sqlite_store.compare_and_swap_state(
+        enrollment,
+        member.member_id,
+        expected,
+        {"staging_generation_id": generation_id, "freshness": "incomplete"},
+    )
+
+
 def test_state_compare_and_swap_rejects_stale_revision(
     sqlite_store, enrollment, member
 ):
@@ -212,6 +221,9 @@ def test_generation_document_preserves_identity_evidence_and_search_text(
 def test_seed_generation_clones_active_rows_and_reports_database_work(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(
+        sqlite_store, enrollment, member, "generation-active"
+    )
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-active", episodes
@@ -222,6 +234,7 @@ def test_seed_generation_clones_active_rows_and_reports_database_work(
             member,
             "generation-active",
             expected_count=2,
+            expected_state=expected,
         )
 
     with sqlite_store.write_transaction() as connection:
@@ -253,6 +266,9 @@ def test_seed_generation_clones_active_rows_and_reports_database_work(
 def test_seed_generation_rejects_a_non_active_source_generation(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(
+        sqlite_store, enrollment, member, "generation-active"
+    )
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-active", episodes
@@ -263,6 +279,7 @@ def test_seed_generation_rejects_a_non_active_source_generation(
             member,
             "generation-active",
             expected_count=2,
+            expected_state=expected,
         )
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-inactive", episodes
@@ -282,6 +299,7 @@ def test_seed_generation_rejects_a_non_active_source_generation(
 def test_activation_verifies_documents_and_fts_before_publishing_state(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(sqlite_store, enrollment, member, "generation-a")
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-a", episodes
@@ -290,7 +308,12 @@ def test_activation_verifies_documents_and_fts_before_publishing_state(
             connection, "generation-a", expected_count=2
         )
         sqlite_store.activate_generation(
-            connection, enrollment, member, "generation-a", expected_count=2
+            connection,
+            enrollment,
+            member,
+            "generation-a",
+            expected_count=2,
+            expected_state=expected,
         )
 
     state = sqlite_store.member_state(enrollment, member.member_id)
@@ -302,13 +325,14 @@ def test_activation_verifies_documents_and_fts_before_publishing_state(
         "freshness": "current",
         "canonicalization_version": 4,
         "boundary_version": 3,
-        "revision": 1,
+        "revision": 2,
     }
 
 
 def test_activation_rejects_wrong_document_or_fts_count_without_state(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(sqlite_store, enrollment, member, "generation-a")
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-a", episodes
@@ -322,16 +346,24 @@ def test_activation_rejects_wrong_document_or_fts_count_without_state(
         )
         with pytest.raises(SQLiteDocumentConflict):
             sqlite_store.activate_generation(
-                connection, enrollment, member, "generation-a", expected_count=2
+                connection,
+                enrollment,
+                member,
+                "generation-a",
+                expected_count=2,
+                expected_state=expected,
             )
 
-    assert sqlite_store.member_state(enrollment, member.member_id) is None
+    assert sqlite_store.member_state(enrollment, member.member_id) == expected
 
 
 def test_activation_rejects_a_generation_owned_by_another_member(
     sqlite_store, enrollment, member, episodes
 ):
     other_member = SourceMember("member-b", Path("/unused"))
+    expected = _stage_generation(
+        sqlite_store, enrollment, member, "generation-foreign"
+    )
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection,
@@ -347,14 +379,70 @@ def test_activation_rejects_a_generation_owned_by_another_member(
                 member,
                 "generation-foreign",
                 expected_count=1,
+                expected_state=expected,
             )
 
-    assert sqlite_store.member_state(enrollment, member.member_id) is None
+    assert sqlite_store.member_state(enrollment, member.member_id) == expected
+
+
+def test_stale_publisher_cannot_replace_a_newer_active_generation(
+    sqlite_store, enrollment, member, episodes
+):
+    with sqlite_store.write_transaction() as connection:
+        sqlite_store.write_generation(
+            connection, enrollment, member, "generation-old", episodes
+        )
+        sqlite_store.write_generation(
+            connection, enrollment, member, "generation-new", episodes
+        )
+
+    stale_expected = sqlite_store.compare_and_swap_state(
+        enrollment,
+        member.member_id,
+        None,
+        {"staging_generation_id": "generation-old", "freshness": "incomplete"},
+    )
+    newer_expected = sqlite_store.compare_and_swap_state(
+        enrollment,
+        member.member_id,
+        stale_expected,
+        {"staging_generation_id": "generation-new", "freshness": "incomplete"},
+    )
+    with sqlite_store.write_transaction() as connection:
+        sqlite_store.activate_generation(
+            connection,
+            enrollment,
+            member,
+            "generation-new",
+            expected_count=2,
+            expected_state=newer_expected,
+        )
+
+    newer_active = sqlite_store.member_state(enrollment, member.member_id)
+    with pytest.raises(SQLiteStateConflict):
+        with sqlite_store.write_transaction() as connection:
+            sqlite_store.activate_generation(
+                connection,
+                enrollment,
+                member,
+                "generation-old",
+                expected_count=2,
+                expected_state=stale_expected,
+            )
+
+    assert sqlite_store.member_state(enrollment, member.member_id) == newer_active
+    assert newer_active == newer_active | {
+        "active_generation_id": "generation-new",
+        "staging_generation_id": None,
+        "freshness": "current",
+        "revision": 3,
+    }
 
 
 def test_incomplete_generation_is_not_active_after_rollback(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(sqlite_store, enrollment, member, "generation-a")
     with pytest.raises(RuntimeError, match="crash before commit"):
         with sqlite_store.write_transaction() as connection:
             sqlite_store.write_generation(
@@ -366,10 +454,11 @@ def test_incomplete_generation_is_not_active_after_rollback(
                 member,
                 "generation-a",
                 expected_count=len(episodes),
+                expected_state=expected,
             )
             raise RuntimeError("crash before commit")
 
-    assert sqlite_store.member_state(enrollment, member.member_id) is None
+    assert sqlite_store.member_state(enrollment, member.member_id) == expected
     with sqlite_store.read_transaction() as connection:
         assert sqlite_store.generation_count(connection, "generation-a") == 0
 
@@ -377,6 +466,9 @@ def test_incomplete_generation_is_not_active_after_rollback(
 def test_delete_generation_preserves_active_and_removes_inactive_fts_rows(
     sqlite_store, enrollment, member, episodes
 ):
+    expected = _stage_generation(
+        sqlite_store, enrollment, member, "generation-active"
+    )
     with sqlite_store.write_transaction() as connection:
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-active", episodes
@@ -387,6 +479,7 @@ def test_delete_generation_preserves_active_and_removes_inactive_fts_rows(
             member,
             "generation-active",
             expected_count=2,
+            expected_state=expected,
         )
         sqlite_store.write_generation(
             connection, enrollment, member, "generation-old", episodes
@@ -448,7 +541,15 @@ def test_delete_generation_preserves_active_and_removes_inactive_fts_rows(
             connection, enrollment, member, "generation-a"
         ),
         lambda store, connection, enrollment, member, episodes: store.activate_generation(
-            connection, enrollment, member, "generation-a", expected_count=2
+            connection,
+            enrollment,
+            member,
+            "generation-a",
+            expected_count=2,
+            expected_state={
+                "revision": 1,
+                "staging_generation_id": "generation-a",
+            },
         ),
     ),
 )

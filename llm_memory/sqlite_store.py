@@ -638,8 +638,24 @@ class SQLiteStore:
         generation_id: str,
         *,
         expected_count: int,
+        expected_state: Mapping[str, Any],
     ) -> None:
         _require_transaction(connection)
+        state_key = _state_key(
+            enrollment.corpus_id, enrollment.source_id, member.member_id
+        )
+        row = self._state_row(connection, state_key)
+        current = None if row is None else self._deserialize_state(row)
+        if (
+            expected_state.get("revision") is None
+            or expected_state.get("staging_generation_id") != generation_id
+            or current is None
+            or current["revision"] != expected_state["revision"]
+            or current.get("staging_generation_id") != generation_id
+        ):
+            raise SQLiteStateConflict(
+                f"generation {generation_id!r} lost staging ownership"
+            )
         owned_count = connection.execute(
             "SELECT count(*) FROM episode_documents "
             "WHERE corpus_id = ? AND source_id = ? AND member_id = ? "
@@ -657,16 +673,11 @@ class SQLiteStore:
             raise SQLiteDocumentConflict(
                 f"generation {generation_id!r} is incomplete or unindexed"
             )
-        state_key = _state_key(
-            enrollment.corpus_id, enrollment.source_id, member.member_id
-        )
-        row = self._state_row(connection, state_key)
-        expected = None if row is None else self._deserialize_state(row)
         self._cas_state_in_transaction(
             connection,
             enrollment,
             member.member_id,
-            expected,
+            expected_state,
             {
                 "active_generation_id": generation_id,
                 "staging_generation_id": None,
