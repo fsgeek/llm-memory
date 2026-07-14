@@ -123,6 +123,42 @@ def test_ensure_rejects_version_one_with_incompatible_fts_schema(tmp_path):
         store.ensure()
 
 
+def test_ensure_rejects_extra_user_defined_index(tmp_path):
+    store = SQLiteStore(tmp_path / "episodes.sqlite3")
+    store.ensure()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE UNIQUE INDEX unexpected_response_unique "
+            "ON episode_documents(response)"
+        )
+
+    with pytest.raises(ProviderUnsupported, match="unexpected_response_unique"):
+        store.ensure()
+
+
+def test_ensure_rejects_extra_user_defined_table(tmp_path):
+    store = SQLiteStore(tmp_path / "episodes.sqlite3")
+    store.ensure()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("CREATE TABLE unexpected_table (value TEXT)")
+
+    with pytest.raises(ProviderUnsupported, match="unexpected_table"):
+        store.ensure()
+
+
+def test_ensure_rejects_extra_user_defined_trigger(tmp_path):
+    store = SQLiteStore(tmp_path / "episodes.sqlite3")
+    store.ensure()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "CREATE TRIGGER unexpected_trigger BEFORE INSERT ON episode_documents "
+            "BEGIN SELECT 1; END"
+        )
+
+    with pytest.raises(ProviderUnsupported, match="unexpected_trigger"):
+        store.ensure()
+
+
 def test_ensure_reports_unsupported_exact_fts_configuration(tmp_path, monkeypatch):
     store = SQLiteStore(tmp_path / "episodes.sqlite3")
     real_connect = sqlite3.connect
@@ -306,6 +342,27 @@ def test_trigger_integrity_failure_is_not_document_conflict(sqlite_store, episod
     with pytest.raises(sqlite3.IntegrityError, match="episode rejected"):
         with sqlite_store.write_transaction() as connection:
             sqlite_store.insert_episode(connection, episode_row)
+
+
+def test_spoofed_unique_message_from_trigger_is_not_document_conflict(
+    sqlite_store, episode_row
+):
+    with sqlite_store.write_transaction() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER spoof_unique BEFORE INSERT ON episode_documents BEGIN
+              SELECT RAISE(
+                ABORT,
+                'UNIQUE constraint failed: episode_documents.storage_key'
+              );
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError) as caught:
+        with sqlite_store.write_transaction() as connection:
+            sqlite_store.insert_episode(connection, episode_row)
+    assert caught.value.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_TRIGGER
 
 
 def test_unrelated_schema_uniqueness_is_not_document_conflict(

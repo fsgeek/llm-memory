@@ -122,6 +122,13 @@ _SCHEMA_OBJECTS = (
     ("trigger", "episode_ad", _SCHEMA_STATEMENTS[6]),
     ("trigger", "episode_au", _SCHEMA_STATEMENTS[7]),
 )
+_FTS_SHADOW_OBJECTS = {
+    "episode_fts_config": "table",
+    "episode_fts_content": "table",
+    "episode_fts_data": "table",
+    "episode_fts_docsize": "table",
+    "episode_fts_idx": "table",
+}
 
 
 @dataclass(frozen=True)
@@ -170,11 +177,15 @@ def _normalized_sql(sql: str) -> str:
 
 
 def _is_document_conflict(exc: sqlite3.IntegrityError) -> bool:
-    return str(exc) in {
-        "UNIQUE constraint failed: episode_documents.storage_key",
-        "UNIQUE constraint failed: episode_documents.generation_id, "
-        "episode_documents.episode_ref",
-    }
+    return (
+        exc.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+        and str(exc)
+        in {
+            "UNIQUE constraint failed: episode_documents.storage_key",
+            "UNIQUE constraint failed: episode_documents.generation_id, "
+            "episode_documents.episode_ref",
+        }
+    )
 
 
 class SQLiteStore:
@@ -274,6 +285,28 @@ class SQLiteStore:
     def _validate_schema(self, connection: sqlite3.Connection) -> None:
         for object_type, name, sql in _SCHEMA_OBJECTS:
             self._validate_schema_object(connection, object_type, name, sql)
+        expected = {name: object_type for object_type, name, _ in _SCHEMA_OBJECTS}
+        expected.update(_FTS_SHADOW_OBJECTS)
+        observed: dict[str, str] = {}
+        for row in connection.execute(
+            "SELECT type, name, sql FROM sqlite_schema ORDER BY name"
+        ):
+            object_type, name, sql = row
+            if (
+                object_type == "index"
+                and name.startswith("sqlite_autoindex_")
+                and sql is None
+            ):
+                continue
+            observed[name] = object_type
+            if expected.get(name) != object_type:
+                raise ProviderUnsupported(
+                    f"unexpected SQLite schema object {name!r}"
+                )
+        missing = expected.keys() - observed.keys()
+        if missing:
+            name = min(missing)
+            raise ProviderUnsupported(f"missing SQLite schema object {name!r}")
 
     def _validate_schema_object(
         self,
