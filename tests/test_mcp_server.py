@@ -6,6 +6,8 @@ from uuid import uuid4
 import pytest
 import yaml
 
+from llm_memory import db as db_module
+from llm_memory import mcp_server
 from llm_memory.contract_index import (
     CONTRACT_EPISODES,
     SOURCE_STATES,
@@ -15,7 +17,42 @@ from llm_memory.contract_index import (
 from llm_memory.db import get_database
 from llm_memory.index import EPISODES, ensure_index
 from llm_memory.ingest import ingest_file
-from llm_memory import mcp_server
+
+
+class RecordingProvider:
+    def __init__(self, strategy="selected-provider-strategy"):
+        self.strategy = strategy
+        self.calls = []
+
+    def capabilities(self):
+        self.calls.append(("capabilities",))
+        return {"strategies": [self.strategy]}
+
+    def ensure(self):
+        self.calls.append(("ensure",))
+        return {"provider": "recording"}
+
+    def reconcile(self, registry, budget):
+        self.calls.append(("reconcile", registry, budget))
+        return "startup-report"
+
+    def search(self, registry, request, budget):
+        self.calls.append(("search", registry, request, budget))
+        return {"strategy": request.strategy, "registry": registry}
+
+    def resolve_supersession(self, enrollment, old_ref):
+        self.calls.append(("resolve", enrollment, old_ref))
+        return None
+
+
+def _run_in_lifespan(operation):
+    async def run():
+        async with mcp_server.mcp._mcp_server.lifespan(
+            mcp_server.mcp._mcp_server
+        ) as context:
+            return context, operation()
+
+    return asyncio.run(run())
 
 
 @pytest.fixture
@@ -117,21 +154,24 @@ def test_search_history_then_open_episode_reads_source_backed_content(
         encoding="utf-8",
     )
     monkeypatch.setenv("LLM_MEMORY_SOURCES_CONFIG", str(config_path))
+    monkeypatch.delenv("LLM_MEMORY_PROVIDER", raising=False)
 
-    search_response = mcp_server.search_history(
-        "episodic copper", [corpus_id], limit=5
-    )
-    episode_ref = search_response["results"][0]["episode_ref"]
-    db.aql.execute(
-        """
-        FOR doc IN @@episodes
-            FILTER doc.corpus_id == @corpus_id
-            REMOVE doc IN @@episodes
-        """,
-        bind_vars={"@episodes": CONTRACT_EPISODES, "corpus_id": corpus_id},
-    )
+    def reach():
+        search_response = mcp_server.search_history(
+            "episodic copper", [corpus_id], limit=5
+        )
+        episode_ref = search_response["results"][0]["episode_ref"]
+        db.aql.execute(
+            """
+            FOR doc IN @@episodes
+                FILTER doc.corpus_id == @corpus_id
+                REMOVE doc IN @@episodes
+            """,
+            bind_vars={"@episodes": CONTRACT_EPISODES, "corpus_id": corpus_id},
+        )
+        return search_response, mcp_server.open_episode(episode_ref, [corpus_id])
 
-    opened = mcp_server.open_episode(episode_ref, [corpus_id])
+    _, (search_response, opened) = _run_in_lifespan(reach)
 
     assert search_response["returned_count"] == 1
     assert opened["standing"] == "available"
@@ -145,57 +185,172 @@ def test_missing_config_does_not_prevent_legacy_tools_from_loading(
     tmp_path, monkeypatch
 ):
     missing_path = tmp_path / "missing-sources.yaml"
+    provider = RecordingProvider()
     monkeypatch.setenv("LLM_MEMORY_SOURCES_CONFIG", str(missing_path))
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
 
-    reloaded = importlib.reload(mcp_server)
-    names = {tool.name for tool in asyncio.run(reloaded.mcp.list_tools())}
+    context, _ = _run_in_lifespan(lambda: None)
+    names = {tool.name for tool in asyncio.run(mcp_server.mcp.list_tools())}
 
+    assert context == {}
     assert {"search", "recall"}.issubset(names)
-    with pytest.raises(FileNotFoundError, match="missing-sources.yaml"):
-        reloaded.search_history("query", ["configured-corpus"])
+    assert provider.calls == [("ensure",)]
+    with pytest.raises(RuntimeError, match="lifespan is not active"):
+        mcp_server.search_history("query", ["configured-corpus"])
 
 
 def test_service_startup_performs_bounded_reconciliation(monkeypatch):
     registry = object()
-    observed = {}
+    provider = RecordingProvider()
 
-    def reconcile(database, declared, budget):
-        observed.update(database=database, declared=declared, budget=budget)
-        return "startup-report"
-
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
     monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
-    monkeypatch.setattr(mcp_server, "reconcile_registry", reconcile)
 
-    async def enter_lifespan():
-        async with mcp_server.mcp._mcp_server.lifespan(
-            mcp_server.mcp._mcp_server
-        ) as context:
-            return context
-
-    context = asyncio.run(enter_lifespan())
+    context, _ = _run_in_lifespan(lambda: None)
 
     assert context == {"startup_reconciliation": "startup-report"}
-    assert observed["database"] is mcp_server._db
-    assert observed["declared"] is registry
-    assert observed["budget"].max_bytes == 1_000_000
+    assert provider.calls[0] == ("ensure",)
+    assert provider.calls[1][0:2] == ("reconcile", registry)
+    assert provider.calls[1][2].max_bytes == 1_000_000
 
 
 def test_service_startup_without_enrollment_config_keeps_legacy_service_available(
     monkeypatch,
 ):
+    provider = RecordingProvider()
+
     def missing_registry():
         raise FileNotFoundError("no enrollment config")
 
-    def forbidden_reconciliation(*args):
-        raise AssertionError("missing enrollment config reached reconciliation")
-
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
     monkeypatch.setattr(mcp_server, "load_registry", missing_registry)
-    monkeypatch.setattr(mcp_server, "reconcile_registry", forbidden_reconciliation)
 
-    async def enter_lifespan():
-        async with mcp_server.mcp._mcp_server.lifespan(
-            mcp_server.mcp._mcp_server
-        ) as context:
-            return context
+    context, _ = _run_in_lifespan(lambda: None)
 
-    assert asyncio.run(enter_lifespan()) == {}
+    assert context == {}
+    assert provider.calls == [("ensure",)]
+
+
+def test_contract_search_uses_lifespan_provider_registry_and_declared_strategy(
+    monkeypatch,
+):
+    registry = object()
+    provider = RecordingProvider("provider-only-strategy")
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+
+    _, response = _run_in_lifespan(
+        lambda: mcp_server.search_history("query", ["configured-corpus"], limit=7)
+    )
+
+    search_call = next(call for call in provider.calls if call[0] == "search")
+    assert response == {
+        "strategy": "provider-only-strategy",
+        "registry": registry,
+    }
+    assert search_call[1] is registry
+    assert search_call[2].strategy == "provider-only-strategy"
+    assert search_call[2].limit == 7
+    assert search_call[3].max_bytes == 1_000_000
+
+
+def test_open_episode_uses_only_lifespan_provider_supersession_resolver(monkeypatch):
+    registry = object()
+    provider = RecordingProvider()
+    observed = {}
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+
+    def open_source(declared, episode_ref, active_corpus_ids, resolver):
+        observed.update(
+            registry=declared,
+            episode_ref=episode_ref,
+            active_corpus_ids=active_corpus_ids,
+            resolver=resolver,
+        )
+        return {"standing": "available"}
+
+    monkeypatch.setattr(mcp_server, "_open_episode", open_source)
+
+    _, response = _run_in_lifespan(
+        lambda: mcp_server.open_episode("episode://corpus/session/episode", ["corpus"])
+    )
+
+    assert response == {"standing": "available"}
+    assert observed["registry"] is registry
+    assert observed["episode_ref"] == "episode://corpus/session/episode"
+    assert observed["active_corpus_ids"] == ["corpus"]
+    assert observed["resolver"].__self__ is provider
+    assert observed["resolver"].__func__ is provider.resolve_supersession.__func__
+
+
+def test_contract_runtime_is_cleared_after_lifespan_exit(monkeypatch):
+    monkeypatch.setattr(mcp_server, "load_provider", RecordingProvider)
+    monkeypatch.setattr(mcp_server, "load_registry", object)
+
+    _run_in_lifespan(lambda: mcp_server._contract_runtime())
+
+    with pytest.raises(RuntimeError, match="lifespan is not active"):
+        mcp_server._contract_runtime()
+    with pytest.raises(RuntimeError, match="lifespan is not active"):
+        mcp_server.open_episode("episode://corpus/session/episode", ["corpus"])
+
+
+def test_explicit_sqlite_lifespan_never_connects_to_arango(tmp_path, monkeypatch):
+    config_path = tmp_path / "sources.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"contract_version": 1, "sources": []}), encoding="utf-8"
+    )
+    sqlite_path = tmp_path / "episodes.sqlite3"
+    monkeypatch.setenv("LLM_MEMORY_PROVIDER", "sqlite")
+    monkeypatch.setenv("LLM_MEMORY_SQLITE_PATH", str(sqlite_path))
+    monkeypatch.setenv("LLM_MEMORY_SOURCES_CONFIG", str(config_path))
+    monkeypatch.setattr(
+        "llm_memory.provider_config.get_database",
+        lambda: (_ for _ in ()).throw(AssertionError("Arango must stay lazy")),
+    )
+
+    context, _ = _run_in_lifespan(lambda: None)
+
+    assert "startup_reconciliation" in context
+    assert sqlite_path.exists()
+
+
+def test_legacy_tools_acquire_arango_database_lazily(monkeypatch):
+    database = object()
+    calls = []
+    monkeypatch.setattr(
+        mcp_server,
+        "get_database",
+        lambda: calls.append("get_database") or database,
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "_search",
+        lambda db, query, *, scope, limit: (db, query, scope, limit),
+    )
+    monkeypatch.setattr(mcp_server, "_recall", lambda db, key: (db, key))
+
+    assert calls == []
+    assert mcp_server.search("needle", scope="scope", limit=3) == (
+        database,
+        "needle",
+        "scope",
+        3,
+    )
+    assert mcp_server.recall("episode-key") == (database, "episode-key")
+    assert calls == ["get_database", "get_database"]
+
+
+def test_import_does_not_connect_to_arango(monkeypatch):
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            db_module,
+            "get_database",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("module import must not connect to Arango")
+            ),
+        )
+        importlib.reload(mcp_server)
+
+    importlib.reload(mcp_server)

@@ -17,37 +17,53 @@ from mcp.server.fastmcp import FastMCP
 
 from llm_memory.contract import SearchRequest
 from llm_memory.db import get_database
-from llm_memory.enrollment import load_registry
-from llm_memory.history import open_episode as _open_episode
-from llm_memory.history import search_history as _search_history
+from llm_memory.enrollment import EnrollmentRegistry, load_registry
+from llm_memory.opening import open_episode as _open_episode
+from llm_memory.provider import EpisodicProvider
+from llm_memory.provider_config import load_provider
 from llm_memory.recall import recall as _recall
-from llm_memory.reconcile import WorkBudget, reconcile_registry
+from llm_memory.reconcile import WorkBudget
 from llm_memory.search import search as _search
 
 # A contract search may reconcile at most one megabyte of source data per call.
 _DEFAULT_RECONCILIATION_MAX_BYTES = 1_000_000
+_selected_provider: EpisodicProvider | None = None
+_selected_registry: EnrollmentRegistry | None = None
+
+
+def _budget() -> WorkBudget:
+    return WorkBudget(
+        _DEFAULT_RECONCILIATION_MAX_BYTES,
+        datetime.now(UTC),
+    )
+
+
+def _contract_runtime() -> tuple[EpisodicProvider, EnrollmentRegistry]:
+    if _selected_provider is None or _selected_registry is None:
+        raise RuntimeError("episodic provider lifespan is not active")
+    return _selected_provider, _selected_registry
 
 
 @asynccontextmanager
 async def _lifespan(_server) -> AsyncIterator[dict]:
+    global _selected_provider, _selected_registry
+
+    provider = load_provider()
+    provider.ensure()
     try:
         registry = load_registry()
     except FileNotFoundError:
         yield {}
         return
-    report = reconcile_registry(
-        _db,
-        registry,
-        WorkBudget(
-            _DEFAULT_RECONCILIATION_MAX_BYTES,
-            datetime.now(UTC),
-        ),
-    )
-    yield {"startup_reconciliation": report}
+    report = provider.reconcile(registry, _budget())
+    _selected_provider, _selected_registry = provider, registry
+    try:
+        yield {"startup_reconciliation": report}
+    finally:
+        _selected_provider = _selected_registry = None
 
 
 mcp = FastMCP("llm-memory", lifespan=_lifespan)
-_db = get_database()
 
 
 @mcp.tool()
@@ -57,7 +73,7 @@ def search(query: str, scope: str = "all", limit: int = 10) -> list[dict]:
     label (e.g. "claude_code" for live sessions, "all" for everything). Returns
     ranked hits, each with `key`, `cycle`, `score`, and a snippet. Pass a hit's
     `key` to `recall` to read that episode in full."""
-    return _search(_db, query, scope=scope, limit=limit)
+    return _search(get_database(), query, scope=scope, limit=limit)
 
 
 @mcp.tool()
@@ -65,7 +81,7 @@ def recall(key: str) -> dict | None:
     """Fetch one episode IN FULL by the `key` from a search hit. Returns the whole
     episode (full response and user message, not the truncated snippet), or null
     if no episode has that key."""
-    return _recall(_db, key)
+    return _recall(get_database(), key)
 
 
 @mcp.tool()
@@ -74,20 +90,27 @@ def search_history(query: str, corpus_ids: list[str], limit: int = 10) -> dict:
 
     Reconciliation reads at most 1,000,000 source bytes per invocation.
     """
-    registry = load_registry()
-    request = SearchRequest.create(query, corpus_ids, limit=limit)
-    budget = WorkBudget(
-        _DEFAULT_RECONCILIATION_MAX_BYTES,
-        datetime.now(UTC),
+    provider, registry = _contract_runtime()
+    strategy = provider.capabilities()["strategies"][0]
+    request = SearchRequest.create(
+        query,
+        corpus_ids,
+        limit=limit,
+        strategy=strategy,
     )
-    return _search_history(_db, registry, request, budget)
+    return provider.search(registry, request, _budget())
 
 
 @mcp.tool()
 def open_episode(episode_ref: str, active_corpus_ids: list[str]) -> dict:
     """Open one contract episode from its enrolled authoritative source."""
-    registry = load_registry()
-    return _open_episode(_db, registry, episode_ref, active_corpus_ids)
+    provider, registry = _contract_runtime()
+    return _open_episode(
+        registry,
+        episode_ref,
+        active_corpus_ids,
+        provider.resolve_supersession,
+    )
 
 
 if __name__ == "__main__":
