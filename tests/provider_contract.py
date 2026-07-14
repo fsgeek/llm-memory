@@ -106,11 +106,19 @@ def assert_portable_provider_contract(
     *,
     strategy: str,
     foreign_strategy: str,
-) -> None:
+) -> bytes:
     registry = synthetic_source.registry
     corpus_id = synthetic_source.corpus_id
     primary = synthetic_source.source("primary")
     expected_primary_refs = frozenset(_episode_refs(primary))
+    expected_search_refs = frozenset(
+        episode_ref
+        for source in registry.sources_for(corpus_id)
+        for episode_ref in _episode_refs(source)
+    )
+    expected_secondary_refs = frozenset(
+        _episode_refs(synthetic_source.source("secondary"))
+    )
 
     capabilities = provider.capabilities()
     assert capabilities["strategies"] == [strategy]
@@ -157,9 +165,10 @@ def assert_portable_provider_contract(
         assert isinstance(first["total_matches"], int)
     else:
         assert first["total_matches"] is None
-    assert [result["episode_ref"] for result in first["results"]] == [
-        result["episode_ref"] for result in second["results"]
-    ]
+    assert first["results"] == second["results"]
+    assert {
+        result["episode_ref"] for result in first["results"]
+    } <= expected_search_refs
     assert first["corpus_standing"][0]["corpus_id"] == corpus_id
     sources = {
         source["source_id"]: source
@@ -177,6 +186,21 @@ def assert_portable_provider_contract(
         "forbidden",
     )
     assert disabled_declaration["returned_count"] == 0
+    secondary = _search(
+        provider,
+        registry,
+        corpus_id,
+        strategy,
+        "secondary",
+    )
+    assert secondary["returned_count"] == 1
+    assert {
+        result["episode_ref"] for result in secondary["results"]
+    } == expected_secondary_refs
+    assert all(
+        EpisodeReference.parse(result["episode_ref"]).source_id == "secondary"
+        for result in secondary["results"]
+    )
 
     primary_result = _search(
         provider,
@@ -248,8 +272,19 @@ def assert_portable_provider_contract(
     primary_scope = PurgeScope(corpus_id=corpus_id, source_id="primary")
     retained_before = provider.measure(primary_scope)
     assert retained_before.standing == "available"
-    assert retained_before.observations["episode_documents"] >= 3
-    assert retained_before.observations["supersession_documents"] >= 1
+    retained_counts = {
+        key: retained_before.observations[key]
+        for key in (
+            "episode_documents",
+            "source_state_documents",
+            "supersession_documents",
+        )
+    }
+    assert retained_counts == {
+        "episode_documents": 3,
+        "source_state_documents": 1,
+        "supersession_documents": 1,
+    }
 
     disabled_registry = _registry_with(registry, "primary", enabled=False)
     disabled = _search(
@@ -297,30 +332,35 @@ def assert_portable_provider_contract(
             provider.resolve_supersession,
         )
     retained_after = provider.measure(primary_scope)
-    assert retained_after.observations["episode_documents"] == (
-        retained_before.observations["episode_documents"]
-    )
+    assert {
+        key: retained_after.observations[key] for key in retained_counts
+    } == retained_counts
 
     sentinel_scope = PurgeScope(
         corpus_id=synthetic_source.sentinel_corpus_id,
         source_id="sentinel",
     )
     sentinel_before = provider.measure(sentinel_scope)
+    sentinel_counts = {
+        key: sentinel_before.observations[key] for key in retained_counts
+    }
+    assert sentinel_counts == {
+        "episode_documents": 1,
+        "source_state_documents": 1,
+        "supersession_documents": 0,
+    }
     purged = provider.purge(
         primary_scope, frozenset({"episodes", "reconciliation"})
     )
-    assert purged["episodes"] >= 3
-    assert purged["reconciliation"] >= 1
+    assert purged == {"episodes": 3, "reconciliation": 1}
     primary_after_purge = provider.measure(primary_scope)
     assert primary_after_purge.observations["episode_documents"] == 0
     assert primary_after_purge.observations["source_state_documents"] == 0
+    assert primary_after_purge.observations["supersession_documents"] == 1
     sentinel_after = provider.measure(sentinel_scope)
-    assert sentinel_after.observations["episode_documents"] == (
-        sentinel_before.observations["episode_documents"]
-    )
-    assert sentinel_after.observations["source_state_documents"] == (
-        sentinel_before.observations["source_state_documents"]
-    )
+    assert {
+        key: sentinel_after.observations[key] for key in sentinel_counts
+    } == sentinel_counts
 
     rebuilt = _search(
         provider,
@@ -331,12 +371,9 @@ def assert_portable_provider_contract(
         now=later,
     )
     assert rebuilt["returned_count"] >= 1
-    assert provider.measure(primary_scope).observations["episode_documents"] >= 3
+    rebuilt_measurement = provider.measure(primary_scope)
+    assert {
+        key: rebuilt_measurement.observations[key] for key in retained_counts
+    } == retained_counts
     _assert_files(synthetic_source, primary_bytes=rewritten_bytes)
-
-    removal = provider.remove_all()
-    assert removal
-    unavailable = provider.measure(PurgeScope())
-    assert unavailable.standing == "unavailable"
-    assert unavailable.observations["episode_documents"] is None
-    _assert_files(synthetic_source, primary_bytes=rewritten_bytes)
+    return rewritten_bytes

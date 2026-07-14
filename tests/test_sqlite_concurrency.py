@@ -6,7 +6,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from threading import Barrier, Lock
+from threading import Barrier, Lock, get_ident
 
 import pytest
 
@@ -58,37 +58,58 @@ def _assert_active_generations_are_complete(store: SQLiteStore) -> None:
 
 
 def test_eight_parallel_sqlite_reconcilers_have_bounded_complete_outcomes(
-    tmp_path, synthetic_source
+    tmp_path, synthetic_source, monkeypatch
 ):
     path = tmp_path / "parallel.sqlite3"
     registry = _primary_registry(synthetic_source)
     SQLiteProvider(path, busy_timeout_ms=100).ensure()
     barrier = Barrier(8)
     connection_lock = Lock()
-    worker_connections = []
+    worker_thread_ids = set()
+    connections_by_thread = {}
+    original_connect = SQLiteStore.connect
+
+    def tracked_connect(store):
+        connection = original_connect(store)
+        thread_id = get_ident()
+        with connection_lock:
+            if thread_id in worker_thread_ids:
+                connections_by_thread.setdefault(thread_id, []).append(connection)
+        return connection
+
+    monkeypatch.setattr(SQLiteStore, "connect", tracked_connect)
 
     def reconcile_from_independent_store(_):
         provider = SQLiteProvider(path, busy_timeout_ms=100)
-        worker_connection = provider.store.connect()
         with connection_lock:
-            worker_connections.append(worker_connection)
+            worker_thread_ids.add(get_ident())
+        barrier.wait(timeout=5)
         try:
-            barrier.wait(timeout=5)
-            try:
-                report = provider.reconcile(registry, WorkBudget(1_000_000, NOW))
-            except ProviderUnavailable:
-                return "retryable"
-            member = report.corpus_standing[0]["sources"][0]["members"][0]
-            assert member["index_standing"] == "available"
-            return "available"
-        finally:
-            worker_connection.close()
+            report = provider.reconcile(registry, WorkBudget(1_000_000, NOW))
+        except ProviderUnavailable:
+            return "retryable"
+        member = report.corpus_standing[0]["sources"][0]["members"][0]
+        assert member["index_standing"] == "available"
+        return "available"
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        outcomes = list(pool.map(reconcile_from_independent_store, range(8)))
+        futures = [
+            pool.submit(reconcile_from_independent_store, worker)
+            for worker in range(8)
+        ]
+        outcomes = [future.result(timeout=10) for future in futures]
 
     assert len(outcomes) == 8
-    assert len({id(connection) for connection in worker_connections}) == 8
+    assert connections_by_thread.keys() == worker_thread_ids
+    worker_connections = [
+        connection
+        for connections in connections_by_thread.values()
+        for connection in connections
+    ]
+    assert len(worker_connections) >= 8
+    assert len({id(connection) for connection in worker_connections}) == len(
+        worker_connections
+    )
     assert all(outcome in {"available", "retryable"} for outcome in outcomes)
     assert "available" in outcomes
     final_provider = SQLiteProvider(path, busy_timeout_ms=100)

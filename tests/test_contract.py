@@ -197,6 +197,11 @@ def test_search_request_requires_concrete_unique_corpora():
         SearchRequest.create("query", ["*"])
 
 
+def test_search_request_rejects_nul_query_as_contract_invalid():
+    with pytest.raises(ContractError, match="query must not contain NUL"):
+        SearchRequest.create("visible\0hidden", ["corpus-a"])
+
+
 @pytest.mark.parametrize(
     "episode_ref",
     ["episode://corpus:bad/session/episode", "episode://[/session/episode"],
