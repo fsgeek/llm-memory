@@ -563,6 +563,8 @@ def test_full_removal_handles_database_wal_shm_and_preserves_sources(
     assert candidates <= {path.name for path in sqlite_store.path.parent.iterdir()}
     try:
         report = remove_provider_file(sqlite_store)
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            held_connection.execute("SELECT count(*) FROM episode_documents").fetchone()
     finally:
         held_connection.close()
 
@@ -588,6 +590,39 @@ def test_full_removal_is_idempotent_when_provider_files_are_absent(tmp_path):
     assert first["residual_paths"] == []
     assert second == first
     assert not store.path.exists()
+
+
+def test_full_removal_reports_active_snapshot_before_unlinking(
+    sqlite_store, populated_fixture
+):
+    held_connection = sqlite_store.connect()
+    held_connection.execute("BEGIN")
+    retained_count = held_connection.execute(
+        "SELECT count(*) FROM episode_documents"
+    ).fetchone()[0]
+    try:
+        report = remove_provider_file(sqlite_store)
+
+        assert report["removed_paths"] == []
+        assert set(report["residual_paths"]) == {
+            path.name for path in sqlite_store.file_paths()
+        }
+        assert set(report["residual_reasons"].values()) == {
+            "active SQLite snapshot prevents verified removal"
+        }
+        assert (
+            held_connection.execute(
+                "SELECT count(*) FROM episode_documents"
+            ).fetchone()[0]
+            == retained_count
+        )
+    finally:
+        held_connection.rollback()
+        held_connection.close()
+
+    retry = remove_provider_file(sqlite_store)
+    assert retry["residual_paths"] == []
+    assert not any(path.exists() for path in sqlite_store.file_paths())
 
 
 def test_full_removal_reports_residual_path_when_unlink_fails(

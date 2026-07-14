@@ -25,6 +25,15 @@ _ROW_COUNT_NAMES = (
     "source_state_documents",
     "supersession_documents",
 )
+_PROVIDER_TABLES = (
+    "episode_fts",
+    "episode_documents",
+    "source_states",
+    "supersessions",
+    "provider_meta",
+)
+_ACTIVE_SNAPSHOT_RESIDUAL = "active SQLite snapshot prevents verified removal"
+_INVALIDATION_RESIDUAL = "SQLite provider content invalidation did not complete"
 
 
 def _require_identifier(name: str, value: object) -> None:
@@ -231,6 +240,27 @@ def _symlink_residual_reason(
     return "not removed because SQLite provider file set contains a symlink"
 
 
+def _invalidate_provider_content(store: SQLiteStore) -> str | None:
+    connection = None
+    try:
+        connection = store.connect()
+        connection.execute("BEGIN IMMEDIATE")
+        for table in _PROVIDER_TABLES:
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+        connection.commit()
+        busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        if busy:
+            return _ACTIVE_SNAPSHOT_RESIDUAL
+        return None
+    except (sqlite3.Error, ProviderUnavailable, ProviderUnsupported, OSError):
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        return _INVALIDATION_RESIDUAL
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def remove_provider_file(store: SQLiteStore) -> dict[str, object]:
     candidates = store.file_paths()
     symlinks = frozenset(path.name for path in candidates if path.is_symlink())
@@ -250,15 +280,22 @@ def remove_provider_file(store: SQLiteStore) -> dict[str, object]:
             "retained": ["enrollment configuration", "source locators"],
         }
 
-    operation_connection = None
     if _path_present(store.path):
-        try:
-            operation_connection = store.connect()
-        except (sqlite3.Error, ProviderUnavailable, ProviderUnsupported, OSError):
-            pass
-        finally:
-            if operation_connection is not None:
-                operation_connection.close()
+        invalidation_residual = _invalidate_provider_content(store)
+        if invalidation_residual is not None:
+            residual = [path.name for path in candidates if _path_present(path)]
+            return {
+                "removed_paths": [],
+                "residual_paths": residual,
+                "residual_reasons": {
+                    name: invalidation_residual for name in residual
+                },
+                "declared_losses": [
+                    "retained supersession observations",
+                    "non-reproducible evaluation state",
+                ],
+                "retained": ["enrollment configuration", "source locators"],
+            }
 
     removed = []
     removal_failures = {}
