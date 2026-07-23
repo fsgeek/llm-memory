@@ -114,6 +114,7 @@ def test_bounded_build_resumes_and_activates_only_when_complete(
     assert _member(second)["freshness"] == "current"
     assert _member(second)["indexed_through"]["value"] == len(data)
     assert _member(second)["integrity"]["chain_digest"]
+    assert _member(second)["episode_count"] == 2
     assert len(sqlite_store.active_episode_refs("local", "resume")) == 2
     assert sqlite_store.staging_episode_count("local", "resume") == 0
 

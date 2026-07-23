@@ -751,6 +751,76 @@ def test_explicit_sqlite_lifespan_never_connects_to_arango(tmp_path, monkeypatch
     assert sqlite_path.exists()
 
 
+def test_nonempty_sqlite_lifespan_emits_reconciliation_without_arango(
+    tmp_path, monkeypatch
+):
+    source_path = tmp_path / "episodes.jsonl"
+    source_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "cycle": cycle,
+                    "user_message": question,
+                    "response_text": response,
+                }
+            )
+            for cycle, question, response in (
+                (1, "first question", "first response"),
+                (2, "second question", "second response"),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "sources.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "contract_version": 1,
+                "sources": [
+                    {
+                        "corpus_id": "sqlite-history",
+                        "source_id": "sqlite-source",
+                        "adapter": "taste_open_jsonl",
+                        "boundary_version": 1,
+                        "canonicalization_version": 1,
+                        "locator": str(source_path),
+                        "enabled": True,
+                        "full_validation_max_age_seconds": 3600,
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    sqlite_path = tmp_path / "episodes.sqlite3"
+    event_path = tmp_path / "sqlite-events.jsonl"
+    monkeypatch.setenv("LLM_MEMORY_PROVIDER", "sqlite")
+    monkeypatch.setenv("LLM_MEMORY_SQLITE_PATH", str(sqlite_path))
+    monkeypatch.setenv("LLM_MEMORY_SOURCES_CONFIG", str(config_path))
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(event_path))
+    monkeypatch.setattr(
+        "llm_memory.provider_config.get_database",
+        lambda: (_ for _ in ()).throw(AssertionError("Arango must stay lazy")),
+    )
+
+    context, _ = _run_in_lifespan(lambda: None)
+
+    report = context["startup_reconciliation"]
+    member = report.corpus_standing[0]["sources"][0]["members"][0]
+    assert member["episode_count"] == 2
+    events = [
+        json.loads(line)
+        for line in event_path.read_text(encoding="utf-8").splitlines()
+    ]
+    reconciliation = next(
+        event for event in events if event["event"] == "reconcile.completed"
+    )
+    assert reconciliation["episode_count"] == 2
+    assert sqlite_path.exists()
+
+
 def test_legacy_tools_acquire_arango_database_lazily(monkeypatch):
     database = object()
     calls = []

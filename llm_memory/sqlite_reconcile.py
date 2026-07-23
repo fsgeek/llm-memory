@@ -692,6 +692,7 @@ def _member_standing(
     age = max(0.0, (now - validated).total_seconds()) if validated else None
     return {
         "member_id": member_id,
+        "episode_count": state.get("episode_count", 0),
         "source_standing": (
             SourceStanding.MISSING.value
             if missing
