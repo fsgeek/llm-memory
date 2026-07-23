@@ -131,6 +131,7 @@ def test_registry_rejects_non_positive_semantic_integers(tmp_path, field, value)
         ("taste_open_jsonl", 2, 1),
         ("gateway_jsonl", 1, 2),
         ("claude_code_jsonl", 2, 2),
+        ("codex_jsonl", 2, 1),
     ],
 )
 def test_registry_rejects_unimplemented_adapter_semantic_versions(
@@ -154,6 +155,20 @@ def test_environment_overrides_default_sources_path(tmp_path, monkeypatch):
     registry = load_registry()
 
     assert registry.known_corpora == frozenset({"project-history"})
+
+
+def test_registry_accepts_native_codex_adapter(tmp_path):
+    source = VALID_CONFIG["sources"][0] | {
+        "source_id": "e8c598ae-711b-42b5-b963-eb35fc946d2b",
+        "adapter": "codex_jsonl",
+        "locator": "/tmp/codex-rollout.jsonl",
+    }
+
+    registry = load_registry(
+        write_config(tmp_path, VALID_CONFIG | {"sources": [source]})
+    )
+
+    assert registry.sources[0].adapter == "codex_jsonl"
 
 
 @pytest.mark.parametrize(

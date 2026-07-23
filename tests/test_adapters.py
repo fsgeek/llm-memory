@@ -39,6 +39,36 @@ def scan(path, adapter_name, *, source_id="declared-stream"):
     return adapter.scan(declared, member)
 
 
+def codex_records():
+    return [
+        {
+            "timestamp": "2026-07-22T17:50:42Z",
+            "type": "session_meta",
+            "payload": {"session_id": "native-codex-session"},
+        },
+        {
+            "timestamp": "2026-07-22T17:51:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "wander with me"},
+        },
+        {
+            "timestamp": "2026-07-22T17:51:01Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec"},
+        },
+        {
+            "timestamp": "2026-07-22T17:51:02Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "message": "we can wander"},
+        },
+        {
+            "timestamp": "2026-07-22T17:51:03Z",
+            "type": "event_msg",
+            "payload": {"type": "agent_message", "message": "and remain honest"},
+        },
+    ]
+
+
 def test_adapter_registry_is_explicit_and_metadata_is_immutable(tmp_path):
     adapter = get_adapter("taste_open_jsonl")
 
@@ -49,11 +79,13 @@ def test_adapter_registry_is_explicit_and_metadata_is_immutable(tmp_path):
             "taste_open_jsonl",
             "gateway_jsonl",
             "claude_code_jsonl",
+            "codex_jsonl",
         )
     } == {
         "taste_open_jsonl": "2",
         "gateway_jsonl": "2",
         "claude_code_jsonl": "2",
+        "codex_jsonl": "1",
     }
     with pytest.raises(FrozenInstanceError):
         adapter.implementation_version = "changed"
@@ -108,6 +140,107 @@ def test_taste_open_uses_declared_stream_and_native_cycle(tmp_path):
     assert episode.body.activity_log == [{"tool": "search_memory"}]
     assert "drowning wall" in episode.state_text
     assert "search_memory" not in episode.state_text
+
+
+def test_codex_uses_session_meta_and_clean_conversation_events(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    data = write_jsonl(path, codex_records())
+
+    result = scan(path, "codex_jsonl", source_id="machine-uuid")
+    first, second = result.episodes
+
+    assert result.source_standing is SourceStanding.AVAILABLE
+    assert result.observed_end == result.complete_end == len(data)
+    assert [episode.body.user_message for episode in result.episodes] == [
+        "wander with me",
+        "wander with me",
+    ]
+    assert [episode.body.response for episode in result.episodes] == [
+        "we can wander",
+        "and remain honest",
+    ]
+    assert [
+        episode.identity.reference.native_session_id for episode in result.episodes
+    ] == [
+        "native-codex-session",
+        "native-codex-session",
+    ]
+    assert [episode.identity.reference.event_token for episode in result.episodes] == [
+        "0",
+        "1",
+    ]
+    assert all(episode.native_event_id is None for episode in result.episodes)
+
+
+def test_codex_ignores_blank_and_nonconversation_events(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(
+        path,
+        codex_records()
+        + [
+            {"type": "world_state", "payload": {"state": "private"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "  "},
+            },
+        ],
+    )
+
+    result = scan(path, "codex_jsonl")
+
+    assert len(result.episodes) == 2
+    assert all(episode.body.state == {} for episode in result.episodes)
+    assert all(episode.body.activity_log == [] for episode in result.episodes)
+    assert all(episode.body.adapter_fields == {} for episode in result.episodes)
+
+
+def test_codex_bounded_resume_matches_full_scan(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(path, codex_records())
+    declared = enrollment("codex_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+    full = adapter.scan(declared, member)
+    cursor = None
+    episodes = []
+    while cursor is None or cursor.byte_offset < path.stat().st_size:
+        chunk = adapter.scan_chunk(declared, member, cursor, 1)
+        episodes.extend(chunk.episodes)
+        assert chunk.source_standing is SourceStanding.AVAILABLE
+        cursor = chunk.next_cursor
+    assert [episode.identity.episode_ref for episode in episodes] == [
+        episode.identity.episode_ref for episode in full.episodes
+    ]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [
+            {
+                "timestamp": "2026-07-22T00:00:00Z",
+                "type": "world_state",
+                "payload": {},
+            }
+        ],
+        [
+            {
+                "timestamp": "2026-07-22T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"session_id": "s"},
+            }
+        ],
+    ],
+)
+def test_codex_clean_lookalike_without_conversation_is_malformed(tmp_path, records):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(path, records)
+
+    result = scan(path, "codex_jsonl")
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert result.episodes == ()
+    assert result.error_position == 0
 
 
 def test_gateway_uses_session_local_sequence_and_keeps_prompt_only_provenance(tmp_path):

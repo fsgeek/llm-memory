@@ -27,7 +27,7 @@ _SOURCE_KEYS = frozenset(
     }
 )
 _SUPPORTED_ADAPTERS = frozenset(
-    {"taste_open_jsonl", "gateway_jsonl", "claude_code_jsonl"}
+    {"taste_open_jsonl", "gateway_jsonl", "claude_code_jsonl", "codex_jsonl"}
 )
 
 

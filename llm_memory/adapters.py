@@ -569,10 +569,119 @@ class ClaudeCodeAdapter:
         return result
 
 
+@dataclass(frozen=True)
+class CodexAdapter:
+    name: str = "codex_jsonl"
+    implementation_version: str = "1"
+
+    def members(self, enrollment: SourceEnrollment) -> tuple[SourceMember, ...]:
+        return _file_member(enrollment)
+
+    def scan(
+        self, enrollment: SourceEnrollment, member: SourceMember
+    ) -> MemberScan:
+        return _member_scan(self.scan_chunk(enrollment, member, None, 2**63 - 1))
+
+    def scan_chunk(
+        self,
+        enrollment: SourceEnrollment,
+        member: SourceMember,
+        cursor: ScanCursor | None,
+        max_bytes: int,
+    ) -> MemberChunk:
+        _require_semantic_versions(enrollment)
+        state = dict(cursor.adapter_state) if cursor is not None else {}
+        native_session_id = state.get("native_session_id")
+        latest_user = state.get("latest_user", "")
+        latest_user_ts = state.get("latest_user_ts", "")
+        sequence_by_session = dict(state.get("sequence_by_session", {}))
+        recognized_conversation = state.get("recognized_conversation", False)
+
+        def handle(
+            record: dict[str, Any], start: int, end: int
+        ) -> EpisodeRecord | None:
+            nonlocal native_session_id, latest_user, latest_user_ts
+            nonlocal recognized_conversation
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                return None
+            if record.get("type") == "session_meta":
+                session = payload.get("session_id")
+                if not isinstance(session, str) or not session:
+                    raise ValueError("Codex session_meta session_id is required")
+                native_session_id = session
+                state["native_session_id"] = session
+                return None
+            if record.get("type") != "event_msg":
+                return None
+            event_type = payload.get("type")
+            message = payload.get("message")
+            if event_type not in {"user_message", "agent_message"}:
+                return None
+            if not isinstance(message, str):
+                raise ValueError("Codex conversational message must be a string")
+            if not message.strip():
+                return None
+            if not isinstance(native_session_id, str) or not native_session_id:
+                raise ValueError("Codex conversation requires prior session_meta")
+            recognized_conversation = True
+            state["recognized_conversation"] = True
+            if event_type == "user_message":
+                latest_user = message
+                latest_user_ts = record.get("timestamp") or ""
+                state["latest_user"] = latest_user
+                state["latest_user_ts"] = latest_user_ts
+                return None
+            sequence = sequence_by_session.get(native_session_id, 0)
+            body = EpisodeBody(
+                timestamp=_optional_text(record, "timestamp"),
+                model="",
+                user_message=latest_user,
+                response=message,
+                state={},
+                activity_log=[],
+                adapter_fields={},
+            )
+            episode = _record(
+                enrollment,
+                native_session_id=native_session_id,
+                event_token=str(sequence),
+                body=body,
+                native_event_id=None,
+                start=start,
+                end=end,
+            )
+            sequence_by_session[native_session_id] = sequence + 1
+            state["sequence_by_session"] = sequence_by_session
+            return episode
+
+        result = _scan_lines_chunk(member, cursor, max_bytes, handle, state)
+        if (
+            (not native_session_id or not recognized_conversation)
+            and result.source_standing is SourceStanding.AVAILABLE
+            and not result.exhausted
+            and result.freshness is not FreshnessStanding.INCOMPLETE
+        ):
+            return MemberChunk(
+                member=result.member,
+                episodes=(),
+                next_cursor=result.next_cursor,
+                observed_end=result.observed_end,
+                complete_end=result.complete_end,
+                source_standing=SourceStanding.MALFORMED,
+                freshness=FreshnessStanding.UNKNOWN,
+                bytes_read=result.bytes_read,
+                exhausted=result.exhausted,
+                error_position=0,
+            )
+        return result
+
+
 _ADAPTERS: dict[str, SourceAdapter] = {
     "taste_open_jsonl": TasteOpenAdapter(),
     "gateway_jsonl": GatewayAdapter(),
     "claude_code_jsonl": ClaudeCodeAdapter(),
+    "codex_jsonl": CodexAdapter(),
 }
 
 
