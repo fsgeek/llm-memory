@@ -18,6 +18,13 @@ from mcp.server.fastmcp import FastMCP
 from llm_memory.contract import SearchRequest
 from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, load_registry
+from llm_memory.observability import (
+    emit_failure_event,
+    emit_open_event,
+    emit_reconciliation_event,
+    emit_search_event,
+    emit_server_event,
+)
 from llm_memory.opening import open_episode as _open_episode
 from llm_memory.provider import EpisodicProvider
 from llm_memory.provider_config import load_provider
@@ -63,6 +70,23 @@ def _sole_strategy(capabilities: object) -> str:
     return strategies[0]
 
 
+def _emit_reconciliation(report) -> None:
+    for corpus in report.corpus_standing:
+        for source in corpus["sources"]:
+            for member in source["members"]:
+                emit_reconciliation_event(
+                    corpus_id=corpus["corpus_id"],
+                    source_id=source["source_id"],
+                    member_id=member["member_id"],
+                    source_standing=member["source_standing"],
+                    index_standing=member["index_standing"],
+                    episode_count=member["episode_count"],
+                    bytes_read=report.bytes_read,
+                    duration_ms=report.elapsed_ms,
+                    work_exhausted=report.work_exhausted,
+                )
+
+
 @asynccontextmanager
 async def _lifespan(_server) -> AsyncIterator[dict]:
     global _lifespan_active, _selected_provider, _selected_registry
@@ -70,20 +94,32 @@ async def _lifespan(_server) -> AsyncIterator[dict]:
     if _lifespan_active:
         raise RuntimeError("episodic provider lifespan is already active")
     _lifespan_active = True
+    emit_server_event("starting")
     try:
-        provider = load_provider()
-        provider.ensure()
         try:
-            registry = load_registry()
-        except FileNotFoundError:
+            provider = load_provider()
+            provider.ensure()
+            try:
+                registry = load_registry()
+            except FileNotFoundError:
+                registry = None
+            if registry is not None:
+                report = provider.reconcile(registry, _budget())
+                _emit_reconciliation(report)
+                _selected_provider, _selected_registry = provider, registry
+        except BaseException as exc:
+            emit_failure_event("server", exc)
+            raise
+        if registry is None:
+            emit_server_event("started", outcome="enrollment_missing")
             yield {}
-            return
-        report = provider.reconcile(registry, _budget())
-        _selected_provider, _selected_registry = provider, registry
-        yield {"startup_reconciliation": report}
+        else:
+            emit_server_event("started")
+            yield {"startup_reconciliation": report}
     finally:
         _lifespan_active = False
         _selected_provider = _selected_registry = None
+        emit_server_event("stopped")
 
 
 mcp = FastMCP("llm-memory", lifespan=_lifespan)
@@ -113,27 +149,54 @@ def search_history(query: str, corpus_ids: list[str], limit: int = 10) -> dict:
 
     Reconciliation reads at most 1,000,000 source bytes per invocation.
     """
-    provider, registry = _contract_runtime()
-    strategy = _sole_strategy(provider.capabilities())
-    request = SearchRequest.create(
-        query,
-        corpus_ids,
-        limit=limit,
-        strategy=strategy,
+    try:
+        provider, registry = _contract_runtime()
+        strategy = _sole_strategy(provider.capabilities())
+        request = SearchRequest.create(
+            query,
+            corpus_ids,
+            limit=limit,
+            strategy=strategy,
+        )
+        response = provider.search(registry, request, _budget())
+    except BaseException as exc:
+        emit_failure_event("search", exc, corpus_ids=corpus_ids)
+        raise
+    emit_search_event(
+        corpus_ids=corpus_ids,
+        returned_count=response.get("returned_count", 0),
+        episode_refs=[
+            result["episode_ref"] for result in response.get("results", ())
+        ],
     )
-    return provider.search(registry, request, _budget())
+    return response
 
 
 @mcp.tool()
 def open_episode(episode_ref: str, active_corpus_ids: list[str]) -> dict:
     """Open one contract episode from its enrolled authoritative source."""
-    provider, registry = _contract_runtime()
-    return _open_episode(
-        registry,
-        episode_ref,
-        active_corpus_ids,
-        provider.resolve_supersession,
+    try:
+        provider, registry = _contract_runtime()
+        response = _open_episode(
+            registry,
+            episode_ref,
+            active_corpus_ids,
+            provider.resolve_supersession,
+        )
+    except BaseException as exc:
+        emit_failure_event(
+            "open",
+            exc,
+            corpus_ids=active_corpus_ids,
+            episode_ref=episode_ref,
+        )
+        raise
+    emit_open_event(
+        corpus_ids=active_corpus_ids,
+        episode_ref=episode_ref,
+        standing=response.get("standing", "unknown"),
     )
+    return response
 
 
 if __name__ == "__main__":

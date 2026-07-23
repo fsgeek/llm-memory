@@ -17,12 +17,14 @@ from llm_memory.contract_index import (
 from llm_memory.db import get_database
 from llm_memory.index import EPISODES, ensure_index
 from llm_memory.ingest import ingest_file
+from llm_memory.reconcile import ReconcileReport
 
 
 class RecordingProvider:
     def __init__(self, strategy="selected-provider-strategy"):
         self.strategy = strategy
         self.calls = []
+        self.reconciliation = ReconcileReport((), 0, 0.0, False)
 
     def capabilities(self):
         self.calls.append(("capabilities",))
@@ -34,7 +36,7 @@ class RecordingProvider:
 
     def reconcile(self, registry, budget):
         self.calls.append(("reconcile", registry, budget))
-        return "startup-report"
+        return self.reconciliation
 
     def search(self, registry, request, budget):
         self.calls.append(("search", registry, request, budget))
@@ -53,6 +55,11 @@ def _run_in_lifespan(operation):
             return context, operation()
 
     return asyncio.run(run())
+
+
+@pytest.fixture(autouse=True)
+def isolated_event_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(tmp_path / "events.jsonl"))
 
 
 @pytest.fixture
@@ -208,7 +215,7 @@ def test_service_startup_performs_bounded_reconciliation(monkeypatch):
 
     context, _ = _run_in_lifespan(lambda: None)
 
-    assert context == {"startup_reconciliation": "startup-report"}
+    assert context == {"startup_reconciliation": provider.reconciliation}
     assert provider.calls[0] == ("ensure",)
     assert provider.calls[1][0:2] == ("reconcile", registry)
     assert provider.calls[1][2].max_bytes == 1_000_000
@@ -441,6 +448,287 @@ def test_failed_lifespan_setup_permits_later_clean_lifespan(monkeypatch):
     asyncio.run(run())
 
     assert registry_loads == ["registry", "registry"]
+
+
+def test_contract_lifespan_and_tools_call_typed_identifier_only_emitters(
+    monkeypatch,
+):
+    registry = object()
+    provider = RecordingProvider()
+    provider.reconciliation = ReconcileReport(
+        (
+            {
+                "corpus_id": "codex-history",
+                "sources": (
+                    {
+                        "source_id": "machine-uuid",
+                        "members": (
+                            {
+                                "member_id": "member-1",
+                                "episode_count": 2,
+                                "source_standing": "available",
+                                "index_standing": "available",
+                            },
+                        ),
+                    },
+                ),
+            },
+        ),
+        17,
+        2.5,
+        False,
+    )
+    search_response = {
+        "query": "secret query",
+        "returned_count": 1,
+        "results": [
+            {"episode_ref": "episode://codex-history/session/episode"}
+        ],
+    }
+    opened_response = {
+        "episode_ref": "episode://codex-history/session/episode",
+        "standing": "available",
+        "response": "must not log",
+    }
+    provider.search = lambda registry, request, budget: search_response
+    calls = []
+
+    def record_server(state, *, outcome=None):
+        calls.append(("server", state, outcome))
+        return False
+
+    def record_reconciliation(**fields):
+        calls.append(("reconciliation", fields))
+        return False
+
+    def record_search(**fields):
+        calls.append(("search", fields))
+        return False
+
+    def record_open(**fields):
+        calls.append(("open", fields))
+        return False
+
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+    monkeypatch.setattr(mcp_server, "emit_server_event", record_server)
+    monkeypatch.setattr(
+        mcp_server, "emit_reconciliation_event", record_reconciliation
+    )
+    monkeypatch.setattr(mcp_server, "emit_search_event", record_search)
+    monkeypatch.setattr(mcp_server, "emit_open_event", record_open)
+    monkeypatch.setattr(
+        mcp_server, "_open_episode", lambda *args: opened_response
+    )
+
+    def operations():
+        searched = mcp_server.search_history(
+            "secret query", ["codex-history"]
+        )
+        opened = mcp_server.open_episode(
+            "episode://codex-history/session/episode", ["codex-history"]
+        )
+        return searched, opened
+
+    _, responses = _run_in_lifespan(operations)
+
+    assert responses == (search_response, opened_response)
+    assert calls == [
+        ("server", "starting", None),
+        (
+            "reconciliation",
+            {
+                "corpus_id": "codex-history",
+                "source_id": "machine-uuid",
+                "member_id": "member-1",
+                "source_standing": "available",
+                "index_standing": "available",
+                "episode_count": 2,
+                "bytes_read": 17,
+                "duration_ms": 2.5,
+                "work_exhausted": False,
+            },
+        ),
+        ("server", "started", None),
+        (
+            "search",
+            {
+                "corpus_ids": ["codex-history"],
+                "returned_count": 1,
+                "episode_refs": [
+                    "episode://codex-history/session/episode"
+                ],
+            },
+        ),
+        (
+            "open",
+            {
+                "corpus_ids": ["codex-history"],
+                "episode_ref": "episode://codex-history/session/episode",
+                "standing": "available",
+            },
+        ),
+        ("server", "stopped", None),
+    ]
+    serialized = json.dumps(calls)
+    assert "secret query" not in serialized
+    assert "must not log" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("operation", "phase", "corpus_ids", "episode_ref"),
+    [
+        (
+            lambda: mcp_server.search_history(
+                "secret query", ["codex-history"]
+            ),
+            "search",
+            ["codex-history"],
+            None,
+        ),
+        (
+            lambda: mcp_server.open_episode(
+                "episode://codex-history/session/episode",
+                ["codex-history"],
+            ),
+            "open",
+            ["codex-history"],
+            "episode://codex-history/session/episode",
+        ),
+    ],
+)
+def test_contract_failure_calls_typed_emitter_and_reraises_original_exception(
+    monkeypatch, operation, phase, corpus_ids, episode_ref
+):
+    failure = RuntimeError("secret body")
+    calls = []
+
+    def record_failure(
+        observed_phase, exc, *, corpus_ids=(), episode_ref=None
+    ):
+        calls.append((observed_phase, exc, corpus_ids, episode_ref))
+        return False
+
+    monkeypatch.setattr(
+        mcp_server,
+        "_contract_runtime",
+        lambda: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(mcp_server, "emit_failure_event", record_failure)
+
+    with pytest.raises(RuntimeError, match="secret body") as caught:
+        operation()
+
+    assert caught.value is failure
+    assert calls == [(phase, failure, corpus_ids, episode_ref)]
+
+
+def test_failed_startup_calls_typed_failure_and_still_stops(monkeypatch):
+    failure = RuntimeError("secret startup body")
+    events = []
+    provider = RecordingProvider()
+    provider.ensure = lambda: (_ for _ in ()).throw(failure)
+
+    def record_server(state, *, outcome=None):
+        events.append(("server", state, outcome))
+        return False
+
+    def record_failure(phase, exc, *, corpus_ids=(), episode_ref=None):
+        events.append(("failure", phase, exc, corpus_ids, episode_ref))
+        return False
+
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "emit_server_event", record_server)
+    monkeypatch.setattr(mcp_server, "emit_failure_event", record_failure)
+
+    with pytest.raises(RuntimeError, match="secret startup body") as caught:
+        _run_in_lifespan(lambda: None)
+
+    assert caught.value is failure
+    assert events == [
+        ("server", "starting", None),
+        ("failure", "server", failure, (), None),
+        ("server", "stopped", None),
+    ]
+
+
+def test_missing_enrollment_emits_started_outcome_and_leaves_runtime_inactive(
+    monkeypatch,
+):
+    events = []
+    provider = RecordingProvider()
+
+    def missing_registry():
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", missing_registry)
+    monkeypatch.setattr(
+        mcp_server,
+        "emit_server_event",
+        lambda state, *, outcome=None: events.append((state, outcome))
+        or False,
+    )
+
+    context, _ = _run_in_lifespan(lambda: None)
+
+    assert context == {}
+    assert events == [
+        ("starting", None),
+        ("started", "enrollment_missing"),
+        ("stopped", None),
+    ]
+    with pytest.raises(RuntimeError, match="lifespan is not active"):
+        mcp_server._contract_runtime()
+
+
+def test_malformed_reconciliation_persists_identifier_only_standing(
+    tmp_path, monkeypatch
+):
+    registry = object()
+    provider = RecordingProvider()
+    provider.reconciliation = ReconcileReport(
+        (
+            {
+                "corpus_id": "codex-history",
+                "sources": (
+                    {
+                        "source_id": "machine-uuid",
+                        "members": (
+                            {
+                                "member_id": "member-1",
+                                "episode_count": 0,
+                                "source_standing": "malformed",
+                                "index_standing": "unavailable",
+                            },
+                        ),
+                    },
+                ),
+            },
+        ),
+        9,
+        1.0,
+        False,
+    )
+    event_path = tmp_path / "malformed-events.jsonl"
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(event_path))
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+
+    _run_in_lifespan(lambda: None)
+
+    records = [
+        json.loads(line)
+        for line in event_path.read_text(encoding="utf-8").splitlines()
+    ]
+    reconciliation = next(
+        record
+        for record in records
+        if record["event"] == "reconcile.completed"
+    )
+    assert reconciliation["source_standing"] == "malformed"
+    assert reconciliation["episode_count"] == 0
+    assert "body" not in json.dumps(reconciliation)
 
 
 def test_explicit_sqlite_lifespan_never_connects_to_arango(tmp_path, monkeypatch):

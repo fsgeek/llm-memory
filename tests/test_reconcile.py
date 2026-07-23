@@ -246,6 +246,7 @@ def test_work_budget_validation_and_initial_build_reaches_current(reconciliation
     assert member["integrity"]["basis"] == "full_digest"
     assert member["integrity"]["chain_digest"]
     assert member["integrity"]["audit_offset"] == len(data)
+    assert member["episode_count"] == 2
     assert len(active_documents(db, corpus_id)) == 2
 
 

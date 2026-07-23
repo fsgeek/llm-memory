@@ -1200,6 +1200,7 @@ def _member_standing(
         index_standing = "unavailable"
     return {
         "member_id": member_id,
+        "episode_count": state.get("episode_count", 0),
         "source_standing": source_standing,
         "index_standing": index_standing,
         "freshness": FreshnessStanding.UNAVAILABLE.value if missing else state.get("freshness", FreshnessStanding.UNKNOWN.value),
