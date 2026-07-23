@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
 import re
 import sys
-from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO
 
 from llm_memory.contract import (
     EpisodeReference,
@@ -18,64 +17,139 @@ from llm_memory.contract import (
     SourceStanding,
     validate_corpus_id,
 )
+from llm_memory.machine_identity import normalize_machine_uuid
 
 
-_ALLOWED_EVENTS = frozenset(
-    {
-        "server.starting",
-        "server.started",
-        "server.stopped",
-        "server.failed",
-        "reconcile.completed",
-        "search.completed",
-        "search.failed",
-        "open.completed",
-        "open.failed",
-    }
-)
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
-_CLASS_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_MAX_IDENTIFIER_LENGTH = 128
+_MAX_CORPORA = 100
+_MAX_EPISODE_REFS = 100
 _MAX_EPISODE_REF_LENGTH = 2048
-_MAX_LIST_ITEMS = 100
+_MAX_OPAQUE_IDENTIFIER_LENGTH = 4096
 _MAX_RECORD_BYTES = 8192
-_DIAGNOSTIC_CODES = frozenset(
-    {"server_startup_failed", "contract_search_failed", "contract_open_failed"}
-)
+_CLASS_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SERVER_STATES = frozenset({"starting", "started", "stopped"})
 _OUTCOMES = frozenset({"completed", "enrollment_missing"})
-_STANDINGS = frozenset((*OpenStanding, "unknown"))
 _SOURCE_STANDINGS = frozenset(SourceStanding)
 _INDEX_STANDINGS = frozenset(IndexStanding)
+_OPEN_STANDINGS = frozenset((*OpenStanding, "unknown"))
+_FAILURE_CODES = {
+    "server": "server_startup_failed",
+    "search": "contract_search_failed",
+    "open": "contract_open_failed",
+}
 
 
-def event_log_path(
-    environ: Mapping[str, str] | None = None,
-    home: Path | None = None,
-) -> Path:
-    environ = os.environ if environ is None else environ
-    configured = environ.get("LLM_MEMORY_EVENT_LOG")
+def emit_server_event(state, *, outcome=None) -> bool:
+    try:
+        if state not in _SERVER_STATES:
+            return False
+        fields = {} if outcome is None else {"outcome": _required_enum(outcome, _OUTCOMES)}
+        return _write_envelope(f"server.{state}", fields)
+    except Exception:
+        return False
+
+
+def emit_reconciliation_event(
+    *,
+    corpus_id,
+    source_id,
+    member_id,
+    source_standing,
+    index_standing,
+    episode_count,
+    bytes_read,
+    duration_ms,
+    work_exhausted,
+) -> bool:
+    try:
+        return _write_envelope(
+            "reconcile.completed",
+            {
+                "corpus_ids": [_valid_corpus_id(corpus_id)],
+                "source_id": _correlation_token(source_id),
+                "member_id": _correlation_token(member_id),
+                "source_standing": _required_enum(source_standing, _SOURCE_STANDINGS),
+                "index_standing": _required_enum(index_standing, _INDEX_STANDINGS),
+                "episode_count": _nonnegative_int(episode_count),
+                "bytes_read": _nonnegative_int(bytes_read),
+                "duration_ms": _duration(duration_ms),
+                "work_exhausted": _bool(work_exhausted),
+            },
+        )
+    except Exception:
+        return False
+
+
+def emit_search_event(*, corpus_ids, returned_count, episode_refs) -> bool:
+    try:
+        valid_refs = _episode_refs(episode_refs)
+        return _write_envelope(
+            "search.completed",
+            {
+                "corpus_ids": _corpus_ids(corpus_ids),
+                "returned_count": _nonnegative_int(returned_count),
+                "episode_refs_sha256": hashlib.sha256(
+                    "\n".join(valid_refs).encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+    except Exception:
+        return False
+
+
+def emit_open_event(*, corpus_ids, episode_ref, standing) -> bool:
+    try:
+        return _write_envelope(
+            "open.completed",
+            {
+                "corpus_ids": _corpus_ids(corpus_ids),
+                "episode_ref": _episode_ref(episode_ref),
+                "standing": _required_enum(standing, _OPEN_STANDINGS),
+            },
+        )
+    except Exception:
+        return False
+
+
+def emit_failure_event(phase, exc, *, corpus_ids=(), episode_ref=None) -> bool:
+    try:
+        if phase not in _FAILURE_CODES or not isinstance(exc, BaseException):
+            return False
+        exception_class = type(exc).__name__
+        if _CLASS_NAME_PATTERN.fullmatch(exception_class) is None:
+            return False
+        fields = {
+            "exception_class": exception_class,
+            "diagnostic_code": _FAILURE_CODES[phase],
+        }
+        valid_corpora = _optional_corpus_ids(corpus_ids)
+        if valid_corpora:
+            fields["corpus_ids"] = valid_corpora
+        valid_ref = _optional_episode_ref(episode_ref)
+        if valid_ref is not None:
+            fields["episode_ref"] = valid_ref
+        return _write_envelope(f"{phase}.failed", fields)
+    except Exception:
+        return False
+
+
+def _event_log_path() -> Path:
+    configured = os.environ.get("LLM_MEMORY_EVENT_LOG")
     if configured:
         return Path(configured)
-    return (Path.home() if home is None else home) / ".local/state/llm-memory/events.jsonl"
+    return Path.home() / ".local/state/llm-memory/events.jsonl"
 
 
-def emit_event(
-    event: str,
-    fields: Mapping[str, object],
-    *,
-    path: Path | None = None,
-    stderr: TextIO | None = None,
-) -> bool:
-    _validate_event(event, fields)
-    record = {
-        "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "event": event,
-        **fields,
-    }
-    encoded = _encode_record(record)
-    target = event_log_path() if path is None else path
-    stderr = sys.stderr if stderr is None else stderr
+def _write_envelope(event: str, fields: dict[str, object]) -> bool:
     try:
+        record = {
+            "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "event": event,
+            **fields,
+        }
+        encoded = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > _MAX_RECORD_BYTES:
+            return False
+        target = _event_log_path()
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(target, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         try:
@@ -91,134 +165,98 @@ def emit_event(
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-    except OSError as exc:
-        _report_failure(stderr, exc)
+    except Exception as exc:
+        _report_failure(exc)
         return False
     return True
 
 
-def _validate_event(event: str, fields: Mapping[str, object]) -> None:
-    if not isinstance(event, str) or event not in _ALLOWED_EVENTS:
-        raise ValueError("unsupported operational event")
-    if not isinstance(fields, Mapping):
-        raise ValueError("event fields must be a mapping")
-    unknown = set(fields) - set(_FIELD_VALIDATORS)
-    if unknown:
-        raise ValueError(f"unsupported operational event field: {next(iter(unknown))}")
-    for name, value in fields.items():
-        _FIELD_VALIDATORS[name](value, name)
+def _valid_corpus_id(value) -> str:
+    if not isinstance(value, str):
+        raise ValueError("corpus identifier must be text")
+    return validate_corpus_id(value)
 
 
-def _encode_record(record: dict[str, object]) -> bytes:
-    encoded = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
-    if len(encoded) > _MAX_RECORD_BYTES:
-        raise ValueError("operational event record is too large")
-    return encoded
+def _corpus_ids(values) -> list[str]:
+    if not isinstance(values, (list, tuple)) or len(values) > _MAX_CORPORA:
+        raise ValueError("corpus identifiers must be bounded")
+    return [_valid_corpus_id(value) for value in values]
 
 
-def _validate_identifier(value: object, name: str) -> None:
-    if (
-        not isinstance(value, str)
-        or len(value) > _MAX_IDENTIFIER_LENGTH
-        or _IDENTIFIER_PATTERN.fullmatch(value) is None
-    ):
-        _invalid(name)
-
-
-def _validate_class_name(value: object, name: str) -> None:
-    if (
-        not isinstance(value, str)
-        or len(value) > _MAX_IDENTIFIER_LENGTH
-        or _CLASS_NAME_PATTERN.fullmatch(value) is None
-    ):
-        _invalid(name)
-
-
-def _validate_corpus_ids(value: object, name: str) -> None:
-    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
-        _invalid(name)
-    for corpus_id in value:
-        if not isinstance(corpus_id, str) or len(corpus_id) > _MAX_IDENTIFIER_LENGTH:
-            _invalid(name)
+def _optional_corpus_ids(values) -> list[str]:
+    if not isinstance(values, (list, tuple)) or len(values) > _MAX_CORPORA:
+        return []
+    valid = []
+    for value in values:
         try:
-            validate_corpus_id(corpus_id)
-        except ValueError:
-            _invalid(name)
+            valid.append(_valid_corpus_id(value))
+        except Exception:
+            continue
+    return valid
 
 
-def _validate_episode_ref(value: object, name: str) -> None:
+def _episode_ref(value) -> str:
     if not isinstance(value, str) or len(value) > _MAX_EPISODE_REF_LENGTH:
-        _invalid(name)
+        raise ValueError("episode reference is invalid")
+    EpisodeReference.parse(value)
+    return value
+
+
+def _optional_episode_ref(value) -> str | None:
+    if value is None:
+        return None
     try:
-        EpisodeReference.parse(value)
+        return _episode_ref(value)
+    except Exception:
+        return None
+
+
+def _episode_refs(values) -> list[str]:
+    if not isinstance(values, (list, tuple)) or len(values) > _MAX_EPISODE_REFS:
+        raise ValueError("episode references must be bounded")
+    return [_episode_ref(value) for value in values]
+
+
+def _correlation_token(value) -> str:
+    if not isinstance(value, str) or len(value) > _MAX_OPAQUE_IDENTIFIER_LENGTH:
+        raise ValueError("opaque identifier is invalid")
+    try:
+        return normalize_machine_uuid(value)
     except ValueError:
-        _invalid(name)
+        return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
-def _validate_episode_refs(value: object, name: str) -> None:
-    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
-        _invalid(name)
-    for episode_ref in value:
-        _validate_episode_ref(episode_ref, name)
+def _required_enum(value, allowed: frozenset[str]) -> str:
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError("operational enum is invalid")
+    return value
 
 
-def _validate_enum(values: frozenset[str]) -> Callable[[object, str], None]:
-    def validate(value: object, name: str) -> None:
-        if not isinstance(value, str) or value not in values:
-            _invalid(name)
-
-    return validate
-
-
-def _validate_count(value: object, name: str) -> None:
+def _nonnegative_int(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        _invalid(name)
+        raise ValueError("operational count is invalid")
+    return value
 
 
-def _validate_duration(value: object, name: str) -> None:
+def _duration(value) -> int | float:
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or value < 0
         or not math.isfinite(value)
     ):
-        _invalid(name)
+        raise ValueError("duration is invalid")
+    return value
 
 
-def _validate_bool(value: object, name: str) -> None:
+def _bool(value) -> bool:
     if not isinstance(value, bool):
-        _invalid(name)
+        raise ValueError("boolean is invalid")
+    return value
 
 
-def _invalid(name: str) -> None:
-    raise ValueError(f"invalid operational event field: {name}")
-
-
-_FIELD_VALIDATORS: Mapping[str, Callable[[object, str], None]] = {
-    "adapter": _validate_identifier,
-    "bytes_read": _validate_count,
-    "corpus_ids": _validate_corpus_ids,
-    "diagnostic_code": _validate_enum(_DIAGNOSTIC_CODES),
-    "duration_ms": _validate_duration,
-    "episode_count": _validate_count,
-    "episode_ref": _validate_episode_ref,
-    "episode_refs": _validate_episode_refs,
-    "exception_class": _validate_class_name,
-    "index_standing": _validate_enum(_INDEX_STANDINGS),
-    "member_id": _validate_identifier,
-    "operation_id": _validate_identifier,
-    "outcome": _validate_enum(_OUTCOMES),
-    "provider": _validate_identifier,
-    "returned_count": _validate_count,
-    "source_id": _validate_identifier,
-    "source_standing": _validate_enum(_SOURCE_STANDINGS),
-    "standing": _validate_enum(_STANDINGS),
-    "work_exhausted": _validate_bool,
-}
-
-
-def _report_failure(stderr: TextIO, exc: OSError) -> None:
+def _report_failure(exc: Exception) -> None:
     try:
-        stderr.write(f"operational event write failed: {type(exc).__name__}\n")
+        sys.stderr.write(f"operational event write failed: {type(exc).__name__}\n")
     except Exception:
         pass
