@@ -20,7 +20,7 @@ Create the ignored local file `config/sources.yaml` with contract version 1 and
 one enabled `codex_jsonl` enrollment:
 
 - corpus ID: `codex-history`
-- source ID: `wam-nuc-ubuntu-2204`
+- source ID: the normalized UUID collected from `/etc/machine-id`
 - locator:
   `/home/tony/.codex/sessions/2026/07/22/rollout-2026-07-22T17-50-42-019f8af3-83db-7972-af11-1d6309ad3392.jsonl`
 - boundary version: 1
@@ -29,10 +29,38 @@ one enabled `codex_jsonl` enrollment:
 
 The machine-specific source ID is deliberate. Future machines may join the
 same corpus under distinct source IDs, preserving provenance rather than
-presenting several histories as one indistinguishable stream.
+presenting several histories as one indistinguishable stream. The hostname
+`wam-nuc-ubuntu-2204` is useful as a human-readable diagnostic label but is not
+an identity: hostnames can be reused or changed.
 
 The exact-file locator is also deliberate. Recursive discovery of Codex's
 year/month/day hierarchy is a later product change, not part of this trial.
+
+## Normalized machine identity
+
+Establish machine identity before indexing any live episode because `source_id`
+is encoded into episode references, reconciliation keys, and supersession
+observations. Replacing a hostname source ID with a UUID after dog-fooding would
+create a new logical source and strand the earlier identity.
+
+Use a small collector/normalizer boundary inspired by Indaleko, without
+importing its machine-configuration subsystem:
+
+1. A platform collector obtains the platform-native stable machine identifier.
+   This trial implements only Linux by reading `/etc/machine-id`.
+2. A platform-independent normalizer parses the collected value as a UUID and
+   emits the canonical lowercase, hyphenated UUID string.
+3. Enrollment uses that canonical value as `source_id`.
+
+The normalizer is the contract shared with future collectors. Windows and macOS
+collectors, when needed, must feed their native identifiers through the same
+normalizer and produce the same canonical representation. Machine hardware,
+software, and configuration history are explicitly outside this trial and can
+be retrofitted without changing episode identity.
+
+Collector or normalization failure is fatal before enrollment or
+reconciliation: the system must not silently fall back to a hostname, random
+UUID, or other unstable identifier.
 
 ## Native Codex adapter prerequisite
 
@@ -115,27 +143,66 @@ their current boundary:
   is removed only through an explicit lifecycle decision.
 - The authoritative Codex JSONL file is never edited by this workflow.
 
+## Persistent operational observability
+
+The trial needs durable evidence about how the memory tools behave, not a
+second copy of the information flowing through them. Append structured JSONL
+events to a configured local path, initially
+`/home/tony/.local/state/llm-memory/events.jsonl`.
+
+Record events for:
+
+- MCP server startup and shutdown;
+- provider and enrollment initialization;
+- reconciliation start and completion, including standing, byte progress, and
+  episode counts;
+- search and open operations, identified by corpus, source, session, episode
+  reference, and outcome; and
+- caught startup, provider, source, reconciliation, search, and open errors.
+
+Events may contain timestamps, operation names, standing, counts, durations,
+machine/source identifiers, corpus identifiers, member identifiers, episode
+references, exception classes, and allowlisted content-free diagnostic codes.
+They must not persist arbitrary exception messages, user or assistant prose,
+snippets, source record bodies, credentials, or database configuration. When a
+conversation matters, its existing identifiers are the observation.
+
+Each event is one append-only JSON line in a user-private file (`0o600`). Logging
+must not mutate authoritative sources or derived memory state. A logging failure
+is written to stderr and must not falsify the operation's standing or replace
+its actual result. Detailed exception text remains transient on stderr rather
+than being copied into the persistent event stream.
+
 ## Verification and success criteria
 
 Before restart:
 
-1. Add adapter tests for native session/user/agent extraction, deterministic
+1. Test Linux collection and platform-independent normalization with valid,
+   malformed, missing, and noncanonical machine identifiers; verify failures
+   never fall back to another identity.
+2. Add adapter tests for native session/user/agent extraction, deterministic
    sequence identity, ignored non-conversation records, malformed lookalikes,
    and equivalence between full scanning and bounded resume.
-2. Load `config/sources.yaml` through `load_registry()` and verify exactly one
-   enabled source with the intended corpus, source identity, adapter, and path.
-3. Run the complete `llm-memory` test suite against the configured ArangoDB.
-4. Reconcile the enrolled source and require `AVAILABLE` source standing with a
+3. Test operational events for successful and failed operations; verify event
+   records contain identifiers and standing but no conversational content or
+   database credentials.
+4. Load `config/sources.yaml` through `load_registry()` and verify exactly one
+   enabled source whose `source_id` equals the normalized `/etc/machine-id`, with
+   the intended corpus, adapter, and path.
+5. Run the complete `llm-memory` test suite against the configured ArangoDB.
+6. Reconcile the enrolled source and require `AVAILABLE` source standing with a
    nonzero episode count. Merely starting the server without crashing is not
    sufficient.
-5. Start the MCP server and verify successful initialization without modifying
+7. Verify the event log persistently records one successful reconciliation and
+   one controlled malformed-source failure without recording source content.
+8. Start the MCP server and verify successful initialization without modifying
    the source.
 
 After restart:
 
 1. Confirm `llm-memory` appears as a connected MCP server.
 2. Search `codex-history` for `Will you permit me to wander with you?`.
-3. Confirm a result identifies source `wam-nuc-ubuntu-2204`.
+3. Confirm a result identifies the normalized machine UUID source.
 4. Open that episode and confirm the full user/assistant exchange is returned
    with verified source-backed standing.
 
@@ -151,5 +218,20 @@ alone is insufficient.
   servers that share the Arango provider.
 - Define authorization, collision, retention, and trust rules for an ayllu of
   instances sharing memory.
-- Decide how curated `qhaway` memory and episodic `llm-memory` cooperate without
-  collapsing their different authority models.
+- Add Windows and macOS native-identity collectors when machines on those
+  platforms join; keep their output behind the same UUID normalizer.
+- Revisit curated `qhaway` memory and episodic `llm-memory` together after the
+  dog-food evidence exists. A graph/vector-capable shared store may change the
+  natural architecture enough to justify major redesign or retirement rather
+  than incremental integration.
+
+## Learning-investment constraint
+
+This implementation is an experiment whose durable outputs are evidence and
+clearly bounded contracts. Add only what is required for the end-to-end reach:
+one Linux identity collector, one common UUID normalizer, one native Codex
+adapter, one enrollment, project-scoped MCP wiring, and identifier-only event
+logging. Do not build general machine configuration, LAN service deployment,
+cross-platform collectors, recursive discovery, ranking enhancements, vector
+retrieval, or a `qhaway` integration in this round. Those may be throw-away work
+until actual use tells us which system boundary deserves to survive.
