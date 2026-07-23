@@ -194,6 +194,53 @@ def test_codex_ignores_blank_and_nonconversation_events(tmp_path):
     assert all(episode.body.adapter_fields == {} for episode in result.episodes)
 
 
+@pytest.mark.parametrize(
+    "malformed_record",
+    [
+        {"type": "session_meta", "payload": None},
+        {"type": "event_msg", "payload": []},
+    ],
+)
+def test_codex_rejects_non_object_payload_for_relevant_records(
+    tmp_path, malformed_record
+):
+    path = tmp_path / "rollout.jsonl"
+    valid_data = write_jsonl(path, codex_records())
+    write_jsonl(path, codex_records() + [malformed_record])
+
+    result = scan(path, "codex_jsonl")
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert len(result.episodes) == 2
+    assert result.error_position == len(valid_data)
+
+
+def test_codex_rejects_wrong_typed_user_timestamp_without_mutating_cursor(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    malformed_user = {
+        "timestamp": 42,
+        "type": "event_msg",
+        "payload": {"type": "user_message", "message": "invalid update"},
+    }
+    valid_data = write_jsonl(path, codex_records())
+    write_jsonl(path, codex_records() + [malformed_user])
+    declared = enrollment("codex_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+
+    result = adapter.scan_chunk(declared, member, None, 2**63 - 1)
+
+    assert result.source_standing is SourceStanding.MALFORMED
+    assert result.error_position == len(valid_data)
+    assert result.next_cursor.adapter_state == {
+        "native_session_id": "native-codex-session",
+        "latest_user": "wander with me",
+        "latest_user_ts": "2026-07-22T17:51:00Z",
+        "sequence_by_session": {"native-codex-session": 2},
+        "recognized_conversation": True,
+    }
+
+
 def test_codex_bounded_resume_matches_full_scan(tmp_path):
     path = tmp_path / "rollout.jsonl"
     write_jsonl(path, codex_records())

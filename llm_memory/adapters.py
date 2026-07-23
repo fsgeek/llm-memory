@@ -602,17 +602,18 @@ class CodexAdapter:
         ) -> EpisodeRecord | None:
             nonlocal native_session_id, latest_user, latest_user_ts
             nonlocal recognized_conversation
+            record_type = record.get("type")
+            if record_type not in {"session_meta", "event_msg"}:
+                return None
             payload = record.get("payload")
             if not isinstance(payload, dict):
-                return None
-            if record.get("type") == "session_meta":
+                raise ValueError("Codex conversational payload must be an object")
+            if record_type == "session_meta":
                 session = payload.get("session_id")
                 if not isinstance(session, str) or not session:
                     raise ValueError("Codex session_meta session_id is required")
                 native_session_id = session
                 state["native_session_id"] = session
-                return None
-            if record.get("type") != "event_msg":
                 return None
             event_type = payload.get("type")
             message = payload.get("message")
@@ -624,14 +625,17 @@ class CodexAdapter:
                 return None
             if not isinstance(native_session_id, str) or not native_session_id:
                 raise ValueError("Codex conversation requires prior session_meta")
-            recognized_conversation = True
-            state["recognized_conversation"] = True
             if event_type == "user_message":
+                user_timestamp = _optional_text(record, "timestamp")
+                recognized_conversation = True
+                state["recognized_conversation"] = True
                 latest_user = message
-                latest_user_ts = record.get("timestamp") or ""
+                latest_user_ts = user_timestamp
                 state["latest_user"] = latest_user
                 state["latest_user_ts"] = latest_user_ts
                 return None
+            recognized_conversation = True
+            state["recognized_conversation"] = True
             sequence = sequence_by_session.get(native_session_id, 0)
             body = EpisodeBody(
                 timestamp=_optional_text(record, "timestamp"),
