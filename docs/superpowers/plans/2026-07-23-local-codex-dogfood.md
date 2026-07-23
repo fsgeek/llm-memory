@@ -22,6 +22,40 @@
 - Do not add recursive session discovery, LAN serving, ranking/vector work, or `qhaway` integration.
 - Commit source/tests in `llm-memory`; keep `config/sources.yaml`, `config/db-config.ini`, the event log, and qhaway's machine-local `.codex/config.toml` uncommitted.
 
+## Amendment 2026-07-23: Typed Operational Events Supersede Generic Mappings
+
+Task 3's originally planned public `emit_event(event, fields)` interface cannot
+enforce the no-content boundary: an allowed string field can still carry prose
+or a credential, and strict validation can replace the operation result it was
+supposed to observe. Replace that generic public interface with typed event
+functions whose arguments come from the operation's authoritative contract:
+
+- `emit_server_event(state, *, outcome=None) -> bool`
+- `emit_reconciliation_event(*, corpus_id, source_id, member_id,
+  source_standing, index_standing, episode_count, bytes_read, duration_ms,
+  work_exhausted) -> bool`
+- `emit_search_event(*, corpus_ids, returned_count, episode_refs) -> bool`
+- `emit_open_event(*, corpus_ids, episode_ref, standing) -> bool`
+- `emit_failure_event(phase, exc, *, corpus_ids=(), episode_ref=None) -> bool`
+
+The constructors create an internal event envelope; callers cannot supply
+arbitrary field names or exception text. Provider and adapter values, when
+recorded, come from closed program vocabularies. Source/member identifiers are
+normalized to correlation-safe values: preserve the canonical machine UUID;
+otherwise persist a deterministic SHA-256 correlation token rather than the raw
+opaque string. Valid episode references may be logged by the open operation.
+Search events persist returned count plus a deterministic digest of the ordered
+result references, not an unbounded list of references. Failure constructors
+derive exception class from `type(exc).__name__` and omit malformed corpus or
+episode identifiers instead of raising while observing their validation error.
+
+Every public emitter and the private writer are non-escaping: invalid arguments,
+serialization/size errors, filesystem/locking/short-write failures, and stderr
+sink failures return `False` and never replace the observed operation's result or
+exception. Short writes retain the cooperative lock-and-rollback guarantee.
+Task 4 must call only these typed functions. This amendment supersedes Task 3's
+generic mapping examples and Task 4's direct `emit_event` examples below.
+
 ---
 
 ## File Structure
