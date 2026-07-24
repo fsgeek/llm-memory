@@ -24,6 +24,10 @@ The authoritative open result contained the searched invitation and its paired
 response. Conversation content is intentionally omitted here; the episode
 reference is the durable identifier.
 
+The episode count is a point-in-time startup observation, not a frozen corpus
+size; the authoritative rollout can continue growing as later turns are
+recorded.
+
 ## Operational evidence
 
 The persistent event log contains the post-restart `server.started`,
@@ -31,6 +35,18 @@ The persistent event log contains the post-restart `server.started`,
 digest of returned references and the open event records the exact episode
 reference. These records contain identifiers and mechanical status only; they
 contain no query, snippet, conversation body, or response fields.
+
+## Controlled malformed-source evidence
+
+After the post-restart proof, an isolated SQLite trial reconciled a temporary
+synthetic Codex lookalike containing no conversational records. It produced
+source standing `malformed`, index standing `unavailable`, and episode count
+zero. The durable private event log records that result under corpus
+`malformed-trial`, with deterministic hashed source/member identifiers. The
+event contains no source body, locator, exception text, or credential field.
+The temporary source, enrollment, runner, and SQLite database were removed
+afterward; only the content-free operational evidence remains. The live
+`codex-history` enrollment was neither repointed nor modified.
 
 ## Qualitative result
 

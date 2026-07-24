@@ -501,6 +501,14 @@ def test_contract_lifespan_and_tools_call_typed_identifier_only_emitters(
         calls.append(("reconciliation", fields))
         return False
 
+    def record_initialization(component, *, outcome):
+        calls.append(("initialization", component, outcome))
+        return False
+
+    def record_reconciliation_started(**fields):
+        calls.append(("reconciliation_started", fields))
+        return False
+
     def record_search(**fields):
         calls.append(("search", fields))
         return False
@@ -512,6 +520,14 @@ def test_contract_lifespan_and_tools_call_typed_identifier_only_emitters(
     monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
     monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
     monkeypatch.setattr(mcp_server, "emit_server_event", record_server)
+    monkeypatch.setattr(
+        mcp_server, "emit_initialization_event", record_initialization
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "emit_reconciliation_started",
+        record_reconciliation_started,
+    )
     monkeypatch.setattr(
         mcp_server, "emit_reconciliation_event", record_reconciliation
     )
@@ -535,6 +551,12 @@ def test_contract_lifespan_and_tools_call_typed_identifier_only_emitters(
     assert responses == (search_response, opened_response)
     assert calls == [
         ("server", "starting", None),
+        ("initialization", "provider", "initialized"),
+        ("initialization", "enrollment", "initialized"),
+        (
+            "reconciliation_started",
+            {"corpus_count": 0, "source_count": 0},
+        ),
         (
             "reconciliation",
             {
@@ -647,9 +669,91 @@ def test_failed_startup_calls_typed_failure_and_still_stops(monkeypatch):
     assert caught.value is failure
     assert events == [
         ("server", "starting", None),
-        ("failure", "server", failure, (), None),
+        ("failure", "provider", failure, (), None),
         ("server", "stopped", None),
     ]
+
+
+def test_startup_emitter_base_exception_cannot_strand_lifespan_state(monkeypatch):
+    provider = RecordingProvider()
+    registry = object()
+    emissions = 0
+
+    def interrupt_once(_state, *, outcome=None):
+        nonlocal emissions
+        emissions += 1
+        if emissions == 1:
+            raise KeyboardInterrupt()
+        return False
+
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+    monkeypatch.setattr(mcp_server, "emit_server_event", interrupt_once)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_in_lifespan(lambda: None)
+
+    context, _ = _run_in_lifespan(lambda: None)
+    assert context == {"startup_reconciliation": provider.reconciliation}
+
+
+def test_empty_registry_still_emits_reconciliation_start(monkeypatch):
+    from llm_memory.enrollment import EnrollmentRegistry
+
+    provider = RecordingProvider()
+    registry = EnrollmentRegistry(())
+    calls = []
+    monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+    monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+    monkeypatch.setattr(
+        mcp_server,
+        "emit_reconciliation_started",
+        lambda **fields: calls.append(fields) or False,
+    )
+
+    context, _ = _run_in_lifespan(lambda: None)
+
+    assert context == {"startup_reconciliation": provider.reconciliation}
+    assert calls == [{"corpus_count": 0, "source_count": 0}]
+
+
+@pytest.mark.parametrize("phase", ["provider", "enrollment", "reconciliation"])
+def test_startup_failure_is_emitted_at_its_specific_phase(monkeypatch, phase):
+    failure = RuntimeError("credential=do-not-persist")
+    provider = RecordingProvider()
+    registry = object()
+    calls = []
+
+    if phase == "provider":
+        monkeypatch.setattr(
+            mcp_server,
+            "load_provider",
+            lambda: (_ for _ in ()).throw(failure),
+        )
+    else:
+        monkeypatch.setattr(mcp_server, "load_provider", lambda: provider)
+        if phase == "enrollment":
+            monkeypatch.setattr(
+                mcp_server,
+                "load_registry",
+                lambda: (_ for _ in ()).throw(failure),
+            )
+        else:
+            monkeypatch.setattr(mcp_server, "load_registry", lambda: registry)
+            provider.reconcile = lambda *_args: (_ for _ in ()).throw(failure)
+    monkeypatch.setattr(
+        mcp_server,
+        "emit_failure_event",
+        lambda observed_phase, exc, **_fields: calls.append(
+            (observed_phase, exc)
+        )
+        or False,
+    )
+
+    with pytest.raises(RuntimeError, match="do-not-persist"):
+        _run_in_lifespan(lambda: None)
+
+    assert calls == [(phase, failure)]
 
 
 def test_missing_enrollment_emits_started_outcome_and_leaves_runtime_inactive(

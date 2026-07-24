@@ -31,6 +31,8 @@ supposed to observe. Replace that generic public interface with typed event
 functions whose arguments come from the operation's authoritative contract:
 
 - `emit_server_event(state, *, outcome=None) -> bool`
+- `emit_initialization_event(component, *, outcome) -> bool`
+- `emit_reconciliation_started(*, corpus_count, source_count) -> bool`
 - `emit_reconciliation_event(*, corpus_id, source_id, member_id,
   source_standing, index_standing, episode_count, bytes_read, duration_ms,
   work_exhausted) -> bool`
@@ -55,6 +57,17 @@ sink failures return `False` and never replace the observed operation's result o
 exception. Short writes retain the cooperative lock-and-rollback guarantee.
 Task 4 must call only these typed functions. This amendment supersedes Task 3's
 generic mapping examples and Task 4's direct `emit_event` examples below.
+
+The 2026-07-24 coverage amendment closes gaps left by the original Task 4
+instrumentation. `component` is limited to `provider` or `enrollment`, and its
+outcome is limited to `initialized` or (for enrollment only) `missing`.
+Reconciliation emits a declaration-count start summary before provider work,
+including a valid all-zero summary for an empty registry (where no per-member
+completion can follow), then retains per-member completion events. Startup
+exceptions are classified at their actual closed phase:
+`provider`, `enrollment`, or `reconciliation`, with fixed diagnostic codes and
+exception class only. No emitter accepts provider configuration, locators,
+record content, query text, arbitrary exception messages, or arbitrary fields.
 
 ---
 

@@ -260,6 +260,77 @@ def test_codex_bounded_resume_matches_full_scan(tmp_path):
     ]
 
 
+def test_codex_full_scan_drops_agent_only_turn_and_resets_user_on_session_change(
+    tmp_path,
+):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(
+        path,
+        codex_records()[:2]
+        + [
+            {
+                "type": "session_meta",
+                "payload": {"session_id": "second-session"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "must not inherit the prior user's words",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "fresh user"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "fresh reply"},
+            },
+        ],
+    )
+
+    result = scan(path, "codex_jsonl")
+
+    assert [(episode.body.user_message, episode.body.response) for episode in result.episodes] == [
+        ("fresh user", "fresh reply")
+    ]
+    assert result.episodes[0].identity.reference.event_token == "0"
+
+
+def test_codex_bounded_scan_drops_agent_only_turn_after_session_change(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    write_jsonl(
+        path,
+        [
+            {"type": "session_meta", "payload": {"session_id": "first"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "old user"},
+            },
+            {"type": "session_meta", "payload": {"session_id": "second"}},
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "agent only"},
+            },
+        ],
+    )
+    declared = enrollment("codex_jsonl", path)
+    adapter = get_adapter(declared.adapter)
+    member = adapter.members(declared)[0]
+    cursor = None
+    episodes = []
+
+    while cursor is None or cursor.byte_offset < path.stat().st_size:
+        chunk = adapter.scan_chunk(declared, member, cursor, 1)
+        episodes.extend(chunk.episodes)
+        cursor = chunk.next_cursor
+
+    assert episodes == []
+    assert cursor.adapter_state["native_session_id"] == "second"
+    assert cursor.adapter_state["latest_user"] == ""
+
+
 @pytest.mark.parametrize(
     "records",
     [

@@ -20,8 +20,10 @@ from llm_memory.db import get_database
 from llm_memory.enrollment import EnrollmentRegistry, load_registry
 from llm_memory.observability import (
     emit_failure_event,
+    emit_initialization_event,
     emit_open_event,
     emit_reconciliation_event,
+    emit_reconciliation_started,
     emit_search_event,
     emit_server_event,
 )
@@ -87,6 +89,17 @@ def _emit_reconciliation(report) -> None:
                 )
 
 
+def _registry_counts(registry: object) -> tuple[int, int]:
+    sources = tuple(getattr(registry, "sources", ()))
+    enabled_sources = tuple(
+        source for source in sources if getattr(source, "enabled", True)
+    )
+    return (
+        len({source.corpus_id for source in enabled_sources}),
+        len(enabled_sources),
+    )
+
+
 @asynccontextmanager
 async def _lifespan(_server) -> AsyncIterator[dict]:
     global _lifespan_active, _selected_provider, _selected_registry
@@ -94,22 +107,38 @@ async def _lifespan(_server) -> AsyncIterator[dict]:
     if _lifespan_active:
         raise RuntimeError("episodic provider lifespan is already active")
     _lifespan_active = True
-    emit_server_event("starting")
     try:
+        emit_server_event("starting")
         try:
             provider = load_provider()
             provider.ensure()
+        except BaseException as exc:
+            emit_failure_event("provider", exc)
+            raise
+        emit_initialization_event("provider", outcome="initialized")
+        try:
             try:
                 registry = load_registry()
             except FileNotFoundError:
                 registry = None
-            if registry is not None:
-                report = provider.reconcile(registry, _budget())
-                _emit_reconciliation(report)
-                _selected_provider, _selected_registry = provider, registry
         except BaseException as exc:
-            emit_failure_event("server", exc)
+            emit_failure_event("enrollment", exc)
             raise
+        if registry is None:
+            emit_initialization_event("enrollment", outcome="missing")
+        else:
+            emit_initialization_event("enrollment", outcome="initialized")
+            corpus_count, source_count = _registry_counts(registry)
+            emit_reconciliation_started(
+                corpus_count=corpus_count, source_count=source_count
+            )
+            try:
+                report = provider.reconcile(registry, _budget())
+            except BaseException as exc:
+                emit_failure_event("reconciliation", exc)
+                raise
+            _emit_reconciliation(report)
+            _selected_provider, _selected_registry = provider, registry
         if registry is None:
             emit_server_event("started", outcome="enrollment_missing")
             yield {}

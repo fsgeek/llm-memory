@@ -612,6 +612,11 @@ class CodexAdapter:
                 session = payload.get("session_id")
                 if not isinstance(session, str) or not session:
                     raise ValueError("Codex session_meta session_id is required")
+                if session != native_session_id:
+                    latest_user = ""
+                    latest_user_ts = ""
+                    state["latest_user"] = ""
+                    state["latest_user_ts"] = ""
                 native_session_id = session
                 state["native_session_id"] = session
                 return None
@@ -634,8 +639,8 @@ class CodexAdapter:
                 state["latest_user"] = latest_user
                 state["latest_user_ts"] = latest_user_ts
                 return None
-            recognized_conversation = True
-            state["recognized_conversation"] = True
+            if not latest_user.strip():
+                return None
             sequence = sequence_by_session.get(native_session_id, 0)
             body = EpisodeBody(
                 timestamp=_optional_text(record, "timestamp"),

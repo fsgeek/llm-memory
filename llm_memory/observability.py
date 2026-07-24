@@ -28,11 +28,18 @@ _MAX_RECORD_BYTES = 8192
 _CLASS_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SERVER_STATES = frozenset({"starting", "started", "stopped"})
 _OUTCOMES = frozenset({"completed", "enrollment_missing"})
+_INITIALIZATION_OUTCOMES = {
+    "provider": frozenset({"initialized"}),
+    "enrollment": frozenset({"initialized", "missing"}),
+}
 _SOURCE_STANDINGS = frozenset(SourceStanding)
 _INDEX_STANDINGS = frozenset(IndexStanding)
 _OPEN_STANDINGS = frozenset((*OpenStanding, "unknown"))
 _FAILURE_CODES = {
     "server": "server_startup_failed",
+    "provider": "provider_initialization_failed",
+    "enrollment": "enrollment_initialization_failed",
+    "reconciliation": "reconciliation_failed",
     "search": "contract_search_failed",
     "open": "contract_open_failed",
 }
@@ -44,7 +51,33 @@ def emit_server_event(state, *, outcome=None) -> bool:
             return False
         fields = {} if outcome is None else {"outcome": _required_enum(outcome, _OUTCOMES)}
         return _write_envelope(f"server.{state}", fields)
-    except Exception:
+    except BaseException:
+        return False
+
+
+def emit_initialization_event(component, *, outcome) -> bool:
+    try:
+        allowed_outcomes = _INITIALIZATION_OUTCOMES.get(component)
+        if allowed_outcomes is None:
+            return False
+        valid_outcome = _required_enum(outcome, allowed_outcomes)
+        return _write_envelope(
+            f"{component}.initialized", {"outcome": valid_outcome}
+        )
+    except BaseException:
+        return False
+
+
+def emit_reconciliation_started(*, corpus_count, source_count) -> bool:
+    try:
+        return _write_envelope(
+            "reconcile.started",
+            {
+                "corpus_count": _nonnegative_int(corpus_count),
+                "source_count": _nonnegative_int(source_count),
+            },
+        )
+    except BaseException:
         return False
 
 
@@ -75,7 +108,7 @@ def emit_reconciliation_event(
                 "work_exhausted": _bool(work_exhausted),
             },
         )
-    except Exception:
+    except BaseException:
         return False
 
 
@@ -92,7 +125,7 @@ def emit_search_event(*, corpus_ids, returned_count, episode_refs) -> bool:
                 ).hexdigest(),
             },
         )
-    except Exception:
+    except BaseException:
         return False
 
 
@@ -106,7 +139,7 @@ def emit_open_event(*, corpus_ids, episode_ref, standing) -> bool:
                 "standing": _required_enum(standing, _OPEN_STANDINGS),
             },
         )
-    except Exception:
+    except BaseException:
         return False
 
 
@@ -128,7 +161,7 @@ def emit_failure_event(phase, exc, *, corpus_ids=(), episode_ref=None) -> bool:
         if valid_ref is not None:
             fields["episode_ref"] = valid_ref
         return _write_envelope(f"{phase}.failed", fields)
-    except Exception:
+    except BaseException:
         return False
 
 
@@ -165,7 +198,7 @@ def _write_envelope(event: str, fields: dict[str, object]) -> bool:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-    except Exception as exc:
+    except BaseException as exc:
         _report_failure(exc)
         return False
     return True
@@ -221,9 +254,12 @@ def _correlation_token(value) -> str:
     if not isinstance(value, str) or len(value) > _MAX_OPAQUE_IDENTIFIER_LENGTH:
         raise ValueError("opaque identifier is invalid")
     try:
-        return normalize_machine_uuid(value)
+        normalized = normalize_machine_uuid(value)
     except ValueError:
         return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+    if normalized == value:
+        return value
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def _required_enum(value, allowed: frozenset[str]) -> str:
@@ -255,8 +291,8 @@ def _bool(value) -> bool:
     return value
 
 
-def _report_failure(exc: Exception) -> None:
+def _report_failure(exc: BaseException) -> None:
     try:
         sys.stderr.write(f"operational event write failed: {type(exc).__name__}\n")
-    except Exception:
+    except BaseException:
         pass

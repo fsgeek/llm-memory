@@ -173,6 +173,17 @@ is written to stderr and must not falsify the operation's standing or replace
 its actual result. Detailed exception text remains transient on stderr rather
 than being copied into the persistent event stream.
 
+### Closed operational phase coverage amendment (2026-07-24)
+
+The typed boundary records provider and enrollment initialization as distinct
+closed-vocabulary phases, followed by one reconciliation-start summary even
+when the registry has zero members. Reconciliation completion remains one
+identifier-only record per member. Provider, enrollment, and reconciliation
+exceptions use distinct fixed diagnostic codes; they are not collapsed into a
+generic startup failure. These additions carry only lifecycle outcomes and
+counts, never provider configuration, enrollment locators, exception text, or
+source content.
+
 ## Verification and success criteria
 
 Before restart:

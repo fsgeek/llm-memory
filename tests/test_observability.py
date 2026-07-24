@@ -90,6 +90,87 @@ def test_reconciliation_preserves_a_canonical_machine_uuid(tmp_path, monkeypatch
     assert json.loads(path.read_text(encoding="utf-8"))["source_id"] == machine_uuid
 
 
+def test_closed_initialization_and_empty_reconciliation_start_events(
+    tmp_path, monkeypatch
+):
+    path = _event_records(tmp_path, monkeypatch)
+
+    assert observability.emit_initialization_event(
+        "provider", outcome="initialized"
+    )
+    assert observability.emit_initialization_event(
+        "enrollment", outcome="missing"
+    )
+    assert observability.emit_reconciliation_started(
+        corpus_count=0, source_count=0
+    )
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [(record["event"], record.get("outcome")) for record in records] == [
+        ("provider.initialized", "initialized"),
+        ("enrollment.initialized", "missing"),
+        ("reconcile.started", None),
+    ]
+    assert records[-1]["corpus_count"] == 0
+    assert records[-1]["source_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("phase", "diagnostic_code"),
+    [
+        ("provider", "provider_initialization_failed"),
+        ("enrollment", "enrollment_initialization_failed"),
+        ("reconciliation", "reconciliation_failed"),
+    ],
+)
+def test_startup_phase_failures_use_distinct_content_free_codes(
+    tmp_path, monkeypatch, phase, diagnostic_code
+):
+    path = _event_records(tmp_path, monkeypatch)
+    secret = "credential=do-not-persist"
+
+    assert observability.emit_failure_event(phase, RuntimeError(secret))
+
+    serialized = path.read_text(encoding="utf-8")
+    record = json.loads(serialized)
+    assert secret not in serialized
+    assert record["event"] == f"{phase}.failed"
+    assert record["exception_class"] == "RuntimeError"
+    assert record["diagnostic_code"] == diagnostic_code
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "E8C598AE-711B-42B5-B963-EB35FC946D2B",
+        "e8c598ae711b42b5b963eb35fc946d2b",
+        " e8c598ae-711b-42b5-b963-eb35fc946d2b ",
+        "0123456789abcdef0123456789abcdef",
+    ],
+)
+def test_reconciliation_hashes_uuid_lookalikes_instead_of_normalizing_them(
+    tmp_path, monkeypatch, identifier
+):
+    path = _event_records(tmp_path, monkeypatch)
+
+    assert observability.emit_reconciliation_event(
+        corpus_id="codex-history",
+        source_id=identifier,
+        member_id="member-1",
+        source_standing="available",
+        index_standing="available",
+        episode_count=0,
+        bytes_read=0,
+        duration_ms=0,
+        work_exhausted=False,
+    )
+
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["source_id"] == (
+        f"sha256:{hashlib.sha256(identifier.encode()).hexdigest()}"
+    )
+
+
 def test_search_summarizes_one_hundred_near_limit_references_with_a_digest(tmp_path, monkeypatch):
     path = _event_records(tmp_path, monkeypatch)
     refs = [_episode_ref(str(index), session_length=800) for index in range(100)]
@@ -196,6 +277,37 @@ def test_throwing_stderr_sink_does_not_escape_a_write_failure(tmp_path, monkeypa
             raise RuntimeError("stderr is closed")
 
     monkeypatch.setattr(observability.sys, "stderr", ThrowingSink())
+    assert observability.emit_server_event("started") is False
+
+
+def test_typed_emitter_suppresses_keyboard_interrupt_from_private_writer(monkeypatch):
+    monkeypatch.setattr(
+        observability,
+        "_write_envelope",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert observability.emit_server_event("started") is False
+
+
+def test_private_writer_suppresses_keyboard_interrupt_from_dependency(monkeypatch):
+    monkeypatch.setattr(
+        observability.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert observability.emit_server_event("started") is False
+
+
+def test_failure_report_suppresses_keyboard_interrupt_from_stderr(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(tmp_path))
+
+    class InterruptingSink:
+        def write(self, _message):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(observability.sys, "stderr", InterruptingSink())
     assert observability.emit_server_event("started") is False
 
 
