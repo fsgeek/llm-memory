@@ -22,16 +22,18 @@ Successful.
 
 - Returned count: `10`.
 - Open standing: `available`.
-- Exact Claude episode reference: `episode://claude-history/NDI4MDM4YjItMDYzYi01ZTUyLTk1MTMtMGM2YjkzNDkwZjlh.ZmI2MTk4MjMtMzE1Yy00MzI2LTg0ZmYtNzViZTUxMmNjNDkw/MQ.MQ.MGQ2ODIzNzgtMTkwMC00ZjU5LThjMmItMzExZDI3N2I3Mzk5.ZTAzZjM0ZThkYTMxMzRjOWNjOWM3MTdiM2NlYzQ1N2ExMTA1N2MzMzJjZDRhMzc0NDNhMTZkYTQ5ZmU2NTFmNw`.
+- Exact Claude episode reference: `episode://claude-history/NDI4MDM4YjItMDYzYi01ZTUyLTk1MTMtMGM2YjkzNDkwZjlh.YzU5YjQzZTgtZGI2MC00ZmZiLWFiMTctMDVjNTI3MzIwMGYy/MQ.MQ.ZWRmOTYwNzEtMDI5Zi00OTE3LWJlZTMtOWFhMTE4NWNiNTAz.ZWMxMzkwOGU3OWIwYTU3OTNhOGUwM2NhOTlhOGZhNzJhNTUyMzBiMWQ1NDBkYTk2ZDBkNzljZTVkNTgxMzViNA`.
 - Claude provenance source ID: `428038b2-063b-5e52-9513-0c6b93490f9a`.
 
 ## Privacy and operational evidence
 
-- Recent event names: `enrollment.initialized`, `open.completed`, `provider.initialized`, `reconcile.completed`, `reconcile.started`, `search.completed`, `server.started`, and `server.starting`.
-- The recent window contained three `search.completed` and three `open.completed` events, with identifier evidence covering both corpus directions.
+- A byte boundary was captured immediately before each restarted client's explicit search/open rerun. Each resulting bounded suffix contained exactly two complete JSONL records: one `search.completed` and one `open.completed`; the opened reference was copied verbatim from that rerun's first search result.
+- Each search record was validated against the closed field set `event`, `ts`, `corpus_ids`, `episode_refs_sha256`, and `returned_count`. Each open record was validated against the closed field set `event`, `ts`, `corpus_ids`, `episode_ref`, and `standing`.
+- All values were constrained recursively: corpus lists contained only valid identifiers, timestamps were valid UTC forms, reference digests were lowercase SHA-256 values, counts were nonnegative integers, episode references were canonical and encoded the expected corpus and provenance source, and open standings belonged to the contract enum. Duplicate or extra keys and unconstrained nested values were rejected.
+- Both bounded suffixes matched their expected corpus, provenance source, exact available open reference, and direction.
 - Event-log mode: `0600`.
-- No `query`, `snippet`, `body`, `user_message`, `response`, `exception_message`, `password`, `access_token`, or `refresh_token` fields were present in the validated window.
-- Fixed diagnostic code: none observed in the validated window.
+- Because validation accepted only those closed schemas, neither suffix could contain query, snippet, episode-body, response, credential, exception-message, or other free-text fields.
+- No failure event or fixed diagnostic code occurred in either bounded suffix.
 
 ## Qualitative usefulness
 
