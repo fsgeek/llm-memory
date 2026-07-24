@@ -51,11 +51,23 @@ The ignored local `config/sources.yaml` gains one enabled source:
 
 The existing Codex source remains byte-for-byte unchanged.
 
-Claude Code receives a machine-local, project-scoped stdio MCP registration
-for the stable `/home/tony/projects/llm-memory` checkout. Configuration is
+Claude Code receives a machine-local stdio MCP registration, created with
+`claude mcp add --scope local`, for the stable
+`/home/tony/projects/llm-memory` checkout. The `local` scope is intentional: it
+must not create or commit a repository-level `.mcp.json`. Configuration is
 created through Claude's MCP CLI rather than by editing user credential or
-state files. Only `search_history` and `open_episode` are needed for the trial.
-Codex retains its existing project-scoped MCP configuration.
+state files. Codex retains its existing project-scoped MCP configuration.
+
+Claude's MCP registration has no per-server tool allowlist, so it exposes all
+four tools currently published by `llm-memory`: `search`, `recall`,
+`search_history`, and `open_episode`. The reciprocal trial uses only the latter
+two and addresses them by their Claude-visible names,
+`mcp__llm-memory__search_history` and `mcp__llm-memory__open_episode`. Claude
+also sees qhaway's distinct `mcp__qhaway__recall`; namespacing prevents a hard
+collision, but the two `recall` tools have different contracts and must not be
+treated as interchangeable. Adding Claude permission rules or changing the
+server's published tool set is deferred until actual misuse or confusion gives
+the ayllu a reason to narrow this initial trust.
 
 ## Data Flow and Provenance
 
@@ -103,8 +115,9 @@ Before restarting either framework:
    checkout.
 5. Confirm persistent event field names and permissions without printing
    conversation content.
-6. Register the stable server with Claude Code through its MCP CLI and confirm
-   the registration mechanically.
+6. Register the stable server with Claude Code through its MCP CLI using
+   `--scope local`, confirm that no `.mcp.json` was created, and mechanically
+   verify the four expected namespaced tools.
 
 After Tony restarts Claude Code, Claude searches and opens a known Codex
 episode. After Tony resumes or restarts Codex as needed, Codex searches and
@@ -114,8 +127,9 @@ conversation text.
 
 ## Rollback
 
-Disable or remove only the Claude source entry and remove only the local
-`llm-memory` Claude MCP registration. Reconcile to reflect the disabled source.
+Disable or remove only the Claude source entry and remove only the
+`--scope local` `llm-memory` Claude MCP registration. Reconcile to reflect the
+disabled source.
 Do not alter the Codex enrollment, the ArangoDB configuration, qhaway's curated
 memory, or unrelated Claude settings.
 
