@@ -223,3 +223,49 @@ def ingest_file(db, path):
             col.insert(episode, overwrite=True)
             count += 1
     return count
+
+
+def main(argv=None):
+    """`python -m llm_memory.ingest claude-session [PATH]`. Without PATH, reads
+    the Claude Code hook JSON from stdin and ingests its `transcript_path`
+    (SessionEnd hook mode, spec D4). Fails loudly and does not retry: a
+    traceback on stderr and a non-zero exit are the contract; the sweep is
+    the retry."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(prog="python -m llm_memory.ingest")
+    sub = parser.add_subparsers(dest="command", required=True)
+    cs = sub.add_parser("claude-session", help="ingest one Claude Code session (path or hook JSON on stdin)")
+    cs.add_argument("path", nargs="?", help="project JSONL; omit to read hook JSON from stdin")
+    cs.add_argument("--label", help="experiment label (default: derived from the project directory name)")
+    cs.add_argument("--host", help="originating hostname (default: this machine)")
+    cs.add_argument("--machine-id", help="originating /etc/machine-id (default: this machine)")
+    cs.add_argument("--dry-run", action="store_true", help="count without writing")
+    args = parser.parse_args(argv)
+
+    if args.path:
+        path = Path(args.path)
+    else:
+        hook = json.load(sys.stdin)
+        path = Path(hook["transcript_path"])
+    if not path.is_file():
+        print(f"claude-session: transcript not found: {path}", file=sys.stderr)
+        return 2
+    label = args.label or label_from_project_dir(path.parent.name)
+    host = args.host or socket.gethostname()
+    machine_id = args.machine_id or read_machine_id()
+
+    from llm_memory.db import get_database
+
+    db = get_database()
+    count = ingest_claude_session(db, path, label, dry_run=args.dry_run, host=host, machine_id=machine_id)
+    verb = "would ingest" if args.dry_run else "ingested"
+    print(f"claude-session: {verb} {count} episodes from {path} (label={label}, host={host})")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
