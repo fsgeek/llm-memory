@@ -160,16 +160,26 @@ def claude_session_to_episodes(path, experiment_label, host=None, machine_id=Non
             }
 
 
+def claude_session_files(path):
+    """A Claude Code session is its project JSONL plus any subagent transcripts
+    under `<session-uuid>/subagents/*.jsonl` beside it (spec D3)."""
+    path = Path(path)
+    subagents = path.with_suffix("") / "subagents"
+    return [path] + sorted(subagents.glob("*.jsonl"))
+
+
 def ingest_claude_session(db, path, experiment_label, dry_run=False, host=None, machine_id=None):
-    """Load one Claude Code project JSONL into the episodes collection. One
-    episode per prose assistant turn. Idempotent per assistant uuid. When
-    dry_run, counts what WOULD be inserted without writing. Returns the count."""
+    """Load one Claude Code session (project JSONL plus its subagent
+    transcripts) into the episodes collection. One episode per prose assistant
+    turn. Idempotent per assistant uuid. When dry_run, counts what WOULD be
+    inserted without writing. Returns the count."""
     col = db.collection(EPISODES)
     count = 0
-    for episode in claude_session_to_episodes(path, experiment_label, host=host, machine_id=machine_id):
-        if not dry_run:
-            col.insert(episode, overwrite=True)
-        count += 1
+    for file in claude_session_files(path):
+        for episode in claude_session_to_episodes(file, experiment_label, host=host, machine_id=machine_id):
+            if not dry_run:
+                col.insert(episode, overwrite=True)
+            count += 1
     return count
 
 
