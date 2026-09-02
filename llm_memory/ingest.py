@@ -1,8 +1,34 @@
 import json
+import re
+import socket
+from pathlib import Path
 
 from llm_memory.adapters import turn_text
 from llm_memory.index import EPISODES
 from llm_memory.schema import flatten_state
+
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+# Existing labels that differ from the project directory name (spec D3).
+_LABEL_OVERRIDES = {"yanantin": "yanantin_construction"}
+
+
+def label_from_project_dir(name):
+    """Derive the experiment label from a `~/.claude/projects/<name>` directory
+    name. Strips the projects prefix, folds worktree dirs into their project,
+    maps scratchpad-launched dirs to the project they were launched from, and
+    normalizes dots to dashes so `wamason.com` and `wamason-com` agree."""
+    m = re.search(r"-projects-(.+)$", name)
+    if m:
+        rest = m.group(1)
+        rest = re.split(rf"-{_UUID}", rest)[0]  # scratchpad dirs
+        rest = re.split(r"-+\.?(?:claude-)?worktrees-", rest)[0]  # worktrees
+        rest = rest.replace(".", "-")
+        return _LABEL_OVERRIDES.get(rest, rest)
+    m = re.match(r"-home-[^-]+(.*)$", name)
+    if m:
+        rest = m.group(1).strip("-.").replace(".", "-")
+        return f"home-{rest}" if rest else "home"
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 def record_to_episode(record, source_file):
