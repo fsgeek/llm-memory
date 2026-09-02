@@ -33,7 +33,7 @@ def test_claude_session_legacy_shape_is_preserved(tmp_path):
     episode = list(claude_session_to_episodes(path, "project-history"))[0]
 
     assert episode == {
-        "_key": "session-legacy-assistant-1",
+        "_key": "assistant-1",
         "session_id": "session-legacy",
         "ts": "2026-07-12T10:00:01Z",
         "model": "claude-test",
@@ -45,6 +45,9 @@ def test_claude_session_legacy_shape_is_preserved(tmp_path):
         "state": {},
         "state_text": "",
         "activity_log": [],
+        "host": None,
+        "machine_id": None,
+        "agent_id": None,
     }
 
 

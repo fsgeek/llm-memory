@@ -96,15 +96,24 @@ def gateway_record_to_episode(record, seq, source_file):
     }
 
 
-def claude_session_to_episodes(path, experiment_label):
+def read_machine_id(path=Path("/etc/machine-id")):
+    """The 32-hex machine id, un-hyphenated, matching the existing episodes."""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def claude_session_to_episodes(path, experiment_label, host=None, machine_id=None):
     """Yield one episode per assistant turn in a Claude Code project JSONL.
 
     Each line is one event; `type` is `user`/`assistant`/etc. An episode pairs an
     assistant turn (`response`) with the most recent preceding user turn
     (`user_message`), mirroring the gateway mapper. Claude Code has no authored
-    state, so state is empty. Keyed by session+assistant-uuid (stable across
-    re-ingest). `experiment_label` is caller-supplied so a project's construction
-    history partitions distinctly from pichay-captured `claude_code` traffic."""
+    state, so state is empty. Keyed by the assistant uuid alone (amendment A4):
+    fork/resume copies a session's history into a new file under a new
+    sessionId but keeps the uuid, so the uuid is the identity of the message.
+    `experiment_label` is caller-supplied so a project's construction history
+    partitions distinctly from pichay-captured `claude_code` traffic. `host` and
+    `machine_id` are the machine of origin (spec D3); the caller supplies them
+    because a staged copy on another machine must not claim to be local."""
     session = "unknown"
     last_user = ""
     last_user_ts = None
@@ -133,7 +142,7 @@ def claude_session_to_episodes(path, experiment_label):
                 continue  # tool-use-only turn with no prose; skip
             uuid = rec.get("uuid") or ""
             yield {
-                "_key": f"{session}-{uuid}",
+                "_key": uuid,
                 "session_id": session,
                 "ts": rec.get("timestamp"),
                 "model": msg.get("model"),
@@ -145,16 +154,19 @@ def claude_session_to_episodes(path, experiment_label):
                 "state": {},
                 "state_text": "",
                 "activity_log": [],
+                "host": host,
+                "machine_id": machine_id,
+                "agent_id": rec.get("agentId"),
             }
 
 
-def ingest_claude_session(db, path, experiment_label, dry_run=False):
+def ingest_claude_session(db, path, experiment_label, dry_run=False, host=None, machine_id=None):
     """Load one Claude Code project JSONL into the episodes collection. One
-    episode per prose assistant turn. Idempotent per (session, uuid). When
+    episode per prose assistant turn. Idempotent per assistant uuid. When
     dry_run, counts what WOULD be inserted without writing. Returns the count."""
     col = db.collection(EPISODES)
     count = 0
-    for episode in claude_session_to_episodes(path, experiment_label):
+    for episode in claude_session_to_episodes(path, experiment_label, host=host, machine_id=machine_id):
         if not dry_run:
             col.insert(episode, overwrite=True)
         count += 1
