@@ -173,3 +173,71 @@ design and may amend this spec in its own commits, stating why. The
 2026-09-01 ingest script this session used is in that session's scratchpad
 (ephemeral by design) — D3 reimplements it properly rather than importing
 it.
+
+## Amendment 2026-09-02 (Claude Fable 5.1, first session in this repo)
+
+Written after a morning spent as a *consumer* of the store — three
+searches, one of which failed — and after characterizing the Codex rollout
+format (`docs/findings-2026-09-02-codex-rollout-format.md`, prototype at
+`scripts/codex_rollout_map.py`). Each item states why, per the ayni
+boundary above. None reopens a D1–D5 decision.
+
+**A1 — Search hits carry `ts`, `experiment_label`, `source_file`.**
+Why: both times the store helped, the snippet only told the reader where
+to look; the answer was then re-derived from the artifact. The hit's
+provenance is worth more than its snippet, and today it carries neither a
+date nor a path. Folds into D5's tool rewrite.
+
+**A2 — The D5 sentence gains a second trigger.** "…`search()` first" stays;
+add: *when Tony says he doesn't recall, search.* Why: the one spontaneous
+use this morning was triggered by the human saying "I do not recall what
+the fossil was", not by the instance noticing its own ignorance. The
+second trigger is audible; the first is not.
+
+**A3 — `describe()` reports per-session ingestion coverage, and the D5
+sentence reports it.** For each session whose file still exists on this
+machine: assistant turns on disk vs. episodes in the store. The sentence
+adds e.g. "*2 sessions on this machine have un-ingested turns*". Why: the
+2026-09-01 brainstorm session that wrote this spec was ingested at
+16:21 UTC and ran until 04:18 UTC the next day; the store holds 18 of its
+197 assistant turns, including none of the spec discussion. Newest-episode
+age ("17 hours") was true and misleading. A stale store does not return
+nothing; it returns something else, unmarked. D4's hook makes the gap
+rare; A3 makes it visible when it happens.
+
+**A4 — Episode `_key` becomes the assistant message uuid alone.** Today it
+is `session_id + "-" + uuid`. Why: Claude Code fork/resume copies a
+session's history into a new file under a new `sessionId`, preserving the
+original `uuid` and `timestamp` on every copied line. Measured: 5 file
+pairs (eidolon 3, hamutay 1, yupi 1) produce 231 episodes that exist twice
+under two session ids, same host, same label, same timestamp; the pair
+checked by hand shares 188 message uuids, then diverges (9 vs. 34 lines
+of its own). Keyed by uuid, the shared prefix lands once and each tail
+lands once; `session_id`/`source_file` record whichever file wrote last.
+Applies to the sweep's overwrite semantics in D3. The 231 existing extras
+are removed by the same rule on re-sweep, or by a one-off delete of the
+duplicate with the later `source_file` mtime.
+
+**A5 — D3's Codex mapper: evidence and two deferred choices.** The
+findings doc records the stable layer (`response_item` messages +
+`turn_context.model`; the `event_msg` layer is absent before CLI 0.110 and
+again from 0.147), the fork-replay rule, the injected-tag filter, and
+that ~1,450 subagent episodes have encrypted, unrecoverable prompts. Two
+choices are left to the implementer, with tradeoffs in the doc: one
+episode per assistant message vs. per turn, and label `codex` (spec) vs.
+the project name from `cwd` with `originator` distinguishing. The author
+of this amendment leans to the project name — a `scope="hamutay"` search
+that silently omits what Codex said seems the wrong default — but did not
+override the spec.
+
+**Recorded, not actioned.** In this session the store's primary use was
+finding *Tony's* words; the instance's own lineage was context around
+them. One session, one draw (see the hamutay essay's first disease).
+Hypothesis for the next consumer sessions, not a design input.
+
+**Reciprocity note.** Two of Tony's own memory failures this morning ("I
+do not recall what the fossil was"; "somewhere we have a sketch") were
+corrected from the record within a minute. The sketch was an approved,
+externally reviewed design five days old. The store's job is not only to
+tell the instance what happened. It is the part of the infrastructure
+that does not forget on behalf of both parties.
