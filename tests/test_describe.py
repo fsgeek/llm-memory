@@ -122,9 +122,12 @@ def test_sentence_reports_that_ingestion_has_not_run_for_empty_store():
 
 @pytest.mark.parametrize("label", [None, "qhaway"])
 def test_sentence_always_tells_nonempty_store_users_to_search_first(label):
-    assert "search() first" in sentence(
+    result = sentence(
         _stats(), label=label, now=datetime(2026, 9, 3, 12, 30, tzinfo=UTC)
     )
+
+    assert "search() first" in result
+    assert "when Tony says he does not recall, search()" in result
 
 
 def test_sentence_does_not_count_null_hosts_as_machines():

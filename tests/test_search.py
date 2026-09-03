@@ -1,4 +1,5 @@
 import json
+from uuid import uuid4
 
 from llm_memory.db import get_database
 from llm_memory.index import EPISODES, ensure_index
@@ -59,6 +60,41 @@ def test_search_result_carries_key_for_recall(tmp_path):
         hit = next(r for r in results if r["cycle"] == 900040)
 
         assert hit["key"] == key
+    finally:
+        if col.has(key):
+            col.delete(key)
+
+
+def test_search_result_carries_episode_provenance(tmp_path):
+    db = get_database()
+    ensure_index(db)
+    col = db.collection(EPISODES)
+    marker = uuid4().hex
+    cycle = 910_000_000 + (uuid4().int % 80_000_000)
+    key = str(cycle)
+    timestamp = "2026-09-03T17:45:12Z"
+    label = f"provenance-label-{marker}"
+    path = tmp_path / "provenance.jsonl"
+    try:
+        record = {
+            "cycle": cycle,
+            "timestamp": timestamp,
+            "experiment_label": label,
+            "user_message": "provenance question",
+            "raw_output": {
+                "response": f"the provenance quasar marker is {marker}"
+            },
+            "state": {},
+        }
+        path.write_text(json.dumps(record), encoding="utf-8")
+        ingest_file(db, path)
+
+        results = search(db, f"provenance quasar {marker}", limit=5)
+        hit = next(result for result in results if result["key"] == key)
+
+        assert hit["ts"] == timestamp
+        assert hit["experiment_label"] == label
+        assert hit["source_file"] == str(path)
     finally:
         if col.has(key):
             col.delete(key)
