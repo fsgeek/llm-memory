@@ -1,6 +1,9 @@
 import io
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -384,6 +387,64 @@ def test_main_hook_mode_reads_transcript_path_from_stdin(tmp_path, monkeypatch):
         assert episode["machine_id"] == "hook-machine"
     finally:
         _delete_if_present(collection, keys_to_clean)
+
+
+def test_hook_command_imports_from_foreign_cwd_with_pythonpath(tmp_path):
+    git_root = Path(__file__).resolve().parents[1]
+    python = git_root / ".venv" / "bin" / "python"
+    command = [
+        "timeout",
+        "30",
+        str(python),
+        "-c",
+        "import sys; from llm_memory.ingest import main; "
+        'sys.exit(main(["claude-session", "--dry-run"]))',
+    ]
+    session_id = str(uuid4())
+    transcript = tmp_path / "-home-tony-projects-hamutay" / f"{session_id}.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            _user_record(session_id, "foreign cwd hook prompt"),
+            _assistant_record(
+                session_id,
+                str(uuid4()),
+                "foreign cwd hook response",
+            ),
+        ],
+    )
+    foreign_cwd = tmp_path / "foreign-project"
+    foreign_cwd.mkdir()
+    hook_input = json.dumps({"transcript_path": str(transcript)})
+
+    env_without_pythonpath = os.environ.copy()
+    env_without_pythonpath.pop("PYTHONPATH", None)
+    failed = subprocess.run(
+        command,
+        cwd=foreign_cwd,
+        env=env_without_pythonpath,
+        input=hook_input,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert failed.returncode != 0
+    assert "ModuleNotFoundError: No module named 'llm_memory'" in failed.stderr
+
+    hook_env = env_without_pythonpath | {"PYTHONPATH": str(git_root)}
+    completed = subprocess.run(
+        command,
+        cwd=foreign_cwd,
+        env=hook_env,
+        input=hook_input,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "would ingest 1" in completed.stdout
 
 
 def test_main_missing_transcript_returns_two_and_reports_path(tmp_path, capsys):
