@@ -267,3 +267,19 @@ plus project label to 154. The instance had no way to see that it was
 reading the top of eight thousand, and no facet to narrow by except label.
 "Out of scope: embedding search, revisit only with a measured failure"
 stands; this is the measured failure, answered without embeddings.
+
+**A8 — D2 executed 2026-09-03, with three departures from its list.**
+Deleted: 18 modules (reconcile, sqlite_*, adapters, adapter_versions,
+contract, contract_index, enrollment, lifecycle, history, opening,
+provider, provider_config, arango_provider, machine_identity), their 26
+test files, `eval/contract_journeys.py`, `evaluation/`, and
+`config/sources.example.yaml`; the `search_history`/`open_episode` tools
+and the startup reconciliation; the empty `episodic_contract_*` collections
+and view in Arango (0 documents each, verified before dropping).
+`observability.py` is now the D2 slice: `search.completed` (query digest,
+scope, window, total, returned, key digest), `recall.completed` (key,
+found), `ingest.completed` (kind, label, host, count, path). Kept, against
+the list: `index.py` — it is the A store's collection and view definition,
+and the list's "index" read as `contract_index`; `evaluate.py` — four
+lines the June eval scripts import; `pyyaml` — the same scripts read
+`eval/queries.yaml`. `turn_text` moved from adapters into ingest.

@@ -3,8 +3,8 @@ import re
 import socket
 from pathlib import Path
 
-from llm_memory.adapters import turn_text
 from llm_memory.index import EPISODES
+from llm_memory.observability import emit_ingest_event
 from llm_memory.schema import flatten_state
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -71,7 +71,15 @@ def record_to_episode(record, source_file):
 def _turn_text(content):
     """Extract plain text from a message turn whose content is either a string or
     a list of Anthropic content blocks."""
-    return turn_text(content)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
 
 
 def gateway_record_to_episode(record, seq, source_file):
@@ -421,6 +429,8 @@ def main(argv=None):
     db = get_database()
     count = ingest_claude_session(db, path, label, dry_run=args.dry_run, host=host, machine_id=machine_id)
     verb = "would ingest" if args.dry_run else "ingested"
+    if not args.dry_run:
+        emit_ingest_event(kind="claude-session", label=label, host=host, count=count, source_file=path)
     print(f"claude-session: {verb} {count} episodes from {path} (label={label}, host={host})")
     return 0
 
@@ -447,6 +457,8 @@ def _main_codex(args):
         count += ingest_codex_rollout(db, file, args.label, dry_run=args.dry_run, host=host, machine_id=machine_id)
     verb = "would ingest" if args.dry_run else "ingested"
     where = f"{len(files)} files under {args.root}" if args.all else files[0]
+    if not args.dry_run:
+        emit_ingest_event(kind="codex", label=args.label, host=host, count=count, source_file=args.root if args.all else files[0])
     print(f"codex: {verb} {count} episodes from {where} (host={host})")
     return 0
 
