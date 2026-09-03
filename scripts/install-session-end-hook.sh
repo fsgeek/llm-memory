@@ -7,7 +7,9 @@ set -e
 GIT_ROOT=$(git rev-parse --show-toplevel)
 PY="$GIT_ROOT/.venv/bin/python"
 [ -x "$PY" ] || { echo "FATAL: $PY not found. Run: uv sync" >&2; exit 1; }
-CMD="timeout 30 $PY -m llm_memory.ingest claude-session"
+# The package is not installed into the venv; it imports from the repo root.
+# The hook runs with the ending session's cwd, so put the repo on the path.
+CMD="PYTHONPATH=$GIT_ROOT timeout 30 $PY -m llm_memory.ingest claude-session"
 SETTINGS="$HOME/.claude/settings.json"
 python3 - "$SETTINGS" "$CMD" <<'EOF'
 import json, sys
@@ -20,6 +22,8 @@ hooks = groups[0].setdefault("hooks", [])
 if any(h.get("command") == cmd for h in hooks):
     print("already installed:", cmd)
 else:
+    # Replace any earlier variant of this hook rather than accumulate them.
+    hooks[:] = [h for h in hooks if "llm_memory.ingest claude-session" not in h.get("command", "")]
     hooks.append({"type": "command", "command": cmd})
     json.dump(s, open(path, "w"), indent=2)
     print("installed:", cmd)
