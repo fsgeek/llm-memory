@@ -84,7 +84,7 @@ def contract_storage():
 def test_server_exposes_legacy_and_contract_read_tools():
     """The read-only surface keeps legacy tools alongside the episodic contract."""
     names = {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}
-    assert names == {"search", "recall", "search_history", "open_episode"}
+    assert names == {"search", "recall", "describe", "search_history", "open_episode"}
 
 
 def test_search_tool_then_recall_tool_is_a_full_reach(tmp_path):
