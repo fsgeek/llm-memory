@@ -13,6 +13,8 @@ FOR doc IN @@view
   SORT score DESC
   LIMIT @limit
   RETURN { _key: doc._key, cycle: doc.cycle, score: score,
+           ts: doc.ts, experiment_label: doc.experiment_label,
+           source_file: doc.source_file,
            user_message: doc.user_message, response: doc.response,
            state_text: doc.state_text }
 """
@@ -69,6 +71,11 @@ def search(db, query, scope="all", limit=10, view=VIEW):
                 "key": doc["_key"],
                 "cycle": doc["cycle"],
                 "score": doc["score"],
+                # Provenance (amendment A1): a hit's date, project, and
+                # source path are worth more than its snippet.
+                "ts": doc.get("ts"),
+                "experiment_label": doc.get("experiment_label"),
+                "source_file": doc.get("source_file"),
                 "matched_field": field,
                 "snippet": snippet,
             }

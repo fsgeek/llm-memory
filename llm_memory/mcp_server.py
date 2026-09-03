@@ -178,8 +178,9 @@ def search(query: str, scope: str = "all", limit: int = 10) -> list[dict]:
     machines (March 2026 onward), keyed by project label. Use it before asking
     what happened, what was decided, or what a prior instance answered.
     `scope` restricts to one project label (see `describe`); "all" searches
-    everything. Returns BM25-ranked hits with `key`, `score`, and a 200-char
-    snippet; pass `key` to `recall` for the whole episode."""
+    everything. Returns BM25-ranked hits with `key`, `score`, `ts`,
+    `experiment_label`, `source_file`, and a 200-char snippet; pass `key` to
+    `recall` for the whole episode."""
     return _search(get_database(), query, scope=scope, limit=limit)
 
 

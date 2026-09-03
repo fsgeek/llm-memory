@@ -94,7 +94,7 @@ def sentence(stats, label=None, now=None):
     text += (
         ". It holds the user's words and prior assistant responses, not "
         "summaries. Before asking Tony what happened or what was decided, "
-        "search() first."
+        "search() first; when Tony says he does not recall, search()."
     )
     return text
 
