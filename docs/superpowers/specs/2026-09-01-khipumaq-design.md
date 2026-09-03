@@ -255,3 +255,15 @@ implementation: 12,318 episodes from 321 rollouts, 23 project labels,
 hamutay 7,321 of them; 1,551 with an empty prompt (encrypted subagent
 tasks and goal continuations). If `codex` is wanted after all, it is one
 AQL update over documents that have a `codex` field.
+
+**A7 — `search()` returns its denominator and takes a time window.** The
+tool now returns `{"total": N, "hits": [...]}` where `total` is the match
+count before `limit`, and accepts `since`/`until` (ISO dates) beside
+`scope`. Why: measured on 2026-09-03 with a consumer's real query (the
+recurring membership question), BM25 matched 8,345 of 9,607 episodes and
+the tool returned ten with no denominator; after the Codex ingest the same
+query matches 24,628 of 25,983. A ten-day window cut that to 2,599; window
+plus project label to 154. The instance had no way to see that it was
+reading the top of eight thousand, and no facet to narrow by except label.
+"Out of scope: embedding search, revisit only with a measured failure"
+stands; this is the measured failure, answered without embeddings.

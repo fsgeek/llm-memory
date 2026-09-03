@@ -172,16 +172,26 @@ mcp = FastMCP(SERVER_NAME, instructions=_self_description(), lifespan=_lifespan)
 
 
 @mcp.tool()
-def search(query: str, scope: str = "all", limit: int = 10) -> list[dict]:
+def search(
+    query: str,
+    scope: str = "all",
+    limit: int = 10,
+    since: str | None = None,
+    until: str | None = None,
+) -> dict:
     """Search every prior session's turns: the user's own words and the
-    assistant's full responses, from Claude Code sessions on all of Tony's
-    machines (March 2026 onward), keyed by project label. Use it before asking
-    what happened, what was decided, or what a prior instance answered.
+    assistant's full responses, from Claude Code and Codex sessions on all of
+    Tony's machines (March 2026 onward), keyed by project label. Use it before
+    asking what happened, what was decided, or what a prior instance answered.
     `scope` restricts to one project label (see `describe`); "all" searches
-    everything. Returns BM25-ranked hits with `key`, `score`, `ts`,
+    everything. `since`/`until` are ISO dates bounding the episode timestamp;
+    a week or a month usually cuts the candidates by an order of magnitude.
+    Returns {"total": N, "hits": [...]}: `total` is how many episodes matched
+    before `limit`, so if it is in the thousands, narrow with `scope` or
+    `since` rather than trust the top ten. Hits carry `key`, `score`, `ts`,
     `experiment_label`, `source_file`, and a 200-char snippet; pass `key` to
     `recall` for the whole episode."""
-    return _search(get_database(), query, scope=scope, limit=limit)
+    return _search(get_database(), query, scope=scope, limit=limit, since=since, until=until)
 
 
 @mcp.tool()

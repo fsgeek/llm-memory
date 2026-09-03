@@ -9,6 +9,8 @@ FOR doc IN @@view
     @analyzer)
   OPTIONS { waitForSync: true }
   __SCOPE_FILTER__
+  __SINCE_FILTER__
+  __UNTIL_FILTER__
   LET score = BM25(doc)
   SORT score DESC
   LIMIT @limit
@@ -46,22 +48,32 @@ def _matched_field(doc, query):
     return max(nonempty)[1] if nonempty else None
 
 
-def search(db, query, scope="all", limit=10, view=VIEW):
+def search(db, query, scope="all", limit=10, view=VIEW, since=None, until=None):
     """Search an ArangoSearch view with BM25 ranking. Defaults to the
     conversation-inclusive view (user_message + response + state_text); `view`
     can target another (e.g. a state-only view for controlled comparison).
     `scope` partitions by `experiment_label`: the default "all" searches every
     corpus, any other value restricts results to episodes with that label (e.g.
-    "claude_code" so a live-session query cannot surface taste_open episodes)."""
+    "claude_code" so a live-session query cannot surface taste_open episodes).
+    `since`/`until` bound the episode timestamp (ISO date or datetime strings,
+    inclusive/exclusive). Returns {"total": N, "hits": [...]}: `total` is how
+    many episodes matched before LIMIT, so a caller can see it is looking at
+    ten of eight thousand and narrow, rather than mistake the page for the
+    answer (amendment A7)."""
     bind_vars = {"@view": view, "q": query, "analyzer": ANALYZER, "limit": limit}
-    if scope == "all":
-        aql = _AQL.replace("  __SCOPE_FILTER__\n", "")
-    else:
-        aql = _AQL.replace(
-            "  __SCOPE_FILTER__\n", "  FILTER doc.experiment_label == @scope\n"
-        )
-        bind_vars["scope"] = scope
-    cursor = db.aql.execute(aql, bind_vars=bind_vars)
+    aql = _AQL
+    filters = {
+        "__SCOPE_FILTER__": ("FILTER doc.experiment_label == @scope", "scope", None if scope == "all" else scope),
+        "__SINCE_FILTER__": ("FILTER doc.ts >= @since", "since", since),
+        "__UNTIL_FILTER__": ("FILTER doc.ts < @until", "until", until),
+    }
+    for marker, (clause, name, value) in filters.items():
+        if value is None:
+            aql = aql.replace(f"  {marker}\n", "")
+        else:
+            aql = aql.replace(marker, clause)
+            bind_vars[name] = value
+    cursor = db.aql.execute(aql, bind_vars=bind_vars, full_count=True)
     hits = []
     for doc in cursor:
         field = _matched_field(doc, query)
@@ -80,4 +92,4 @@ def search(db, query, scope="all", limit=10, view=VIEW):
                 "snippet": snippet,
             }
         )
-    return hits
+    return {"total": cursor.statistics()["fullCount"], "hits": hits}

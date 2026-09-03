@@ -44,7 +44,7 @@ def margin_probe(db, spec, k_show=10):
     print("=== MARGIN OF VICTORY ===")
     for item in spec["queries"]:
         q, expected = item["query"], item["expected"]
-        hits = search(db, q, limit=k_show)
+        hits = search(db, q, limit=k_show)["hits"]
         rank, want = rank_of(hits, expected)
         scores = [h["score"] for h in hits]
         if rank is None:
@@ -67,7 +67,7 @@ def paraphrase_probe(db, spec):
     by_q = {it["query"]: it["expected"] for it in spec["queries"]}
     for orig, para in PARAPHRASES.items():
         expected = by_q[orig]
-        hits = search(db, para, limit=10)
+        hits = search(db, para, limit=10)["hits"]
         rank, want = rank_of(hits, expected)
         verdict = f"FOUND at rank {rank} (cy{want})" if rank is not None else "MISS (not in top-10)"
         print(f"\n  orig : {orig!r}  -> expected {expected}")

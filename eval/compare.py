@@ -36,8 +36,8 @@ def main():
     state_pass = conv_pass = 0
     for item in spec["queries"]:
         q, expected = item["query"], item["expected"]
-        state = [h["cycle"] for h in search(db, q, limit=k, view=STATE_ONLY_VIEW)]
-        conv = [h["cycle"] for h in search(db, q, limit=k, view=VIEW)]
+        state = [h["cycle"] for h in search(db, q, limit=k, view=STATE_ONLY_VIEW)["hits"]]
+        conv = [h["cycle"] for h in search(db, q, limit=k, view=VIEW)["hits"]]
         s_ok, c_ok = hit_at_k(state, expected, k), hit_at_k(conv, expected, k)
         state_pass += s_ok
         conv_pass += c_ok

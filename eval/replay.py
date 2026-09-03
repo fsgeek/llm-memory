@@ -22,7 +22,7 @@ def main():
     passed = 0
     for item in spec["queries"]:
         query, expected = item["query"], item["expected"]
-        cycles = [h["cycle"] for h in search(db, query, limit=k)]
+        cycles = [h["cycle"] for h in search(db, query, limit=k)["hits"]]
         ok = hit_at_k(cycles, expected, k=k)
         passed += ok
         print(f"[{'PASS' if ok else 'FAIL'}] {query!r}  top{k}={cycles}  expected~{expected}  (baseline: 0)")
