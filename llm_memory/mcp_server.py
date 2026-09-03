@@ -17,6 +17,9 @@ from mcp.server.fastmcp import FastMCP
 
 from llm_memory.contract import SearchRequest
 from llm_memory.db import get_database
+from llm_memory.describe import SERVER_NAME
+from llm_memory.describe import describe as _describe
+from llm_memory.describe import instructions as _instructions
 from llm_memory.enrollment import EnrollmentRegistry, load_registry
 from llm_memory.observability import (
     emit_failure_event,
@@ -151,25 +154,49 @@ async def _lifespan(_server) -> AsyncIterator[dict]:
         emit_server_event("stopped")
 
 
-mcp = FastMCP("llm-memory", lifespan=_lifespan)
+def _self_description() -> str:
+    """The one sentence the server says about itself (spec D5), rebuilt from
+    the store at every start. If the store cannot be reached, say that rather
+    than say nothing: the tools below will fail the same way."""
+    try:
+        return _instructions(get_database())
+    except Exception as exc:  # noqa: BLE001 — any failure is worth naming
+        return (
+            f"{SERVER_NAME} could not reach its episode store at start "
+            f"({type(exc).__name__}: {exc}); search() and recall() will fail "
+            "until that is fixed."
+        )
+
+
+mcp = FastMCP(SERVER_NAME, instructions=_self_description(), lifespan=_lifespan)
 
 
 @mcp.tool()
 def search(query: str, scope: str = "all", limit: int = 10) -> list[dict]:
-    """Search episodic memory for prior turns. Matches the conversational
-    response, the user's message, and state text. `scope` is the experiment
-    label (e.g. "claude_code" for live sessions, "all" for everything). Returns
-    ranked hits, each with `key`, `cycle`, `score`, and a snippet. Pass a hit's
-    `key` to `recall` to read that episode in full."""
+    """Search every prior session's turns: the user's own words and the
+    assistant's full responses, from Claude Code sessions on all of Tony's
+    machines (March 2026 onward), keyed by project label. Use it before asking
+    what happened, what was decided, or what a prior instance answered.
+    `scope` restricts to one project label (see `describe`); "all" searches
+    everything. Returns BM25-ranked hits with `key`, `score`, and a 200-char
+    snippet; pass `key` to `recall` for the whole episode."""
     return _search(get_database(), query, scope=scope, limit=limit)
 
 
 @mcp.tool()
 def recall(key: str) -> dict | None:
-    """Fetch one episode IN FULL by the `key` from a search hit. Returns the whole
-    episode (full response and user message, not the truncated snippet), or null
-    if no episode has that key."""
+    """Read one episode in full by the `key` from a search hit: the user's
+    message, the assistant's whole response, timestamp, model, project label,
+    host, and source file. Null if no episode has that key."""
     return _recall(get_database(), key)
+
+
+@mcp.tool()
+def describe() -> dict:
+    """What the store holds: episode count, counts by project label and by
+    host, and the oldest/newest timestamps. Read-only; use it to pick a
+    `scope` for `search` or to check whether ingestion is current."""
+    return _describe(get_database())
 
 
 @mcp.tool()
