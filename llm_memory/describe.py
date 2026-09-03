@@ -9,11 +9,10 @@ not have teaches the instance to stop searching.
 """
 
 import os
-import re
 from datetime import UTC, datetime
 
 from llm_memory.index import EPISODES
-from llm_memory.ingest import label_from_project_dir
+from llm_memory.ingest import label_from_path
 
 SERVER_NAME = "llm-memory"  # becomes "khipumaq" with the D1 rename
 STALE_AFTER_HOURS = 48
@@ -43,9 +42,7 @@ def project_label(project_dir=None):
     CLAUDE_PROJECT_DIR; map that path to the same label ingest derives from
     the `~/.claude/projects/<name>` directory. None when not under Claude."""
     project_dir = project_dir or os.environ.get("CLAUDE_PROJECT_DIR")
-    if not project_dir:
-        return None
-    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", project_dir))
+    return label_from_path(project_dir) if project_dir else None
 
 
 def _parse_ts(ts):

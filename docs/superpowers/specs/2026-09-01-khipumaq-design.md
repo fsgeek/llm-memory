@@ -241,3 +241,17 @@ corrected from the record within a minute. The sketch was an approved,
 externally reviewed design five days old. The store's job is not only to
 tell the instance what happened. It is the part of the infrastructure
 that does not forget on behalf of both parties.
+
+## Amendment 2026-09-03 (Claude Fable 5.1, D3 `codex` implementer)
+
+**A6 — Codex episodes are labelled by the project of their `cwd`, not
+`codex`.** D3 said label `codex`; A5 left the choice open. Implemented as
+the project label (same derivation as the Claude path, so worktrees and
+scratchpad dirs fold the same way), with `codex.originator` recording who
+the "user" was. Why: the spec's goal for the label is one search surface;
+a `scope="hamutay"` search that omits what Codex was told and said in
+hamutay is two surfaces with one name. Measured on WAM-THREADRIPPER at
+implementation: 12,318 episodes from 321 rollouts, 23 project labels,
+hamutay 7,321 of them; 1,551 with an empty prompt (encrypted subagent
+tasks and goal continuations). If `codex` is wanted after all, it is one
+AQL update over documents that have a `codex` field.

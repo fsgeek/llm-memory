@@ -31,6 +31,14 @@ def label_from_project_dir(name):
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
+def label_from_path(path):
+    """Label for a working-directory path (a Codex rollout's `cwd`, Claude's
+    CLAUDE_PROJECT_DIR), by the same rule as the project directory name:
+    Claude Code names `~/.claude/projects/<name>` by replacing every
+    non-alphanumeric character in the path with a dash."""
+    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", str(path)))
+
+
 def record_to_episode(record, source_file):
     """Transform one taste_open cycle record into an episode document that carries
     BOTH sides of the conversation and the flattened state."""
@@ -225,6 +233,147 @@ def ingest_file(db, path):
     return count
 
 
+# User-role messages the Codex harness injects; not the human's (or Claude's)
+# prompt. See docs/findings-2026-09-02-codex-rollout-format.md.
+_CODEX_INJECTED_TAGS = {
+    "environment_context", "codex_internal_context", "recommended_plugins",
+    "turn_aborted", "user_instructions", "subagent_notification",
+}
+_CODEX_INJECTED_PREFIXES = (
+    "# AGENTS.md instructions for",
+    "Warning: apply_patch was requested via",
+)
+
+
+def _codex_text(content):
+    if isinstance(content, str):
+        return content
+    return "".join(
+        c.get("text", "") for c in (content or []) if isinstance(c, dict)
+    )
+
+
+def _codex_injected(text):
+    t = text.lstrip()
+    if t.startswith(_CODEX_INJECTED_PREFIXES):
+        return True
+    m = re.match(r"<([A-Za-z_]+)", t)
+    return bool(m) and m.group(1) in _CODEX_INJECTED_TAGS
+
+
+def _iso(s):
+    from datetime import datetime
+
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def codex_rollout_to_episodes(path, experiment_label=None, host=None, machine_id=None):
+    """Yield one episode per prose assistant message in a Codex CLI rollout
+    JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), paired with the
+    most recent preceding user prompt — the mirror of
+    `claude_session_to_episodes`. Built only on the layers present in every
+    observed cli_version (0.0.0 .. 0.151.0): `session_meta` (first one wins;
+    forked files carry the parent's second), `turn_context.model`, and
+    `response_item` messages with role user/assistant. Never reads
+    `event_msg` (absent in 0.147+) or `compacted.replacement_history`
+    (replays prompts). Injected user-role context is not a prompt; a
+    subagent's task arrives encrypted, so its episodes have an empty
+    `user_message` — nobody's words are recoverable, and the field says so.
+    The label defaults to the project the rollout's `cwd` was in, so a
+    project-scoped search returns what Codex said there; `codex.originator`
+    records who the "user" was (Tony, a Claude instance, or a parent agent)."""
+    meta = None
+    meta_ts = None
+    model = None
+    last_user, last_user_ts = "", None
+    # A forked rollout (session_meta.forked_from_id) begins by replaying the
+    # parent's history, all stamped within ~0.1s of the fork's own timestamp;
+    # the first live turn_context comes seconds later. Those rows are already
+    # episodes of the parent session, so skip them.
+    in_replay = False
+    with open(path) as f:
+        for lineno, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rtype = rec.get("type")
+            p = rec.get("payload") or {}
+            if rtype == "session_meta":
+                if meta is None:
+                    meta = p
+                    meta_ts = _iso(rec["timestamp"])
+                    in_replay = bool(p.get("forked_from_id"))
+                continue
+            if rtype == "turn_context":
+                model = p.get("model") or model
+                if in_replay and (_iso(rec["timestamp"]) - meta_ts).total_seconds() > 1:
+                    in_replay = False
+                continue
+            if in_replay:
+                continue
+            if rtype != "response_item" or p.get("type") != "message":
+                continue
+            role = p.get("role")
+            text = _codex_text(p.get("content"))
+            if role == "user":
+                if _codex_injected(text):
+                    continue
+                last_user, last_user_ts = text, rec.get("timestamp")
+                continue
+            if role != "assistant" or not text.strip():
+                continue
+            meta = meta or {}
+            session = meta.get("id") or "unknown"
+            msg_id = p.get("id") or f"line{lineno}"
+            cwd = meta.get("cwd")
+            yield {
+                "_key": f"{session}-{msg_id}",
+                "session_id": session,
+                "ts": rec.get("timestamp"),
+                "model": model,
+                "experiment_label": experiment_label
+                or (label_from_path(cwd) if cwd else "codex"),
+                "source_file": str(path),
+                "user_message": last_user,
+                "user_ts": last_user_ts,
+                "response": text,
+                "state": {},
+                "state_text": "",
+                "activity_log": [],
+                "host": host,
+                "machine_id": machine_id,
+                "codex": {
+                    "originator": meta.get("originator"),
+                    "cli_version": meta.get("cli_version"),
+                    "cwd": cwd,
+                    "thread_source": meta.get("thread_source"),
+                    "agent_nickname": meta.get("agent_nickname"),
+                    "forked_from_id": meta.get("forked_from_id"),
+                },
+            }
+
+
+def codex_rollout_files(root):
+    """Every rollout file under a Codex sessions tree, oldest first."""
+    return sorted(Path(root).glob("*/*/*/rollout-*.jsonl"))
+
+
+def ingest_codex_rollout(db, path, experiment_label=None, dry_run=False, host=None, machine_id=None):
+    """Load one Codex rollout into the episodes collection. Idempotent per
+    (session, message id). Returns the count."""
+    col = db.collection(EPISODES)
+    count = 0
+    for episode in codex_rollout_to_episodes(path, experiment_label, host=host, machine_id=machine_id):
+        if not dry_run:
+            col.insert(episode, overwrite=True)
+        count += 1
+    return count
+
+
 def main(argv=None):
     """`python -m llm_memory.ingest claude-session [PATH]`. Without PATH, reads
     the Claude Code hook JSON from stdin and ingests its `transcript_path`
@@ -242,7 +391,18 @@ def main(argv=None):
     cs.add_argument("--host", help="originating hostname (default: this machine)")
     cs.add_argument("--machine-id", help="originating /etc/machine-id (default: this machine)")
     cs.add_argument("--dry-run", action="store_true", help="count without writing")
+    cx = sub.add_parser("codex", help="ingest Codex CLI rollout files (one path, or --all under --root)")
+    cx.add_argument("path", nargs="?", help="one rollout JSONL")
+    cx.add_argument("--all", action="store_true", help="every rollout under --root")
+    cx.add_argument("--root", default=Path.home() / ".codex" / "sessions", help="Codex sessions tree (default: ~/.codex/sessions)")
+    cx.add_argument("--label", help="experiment label (default: the project of each rollout's cwd)")
+    cx.add_argument("--host", help="originating hostname (default: this machine)")
+    cx.add_argument("--machine-id", help="originating /etc/machine-id (default: this machine)")
+    cx.add_argument("--dry-run", action="store_true", help="count without writing")
     args = parser.parse_args(argv)
+
+    if args.command == "codex":
+        return _main_codex(args)
 
     if args.path:
         path = Path(args.path)
@@ -262,6 +422,32 @@ def main(argv=None):
     count = ingest_claude_session(db, path, label, dry_run=args.dry_run, host=host, machine_id=machine_id)
     verb = "would ingest" if args.dry_run else "ingested"
     print(f"claude-session: {verb} {count} episodes from {path} (label={label}, host={host})")
+    return 0
+
+
+def _main_codex(args):
+    import sys
+
+    if bool(args.path) == bool(args.all):
+        print("codex: give exactly one of PATH or --all", file=sys.stderr)
+        return 2
+    files = codex_rollout_files(args.root) if args.all else [Path(args.path)]
+    missing = [f for f in files if not f.is_file()]
+    if missing:
+        print(f"codex: rollout not found: {missing[0]}", file=sys.stderr)
+        return 2
+    host = args.host or socket.gethostname()
+    machine_id = args.machine_id or read_machine_id()
+
+    from llm_memory.db import get_database
+
+    db = get_database()
+    count = 0
+    for file in files:
+        count += ingest_codex_rollout(db, file, args.label, dry_run=args.dry_run, host=host, machine_id=machine_id)
+    verb = "would ingest" if args.dry_run else "ingested"
+    where = f"{len(files)} files under {args.root}" if args.all else files[0]
+    print(f"codex: {verb} {count} episodes from {where} (host={host})")
     return 0
 
 
