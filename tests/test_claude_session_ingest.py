@@ -11,6 +11,7 @@ import pytest
 from llm_memory.db import get_database
 from llm_memory.index import EPISODES, ensure_index
 from llm_memory.ingest import (
+    _turn_text,
     claude_session_files,
     claude_session_to_episodes,
     ingest_claude_session,
@@ -60,6 +61,28 @@ def _delete_if_present(collection, keys):
     for key in keys:
         if collection.has(key):
             collection.delete(key)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("plain message", "plain message"),
+        (
+            [
+                {"type": "text", "text": "first block"},
+                {"type": "tool_use", "name": "Read"},
+                "not a content block",
+                {"type": "text", "text": "second block"},
+            ],
+            "first block second block",
+        ),
+        (None, ""),
+        ({"type": "text", "text": "not wrapped in a list"}, ""),
+        (42, ""),
+    ],
+)
+def test_turn_text_extracts_only_supported_text_content(content, expected):
+    assert _turn_text(content) == expected
 
 
 @pytest.mark.parametrize(
@@ -309,13 +332,17 @@ def test_session_file_and_subagent_are_both_ingested(tmp_path):
         _delete_if_present(collection, keys_to_clean)
 
 
-def test_main_path_dry_run_reports_count_without_writing(tmp_path, capsys):
+def test_main_path_dry_run_reports_count_without_writing(
+    tmp_path, monkeypatch, capsys
+):
     db = get_database()
     ensure_index(db)
     collection = db.collection(EPISODES)
     session_id = str(uuid4())
     assistant_uuid = str(uuid4())
     path = tmp_path / "-home-tony-projects-hamutay" / f"{session_id}.jsonl"
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(event_log))
     keys_to_clean = {assistant_uuid, f"{session_id}-{assistant_uuid}"}
     try:
         _write_jsonl(
@@ -343,6 +370,58 @@ def test_main_path_dry_run_reports_count_without_writing(tmp_path, capsys):
         assert "would ingest 1" in captured.out
         assert not collection.has(assistant_uuid)
         assert not collection.has(f"{session_id}-{assistant_uuid}")
+        assert not event_log.exists()
+    finally:
+        _delete_if_present(collection, keys_to_clean)
+
+
+def test_claude_session_cli_emits_one_completed_ingest_event(tmp_path, monkeypatch):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    session_id = str(uuid4())
+    assistant_uuid = str(uuid4())
+    path = tmp_path / "-home-tony-projects-hamutay" / f"{session_id}.jsonl"
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(event_log))
+    keys_to_clean = {assistant_uuid, f"{session_id}-{assistant_uuid}"}
+    try:
+        _write_jsonl(
+            path,
+            [
+                _user_record(session_id, "event prompt"),
+                _assistant_record(session_id, assistant_uuid, "event response"),
+            ],
+        )
+
+        result = main(
+            [
+                "claude-session",
+                str(path),
+                "--label",
+                "event-label",
+                "--host",
+                "event-host",
+                "--machine-id",
+                "event-machine",
+            ]
+        )
+
+        records = [
+            json.loads(line)
+            for line in event_log.read_text(encoding="utf-8").splitlines()
+        ]
+        assert result == 0
+        assert len(records) == 1
+        assert records[0] == {
+            "count": 1,
+            "event": "ingest.completed",
+            "host": "event-host",
+            "kind": "claude-session",
+            "label": "event-label",
+            "source_file": str(path),
+            "ts": records[0]["ts"],
+        }
     finally:
         _delete_if_present(collection, keys_to_clean)
 

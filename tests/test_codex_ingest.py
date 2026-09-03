@@ -535,6 +535,64 @@ def test_codex_cli_ingests_one_path_and_all_rollouts(tmp_path, capsys):
         _delete_if_present(collection, [single_key, *all_keys])
 
 
+def test_codex_cli_emits_one_completed_ingest_event(tmp_path, monkeypatch):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    session_id = f"codex-event-{marker}"
+    message_id = f"msg_{marker}"
+    key = f"{session_id}-{message_id}"
+    path = tmp_path / "rollout-event.jsonl"
+    event_log = tmp_path / "events.jsonl"
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(event_log))
+    try:
+        _write_jsonl(
+            path,
+            [
+                _session_meta(session_id),
+                _turn_context("gpt-5.6-sol"),
+                _message(
+                    "assistant",
+                    f"event response {marker}",
+                    "2026-09-03T10:00:02Z",
+                    message_id,
+                ),
+            ],
+        )
+
+        result = main(
+            [
+                "codex",
+                str(path),
+                "--label",
+                "event-label",
+                "--host",
+                "event-host",
+                "--machine-id",
+                "event-machine",
+            ]
+        )
+
+        records = [
+            json.loads(line)
+            for line in event_log.read_text(encoding="utf-8").splitlines()
+        ]
+        assert result == 0
+        assert len(records) == 1
+        assert records[0] == {
+            "count": 1,
+            "event": "ingest.completed",
+            "host": "event-host",
+            "kind": "codex",
+            "label": "event-label",
+            "source_file": str(path),
+            "ts": records[0]["ts"],
+        }
+    finally:
+        _delete_if_present(collection, [key])
+
+
 def test_codex_cli_rejects_missing_mode_or_path(tmp_path, capsys):
     result = main(["codex"])
     captured = capsys.readouterr()

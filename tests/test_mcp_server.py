@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from uuid import uuid4
 
@@ -13,6 +14,12 @@ from llm_memory.ingest import ingest_file
 @pytest.fixture(autouse=True)
 def isolated_event_log(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(tmp_path / "events.jsonl"))
+
+
+def test_server_exposes_only_the_read_tools():
+    names = {tool.name for tool in asyncio.run(mcp_server.mcp.list_tools())}
+
+    assert names == {"search", "recall", "describe"}
 
 
 def test_search_tool_then_recall_tool_is_a_full_reach(tmp_path):
@@ -95,25 +102,116 @@ def test_legacy_tools_acquire_arango_database_lazily(monkeypatch):
     monkeypatch.setattr(
         mcp_server,
         "_search",
-        lambda db, query, *, scope, limit, since, until: (
-            db,
-            query,
-            scope,
-            limit,
-            since,
-            until,
-        ),
+        lambda db, query, *, scope, limit, since, until: calls.append(
+            ("search", db, query, scope, limit, since, until)
+        )
+        or {"total": 1, "hits": [{"key": "search-result"}]},
     )
     monkeypatch.setattr(mcp_server, "_recall", lambda db, key: (db, key))
 
     assert calls == []
-    assert mcp_server.search("needle", scope="scope", limit=3) == (
-        database,
+    assert mcp_server.search(
         "needle",
-        "scope",
-        3,
-        None,
-        None,
-    )
+        scope="scope",
+        limit=3,
+        since="2026-08-01T00:00:00Z",
+        until="2026-08-31T23:59:59Z",
+    ) == {"total": 1, "hits": [{"key": "search-result"}]}
     assert mcp_server.recall("episode-key") == (database, "episode-key")
-    assert calls == ["get_database", "get_database"]
+    assert calls == [
+        "get_database",
+        (
+            "search",
+            database,
+            "needle",
+            "scope",
+            3,
+            "2026-08-01T00:00:00Z",
+            "2026-08-31T23:59:59Z",
+        ),
+        "get_database",
+    ]
+
+
+def test_search_tool_emits_a_content_free_completed_event(tmp_path, monkeypatch):
+    database = object()
+    query = "private capybara query"
+    snippet = "private snippet from an episode"
+    result = {
+        "total": 7,
+        "hits": [
+            {"key": "episode-a", "snippet": snippet},
+            {"key": "episode-b", "snippet": "another private snippet"},
+        ],
+    }
+    search_calls = []
+    monkeypatch.setattr(mcp_server, "get_database", lambda: database)
+    monkeypatch.setattr(
+        mcp_server,
+        "_search",
+        lambda db, search_query, *, scope, limit, since, until: search_calls.append(
+            (db, search_query, scope, limit, since, until)
+        )
+        or result,
+    )
+
+    returned = mcp_server.search(
+        query,
+        scope="hamutay",
+        limit=2,
+        since="2026-08-01T00:00:00Z",
+        until="2026-09-01T00:00:00Z",
+    )
+
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in event_text.splitlines()]
+    assert returned is result
+    assert search_calls == [
+        (
+            database,
+            query,
+            "hamutay",
+            2,
+            "2026-08-01T00:00:00Z",
+            "2026-09-01T00:00:00Z",
+        )
+    ]
+    assert len(records) == 1
+    assert records[0] == {
+        "event": "search.completed",
+        "keys_sha256": hashlib.sha256(b"episode-a\nepisode-b").hexdigest(),
+        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "returned": 2,
+        "scope": "hamutay",
+        "since": "2026-08-01T00:00:00Z",
+        "total": 7,
+        "ts": records[0]["ts"],
+        "until": "2026-09-01T00:00:00Z",
+    }
+    assert query not in event_text
+    assert snippet not in event_text
+
+
+def test_recall_tool_emits_a_completed_event(tmp_path, monkeypatch):
+    database = object()
+    episode = {"_key": "episode-a", "response": "private episode body"}
+    monkeypatch.setattr(mcp_server, "get_database", lambda: database)
+    monkeypatch.setattr(
+        mcp_server,
+        "_recall",
+        lambda db, key: episode if (db, key) == (database, "episode-a") else None,
+    )
+
+    returned = mcp_server.recall("episode-a")
+
+    event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    records = [json.loads(line) for line in event_text.splitlines()]
+    assert returned is episode
+    assert len(records) == 1
+    assert records[0] == {
+        "event": "recall.completed",
+        "found": True,
+        "key": "episode-a",
+        "ts": records[0]["ts"],
+    }
+    assert episode["response"] not in event_text
