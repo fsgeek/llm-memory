@@ -1,4 +1,6 @@
+import io
 import json
+import sys
 from uuid import uuid4
 
 import pytest
@@ -535,6 +537,242 @@ def test_codex_cli_ingests_one_path_and_all_rollouts(tmp_path, capsys):
         _delete_if_present(collection, [single_key, *all_keys])
 
 
+def test_codex_cli_session_end_hook_reads_transcript_path_from_stdin(
+    tmp_path, monkeypatch, capsys
+):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    session_id = f"codex-hook-session-end-{marker}"
+    message_id = f"msg_{marker}"
+    key = f"{session_id}-{message_id}"
+    path = tmp_path / "rollout-session-end.jsonl"
+    try:
+        _write_jsonl(
+            path,
+            [
+                _session_meta(session_id),
+                _turn_context("gpt-5.6-sol"),
+                _message(
+                    "assistant",
+                    f"session end response {marker}",
+                    "2026-09-03T10:00:02Z",
+                    message_id,
+                ),
+            ],
+        )
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionEnd",
+                        "session_id": session_id,
+                        "transcript_path": str(path),
+                        "cwd": "/home/tony/projects/hamutay",
+                    }
+                )
+            ),
+        )
+
+        result = main(["codex", "--host", "h", "--machine-id", "m"])
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert captured.out == f"codex: ingested 1 episodes from {path} (host=h)\n"
+        assert captured.err == ""
+        episode = collection.get(key)
+        assert episode["response"] == f"session end response {marker}"
+        assert episode["source_file"] == str(path)
+        assert episode["host"] == "h"
+        assert episode["machine_id"] == "m"
+    finally:
+        _delete_if_present(collection, [key])
+
+
+def test_codex_cli_subagent_stop_prefers_agent_transcript_path(
+    tmp_path, monkeypatch, capsys
+):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    parent_session = f"codex-hook-parent-{marker}"
+    agent_session = f"codex-hook-agent-{marker}"
+    parent_message = f"msg_parent_{marker}"
+    agent_message = f"msg_agent_{marker}"
+    parent_key = f"{parent_session}-{parent_message}"
+    agent_key = f"{agent_session}-{agent_message}"
+    parent_path = tmp_path / "rollout-parent.jsonl"
+    agent_path = tmp_path / "rollout-agent.jsonl"
+    try:
+        _write_jsonl(
+            parent_path,
+            [
+                _session_meta(parent_session),
+                _turn_context("gpt-5.6-sol"),
+                _message(
+                    "assistant",
+                    f"parent response {marker}",
+                    "2026-09-03T10:00:02Z",
+                    parent_message,
+                ),
+            ],
+        )
+        _write_jsonl(
+            agent_path,
+            [
+                _session_meta(agent_session),
+                _turn_context("gpt-5.6-sol"),
+                _message(
+                    "assistant",
+                    f"agent response {marker}",
+                    "2026-09-03T10:00:02Z",
+                    agent_message,
+                ),
+            ],
+        )
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SubagentStop",
+                        "session_id": agent_session,
+                        "transcript_path": str(parent_path),
+                        "agent_transcript_path": str(agent_path),
+                        "cwd": "/home/tony/projects/hamutay",
+                    }
+                )
+            ),
+        )
+
+        result = main(["codex", "--host", "h", "--machine-id", "m"])
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert captured.out == (
+            f"codex: ingested 1 episodes from {agent_path} (host=h)\n"
+        )
+        assert captured.err == ""
+        assert collection.get(agent_key)["response"] == f"agent response {marker}"
+        assert not collection.has(parent_key)
+    finally:
+        _delete_if_present(collection, [parent_key, agent_key])
+
+
+def test_codex_cli_hook_missing_rollout_returns_two_without_writing(
+    tmp_path, monkeypatch, capsys
+):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    session_id = f"codex-hook-missing-{marker}"
+    key = f"{session_id}-msg_{marker}"
+    missing = tmp_path / f"rollout-missing-{marker}.jsonl"
+    try:
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionEnd",
+                        "session_id": session_id,
+                        "transcript_path": str(missing),
+                        "cwd": "/home/tony/projects/hamutay",
+                    }
+                )
+            ),
+        )
+
+        result = main(["codex", "--host", "h", "--machine-id", "m"])
+
+        captured = capsys.readouterr()
+        assert result == 2
+        assert captured.out == ""
+        assert "rollout not found" in captured.err
+        assert str(missing) in captured.err
+        assert not collection.has(key)
+    finally:
+        _delete_if_present(collection, [key])
+
+
+def test_codex_cli_rejects_path_with_all(tmp_path, capsys):
+    path = tmp_path / "rollout.jsonl"
+
+    result = main(["codex", str(path), "--all"])
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == ""
+    assert "not both" in captured.err
+
+
+def test_codex_cli_hook_dry_run_reports_without_writing(
+    tmp_path, monkeypatch, capsys
+):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    session_id = f"codex-hook-dry-{marker}"
+    message_id = f"msg_{marker}"
+    key = f"{session_id}-{message_id}"
+    path = tmp_path / "rollout-hook-dry.jsonl"
+    try:
+        _write_jsonl(
+            path,
+            [
+                _session_meta(session_id),
+                _turn_context("gpt-5.6-sol"),
+                _message(
+                    "assistant",
+                    f"dry response {marker}",
+                    "2026-09-03T10:00:02Z",
+                    message_id,
+                ),
+            ],
+        )
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionEnd",
+                        "session_id": session_id,
+                        "transcript_path": str(path),
+                        "cwd": "/home/tony/projects/hamutay",
+                    }
+                )
+            ),
+        )
+
+        result = main(
+            [
+                "codex",
+                "--dry-run",
+                "--host",
+                "h",
+                "--machine-id",
+                "m",
+            ]
+        )
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert "would ingest" in captured.out
+        assert captured.err == ""
+        assert not collection.has(key)
+    finally:
+        _delete_if_present(collection, [key])
+
+
 def test_codex_cli_emits_one_completed_ingest_event(tmp_path, monkeypatch):
     db = get_database()
     ensure_index(db)
@@ -593,14 +831,7 @@ def test_codex_cli_emits_one_completed_ingest_event(tmp_path, monkeypatch):
         _delete_if_present(collection, [key])
 
 
-def test_codex_cli_rejects_missing_mode_or_path(tmp_path, capsys):
-    result = main(["codex"])
-    captured = capsys.readouterr()
-
-    assert result == 2
-    assert captured.out == ""
-    assert "give exactly one of PATH or --all" in captured.err
-
+def test_codex_cli_rejects_missing_path(tmp_path, capsys):
     missing = tmp_path / "missing.jsonl"
     result = main(["codex", str(missing)])
     captured = capsys.readouterr()
