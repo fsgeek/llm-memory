@@ -283,3 +283,23 @@ the list: `index.py` — it is the A store's collection and view definition,
 and the list's "index" read as `contract_index`; `evaluate.py` — four
 lines the June eval scripts import; `pyyaml` — the same scripts read
 `eval/queries.yaml`. `turn_text` moved from adapters into ingest.
+
+**A9 — D4 layer 1 for Codex: a native Codex hook, not a wrapper.** Codex
+CLI 0.151 has a hooks system (`$CODEX_HOME/hooks.json`, Claude Code's
+shape; events include SessionEnd and SubagentStop; the hook JSON carries
+`transcript_path` / `agent_transcript_path`, `session_id`, `cwd`). Measured
+2026-09-03 in an isolated CODEX_HOME: (1) hooks run only when trusted;
+trust is persisted as `[hooks.state."<hooks.json path>:<event>:<i>:<j>"]
+trusted_hash = "<sha256 from hooks/list>"` in config.toml, which
+`scripts/install-codex-hook.sh` writes by asking `codex app-server` for
+`hooks/list`; (2) end-of-session hooks are capped at ~1 s and killed at
+exit, and the JSON `timeout`/`async` fields are not honored, so
+`scripts/codex-hook-ingest.sh` reads the JSON and detaches the ingest with
+setsid — a detached `sleep 5` completed after Codex exited, a same-process
+one did not; (3) the largest local rollout (62 MB, 5,296 episodes) parses
+in under a second but its writes take longer than the cap, which is why
+the detach is not optional. `ingest codex` with no path reads the hook
+JSON from stdin, mirroring `claude-session`. A wrapper around the `codex`
+binary was rejected: the VS Code extension bundles its own binary (35 local
+rollouts), and a wrapper cannot learn the transcript path. The nightly
+sweep (D4 layer 2) remains the retry for hook failures.

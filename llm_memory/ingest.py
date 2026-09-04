@@ -399,8 +399,8 @@ def main(argv=None):
     cs.add_argument("--host", help="originating hostname (default: this machine)")
     cs.add_argument("--machine-id", help="originating /etc/machine-id (default: this machine)")
     cs.add_argument("--dry-run", action="store_true", help="count without writing")
-    cx = sub.add_parser("codex", help="ingest Codex CLI rollout files (one path, or --all under --root)")
-    cx.add_argument("path", nargs="?", help="one rollout JSONL")
+    cx = sub.add_parser("codex", help="ingest Codex CLI rollout files (one path, --all under --root, or hook JSON on stdin)")
+    cx.add_argument("path", nargs="?", help="one rollout JSONL; omit (without --all) to read Codex hook JSON from stdin")
     cx.add_argument("--all", action="store_true", help="every rollout under --root")
     cx.add_argument("--root", default=Path.home() / ".codex" / "sessions", help="Codex sessions tree (default: ~/.codex/sessions)")
     cx.add_argument("--label", help="experiment label (default: the project of each rollout's cwd)")
@@ -438,10 +438,18 @@ def main(argv=None):
 def _main_codex(args):
     import sys
 
-    if bool(args.path) == bool(args.all):
-        print("codex: give exactly one of PATH or --all", file=sys.stderr)
+    if args.path and args.all:
+        print("codex: give PATH or --all, not both", file=sys.stderr)
         return 2
-    files = codex_rollout_files(args.root) if args.all else [Path(args.path)]
+    if args.all:
+        files = codex_rollout_files(args.root)
+    elif args.path:
+        files = [Path(args.path)]
+    else:
+        # Codex hook mode (SessionEnd / SubagentStop): the hook JSON names the
+        # rollout that just closed. Same contract as the Claude hook.
+        hook = json.load(sys.stdin)
+        files = [Path(hook.get("agent_transcript_path") or hook["transcript_path"])]
     missing = [f for f in files if not f.is_file()]
     if missing:
         print(f"codex: rollout not found: {missing[0]}", file=sys.stderr)
