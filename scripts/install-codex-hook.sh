@@ -13,11 +13,16 @@ PY="$GIT_ROOT/.venv/bin/python"
 HOOK="$GIT_ROOT/scripts/codex-hook-ingest.sh"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 export CODEX_HOME
-"$PY" - "$CODEX_HOME" "$HOOK" <<'EOF2'
+# The codex binary is only needed here, to ask for the hooks' trust hashes;
+# the hook itself is run by whichever Codex (CLI, VS Code extension) ends the
+# session. Override with CODEX_BIN when codex is not on PATH.
+CODEX_BIN="${CODEX_BIN:-$(command -v codex || ls "$HOME"/node_modules/.bin/codex "$HOME"/.bun/bin/codex 2>/dev/null | head -1)}"
+[ -x "$CODEX_BIN" ] || { echo "FATAL: codex binary not found; set CODEX_BIN" >&2; exit 1; }
+"$PY" - "$CODEX_HOME" "$HOOK" "$CODEX_BIN" <<'EOF2'
 import json, re, select, subprocess, sys, time
 from pathlib import Path
 
-home, hook = Path(sys.argv[1]), sys.argv[2]
+home, hook, codex_bin = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 hooks_path = home / "hooks.json"
 doc = json.loads(hooks_path.read_text()) if hooks_path.exists() else {}
 events = doc.setdefault("hooks", {})
@@ -33,7 +38,7 @@ hooks_path.write_text(json.dumps(doc, indent=2) + "\n")
 print(f"hooks.json: SessionEnd and SubagentStop -> {hook}")
 
 # Ask Codex for the hooks' keys and hashes, then persist trust for ours.
-p = subprocess.Popen(["codex", "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+p = subprocess.Popen([codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 def send(o):
     p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
 def wait(i, timeout=30):

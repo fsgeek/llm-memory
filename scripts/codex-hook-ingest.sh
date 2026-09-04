@@ -7,6 +7,7 @@
 # retry for anything that fails here.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LOG="${CODEX_HOME:-$HOME/.codex}/log/llm-memory-hook.log"
+mkdir -p "$(dirname "$LOG")"
 json=$(cat)
 setsid sh -c '
   printf %s "$0" | PYTHONPATH="$1" timeout 300 "$1/.venv/bin/python" \
