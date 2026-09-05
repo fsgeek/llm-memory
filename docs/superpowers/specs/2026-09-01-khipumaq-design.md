@@ -303,3 +303,25 @@ JSON from stdin, mirroring `claude-session`. A wrapper around the `codex`
 binary was rejected: the VS Code extension bundles its own binary (35 local
 rollouts), and a wrapper cannot learn the transcript path. The nightly
 sweep (D4 layer 2) remains the retry for hook failures.
+
+**A10 — Backup and warm replica (2026-09-04/05).** Not in the original
+spec; added because the store was the only copy of thousands of episodes
+and lived in one Docker container on one Windows host with no backup. The
+primary is ArangoDB 3.12.4 community, container `arango-indaleko-20240118170759`
+on WAM-THREADRIPPER's Docker Desktop (host 192.168.111.127); the parallel
+container `arango-vector-sandbox` (enterprise 3.12.9, vector index flag) is
+now `restart=always` like the original. wam-nuc runs a native ArangoDB
+3.12.10 enterprise (`arangodb3` service); its `arangod.conf` had both
+`tcp://0.0.0.0:8529` and `tcp://[::]:8529` endpoints, which made the
+second bind fail and the service crash-loop — the IPv4 line is commented
+out and the web UI is reachable on the LAN. `scripts/backup-store.sh`
+(systemd user timer on wam-nuc, 03:30 UTC, installed by
+`scripts/install-backup-timer.sh`): arangodump the primary into
+`~/backups/llm-memory/<date>` (29 MB compressed, ~5 s), arangorestore into
+wam-nuc's own `llm_memory` database (warm replica and intended future
+primary), verify counts, restic to `sftp:activitycontext.work:backups/llm-memory-restic`
+with 30 daily / 24 monthly retention. The restic password file is
+`~/.config/llm-memory/restic-password` on wam-nuc only (0600); it must be
+copied somewhere safe. First run 2026-09-05 00:55 UTC: 26,117 episodes,
+primary == replica, snapshot pushed. Cutover to wam-nuc as primary is the
+`host` line in `config/db-config.ini` on three machines.
