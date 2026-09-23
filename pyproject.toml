@@ -15,6 +15,9 @@ dependencies = [
     "python-arango>=8.3.3",
 ]
 
+[project.scripts]
+khipumaq = "khipumaq.cli:main"
+
 [dependency-groups]
 # Repo tooling, not shipped: the suite, the June eval scripts (eval/ reads
 # queries.yaml), and the post-commit OpenTimestamps hook.
