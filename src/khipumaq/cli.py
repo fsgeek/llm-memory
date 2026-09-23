@@ -93,6 +93,7 @@ def _install(skip_codex):
     from khipumaq import setup
     from khipumaq.db import config_path
 
+    status = 0
     setup.install_claude(*_claude_paths())
     print("khipumaq: Claude Code SessionEnd hook and MCP server installed.")
     if skip_codex:
@@ -102,8 +103,13 @@ def _install(skip_codex):
     elif (codex_bin := setup.codex_binary()) is None:
         print("khipumaq: codex binary not found (set CODEX_BIN); Codex hooks skipped.", file=sys.stderr)
     else:
-        setup.install_codex(setup.codex_home(), codex_bin)
-        print("khipumaq: Codex SessionEnd/SubagentStop hooks installed and trusted.")
+        try:
+            setup.install_codex(setup.codex_home(), codex_bin)
+            print("khipumaq: Codex SessionEnd/SubagentStop hooks installed and trusted.")
+        except RuntimeError as exc:
+            # The hooks are written but untrusted, so Codex will not run them.
+            print(f"khipumaq: Codex hooks NOT trusted: {exc}", file=sys.stderr)
+            status = 1
     if setup.has_systemd_user():
         setup.install_timer()
         print("khipumaq: nightly sweep timer enabled (systemctl --user status khipumaq-sweep.timer).")
@@ -114,7 +120,7 @@ def _install(skip_codex):
     except FileNotFoundError as exc:
         print(f"khipumaq: {exc}\n          Hooks and server will fail until it exists.", file=sys.stderr)
     print("khipumaq: restart Claude Code for the MCP server to load.")
-    return 0
+    return status
 
 
 def _uninstall():

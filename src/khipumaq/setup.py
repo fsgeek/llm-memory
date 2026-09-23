@@ -162,27 +162,48 @@ def codex_home():
 
 def codex_binary():
     """Needed only to ask Codex for the trust hashes of our hooks; the hooks are
-    run by whichever Codex (CLI or VS Code extension) ends the session."""
+    run by whichever Codex (CLI or VS Code extension) ends the session. Looks
+    past PATH because nvm and bun installs are often only on an interactive
+    shell's PATH."""
     found = os.environ.get("CODEX_BIN") or shutil.which("codex")
     if found:
         return found
-    for candidate in (Path.home() / "node_modules/.bin/codex", Path.home() / ".bun/bin/codex"):
+    home = Path.home()
+    candidates = sorted(home.glob(".nvm/versions/node/*/bin/codex"), reverse=True)
+    candidates += [home / "node_modules/.bin/codex", home / ".bun/bin/codex"]
+    for candidate in candidates:
         if candidate.exists():
             return str(candidate)
     return None
 
 
 def _hooks_list(codex_bin, home):
-    """Ask `codex app-server` for every hook's key and current hash."""
-    env = os.environ | {"CODEX_HOME": str(home)}
+    """Ask `codex app-server` for every hook's key and current hash. The binary's
+    own directory goes first on PATH: an nvm install keeps `node` beside it,
+    and `codex` is a node script. If app-server dies, its stderr is the error."""
+    env = os.environ | {
+        "CODEX_HOME": str(home),
+        "PATH": os.pathsep.join([str(Path(codex_bin).parent), os.environ.get("PATH", "")]),
+    }
+    errors = tempfile.TemporaryFile("w+")
     proc = subprocess.Popen(
         [codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True, env=env,
+        stderr=errors, text=True, env=env,
     )
 
+    def failed(why):
+        proc.kill()
+        proc.wait()
+        errors.seek(0)
+        detail = errors.read().strip()[-800:]
+        return RuntimeError(f"{codex_bin} app-server {why}" + (f":\n{detail}" if detail else ""))
+
     def send(message):
-        proc.stdin.write(json.dumps(message) + "\n")
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError:
+            raise failed("exited") from None
 
     def wait(request_id, timeout=30):
         end = time.time() + timeout
@@ -192,14 +213,14 @@ def _hooks_list(codex_bin, home):
                 continue
             line = proc.stdout.readline()
             if not line:
-                break
+                raise failed("exited")
             try:
                 message = json.loads(line)
             except ValueError:
                 continue
             if message.get("id") == request_id:
                 return message
-        raise RuntimeError("codex app-server did not answer hooks/list")
+        raise failed("did not answer hooks/list")
 
     try:
         send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
