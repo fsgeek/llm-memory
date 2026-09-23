@@ -325,3 +325,54 @@ with 30 daily / 24 monthly retention. The restic password file is
 copied somewhere safe. First run 2026-09-05 00:55 UTC: 26,117 episodes,
 primary == replica, snapshot pushed. Cutover to wam-nuc as primary is the
 `host` line in `config/db-config.ini` on three machines.
+
+## Amendment 2026-09-23 (Claude Opus 5.5, packaging)
+
+Tony asked to take the project toward PyPI the way qhaway went. Decisions
+from that conversation, and what was built on it.
+
+**A11 — D1 executed as packaging.** `llm-memory` is taken on PyPI;
+`khipumaq` is free. The package is `src/khipumaq` (uv_build); runtime
+dependencies are `mcp` and `python-arango` only, and the wheel carries code
+only — no config, no data. The database, its user, and the event-log path
+keep their `llm_memory` names (D1 already said so for the database).
+
+**A12 — Config leaves the source tree.** `db-config.ini` is read from
+`$KHIPUMAQ_CONFIG` (exclusively), else `~/.config/khipumaq/`, else the
+checkout's `config/` — the last so machines running from a checkout keep
+working unchanged.
+
+**A13 — `khipumaq install` replaces the install scripts.** One command
+writes the Claude SessionEnd hook, the user-scope MCP entry, the Codex
+hooks with their trust, and a sweep timer, and removes the pre-package
+`llm_memory` entries. Migrating a checkout machine is: pull, `uv sync`,
+`.venv/bin/khipumaq install`. `codex-hook` replaces the setsid script
+(returns in ~60 ms against Codex's ~1 s cap).
+
+**A14 — D4 layer 2 is per machine, not a central rsync.** Why: every
+machine already writes to the store directly, so each can retry its own
+misses; the central design needed ssh between machines and was never
+built. `khipumaq sweep` ingests files modified since its last successful
+run (less a day), from a daily systemd user timer with `Persistent=true`.
+Measured on wam-desktop: full sweep 2,903 episodes in 25 s, incremental
+1.4 s.
+
+**Direction agreed, not yet built.** A container (Docker/Podman) holding
+ArangoDB, the read-only MCP server over HTTP, and an HTTP ingest endpoint
+used only by hooks — so clients need neither the Arango driver nor
+credentials, and Windows Claude can reach the store without a checkout.
+The ayllu's primary stays on the LAN; LAN reachability is the access
+boundary for now (Tony: two humans, one gateway he controls). A PyPI
+install starts clean against the user's own ArangoDB; WAN or ArangoDB
+Cloud setups are documented as untested, PRs welcome, which requires a
+license (MIT, matching qhaway) and DCO sign-off. The ayllu's memories are
+never to leave the organization; the package never phones home. Label
+folding (raw project dir kept as a field, labels computed from
+configurable rules) belongs to the same packaging work.
+
+**Recorded: a stale checkout re-derived A10.** This work began on
+wam-desktop from a checkout 19 days and four commits behind `origin/main`.
+In conversation I recommended an encrypted off-site backup; A10 had built
+one on 2026-09-04, and neither Tony nor I knew. The store had the episodes
+that built it; I did not search for them because I did not know there was
+anything to search for. A checkout is a snapshot, the same way context is.
