@@ -8,9 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
-from llm_memory.db import get_database
-from llm_memory.evaluate import hit_at_k
-from llm_memory.search import search
+from khipumaq.db import get_database
+from khipumaq.evaluate import hit_at_k
+from khipumaq.search import search
 
 SPEC = Path(__file__).parent / "queries.yaml"
 

@@ -12,18 +12,18 @@ Two principles, kept from the retired contract layer (spec D2):
 The server says one sentence about itself at start (spec D5), rebuilt from
 the store: what it holds, how fresh it is, and when to reach for it.
 
-Run for dogfooding:  uv run python -m llm_memory.mcp_server   (stdio transport)
+Run for dogfooding:  uv run python -m khipumaq.mcp_server   (stdio transport)
 """
 
 from mcp.server.fastmcp import FastMCP
 
-from llm_memory.db import get_database
-from llm_memory.describe import SERVER_NAME
-from llm_memory.describe import describe as _describe
-from llm_memory.describe import instructions as _instructions
-from llm_memory.observability import emit_recall_event, emit_search_event
-from llm_memory.recall import recall as _recall
-from llm_memory.search import search as _search
+from khipumaq.db import get_database
+from khipumaq.describe import SERVER_NAME
+from khipumaq.describe import describe as _describe
+from khipumaq.describe import instructions as _instructions
+from khipumaq.observability import emit_recall_event, emit_search_event
+from khipumaq.recall import recall as _recall
+from khipumaq.search import search as _search
 
 
 def _self_description() -> str:

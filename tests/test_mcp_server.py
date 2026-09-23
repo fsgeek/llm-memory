@@ -5,10 +5,10 @@ from uuid import uuid4
 
 import pytest
 
-from llm_memory import mcp_server
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import ingest_file
+from khipumaq import mcp_server
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import ingest_file
 
 
 @pytest.fixture(autouse=True)

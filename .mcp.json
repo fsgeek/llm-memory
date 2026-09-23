@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "llm-memory": {
+    "khipumaq": {
       "command": "uv",
       "args": [
         "run",
@@ -8,7 +8,7 @@
         "/home/tony/projects/llm-memory",
         "python",
         "-m",
-        "llm_memory.mcp_server"
+        "khipumaq.mcp_server"
       ]
     }
   }

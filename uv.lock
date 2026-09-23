@@ -320,23 +320,31 @@ wheels = [
 ]
 
 [[package]]
-name = "llm-memory"
+name = "khipumaq"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
+    { name = "python-arango" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "opentimestamps-client" },
     { name = "pytest" },
-    { name = "python-arango" },
     { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.28.0" },
+    { name = "python-arango", specifier = ">=8.3.3" },
+]
+
+[package.metadata.requires-dev]
+dev = [
     { name = "opentimestamps-client", specifier = ">=0.7.2" },
     { name = "pytest", specifier = ">=9.1.0" },
-    { name = "python-arango", specifier = ">=8.3.3" },
     { name = "pyyaml", specifier = ">=6.0.3" },
 ]
 

@@ -8,9 +8,9 @@ from uuid import uuid4
 
 import pytest
 
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import (
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import (
     _turn_text,
     claude_session_files,
     claude_session_to_episodes,
@@ -476,7 +476,7 @@ def test_hook_command_imports_from_foreign_cwd_with_pythonpath(tmp_path):
         "30",
         str(python),
         "-c",
-        "import sys; from llm_memory.ingest import main; "
+        "import sys; from khipumaq.ingest import main; "
         'sys.exit(main(["claude-session", "--dry-run"]))',
     ]
     session_id = str(uuid4())

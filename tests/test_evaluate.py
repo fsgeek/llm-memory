@@ -1,4 +1,4 @@
-from llm_memory.evaluate import hit_at_k
+from khipumaq.evaluate import hit_at_k
 
 
 def test_hit_at_k_true_when_expected_in_topk():

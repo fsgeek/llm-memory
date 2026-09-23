@@ -1,5 +1,5 @@
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, VIEW, ensure_index
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, VIEW, ensure_index
 
 
 def test_ensure_index_creates_collection_and_view():

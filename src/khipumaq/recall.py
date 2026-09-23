@@ -1,4 +1,4 @@
-from llm_memory.index import EPISODES
+from khipumaq.index import EPISODES
 
 
 def recall(db, key):

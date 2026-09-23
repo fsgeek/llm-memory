@@ -3,9 +3,9 @@ import re
 import socket
 from pathlib import Path
 
-from llm_memory.index import EPISODES
-from llm_memory.observability import emit_ingest_event
-from llm_memory.schema import flatten_state
+from khipumaq.index import EPISODES
+from khipumaq.observability import emit_ingest_event
+from khipumaq.schema import flatten_state
 
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 # Existing labels that differ from the project directory name (spec D3).
@@ -383,7 +383,7 @@ def ingest_codex_rollout(db, path, experiment_label=None, dry_run=False, host=No
 
 
 def main(argv=None):
-    """`python -m llm_memory.ingest claude-session [PATH]`. Without PATH, reads
+    """`python -m khipumaq.ingest claude-session [PATH]`. Without PATH, reads
     the Claude Code hook JSON from stdin and ingests its `transcript_path`
     (SessionEnd hook mode, spec D4). Fails loudly and does not retry: a
     traceback on stderr and a non-zero exit are the contract; the sweep is
@@ -391,7 +391,7 @@ def main(argv=None):
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(prog="python -m llm_memory.ingest")
+    parser = argparse.ArgumentParser(prog="python -m khipumaq.ingest")
     sub = parser.add_subparsers(dest="command", required=True)
     cs = sub.add_parser("claude-session", help="ingest one Claude Code session (path or hook JSON on stdin)")
     cs.add_argument("path", nargs="?", help="project JSONL; omit to read hook JSON from stdin")
@@ -424,7 +424,7 @@ def main(argv=None):
     host = args.host or socket.gethostname()
     machine_id = args.machine_id or read_machine_id()
 
-    from llm_memory.db import get_database
+    from khipumaq.db import get_database
 
     db = get_database()
     count = ingest_claude_session(db, path, label, dry_run=args.dry_run, host=host, machine_id=machine_id)
@@ -457,7 +457,7 @@ def _main_codex(args):
     host = args.host or socket.gethostname()
     machine_id = args.machine_id or read_machine_id()
 
-    from llm_memory.db import get_database
+    from khipumaq.db import get_database
 
     db = get_database()
     count = 0

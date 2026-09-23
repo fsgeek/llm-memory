@@ -1,4 +1,4 @@
-from llm_memory.index import ANALYZER, VIEW
+from khipumaq.index import ANALYZER, VIEW
 
 _AQL = """
 FOR doc IN @@view

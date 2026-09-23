@@ -3,7 +3,7 @@ import json
 import stat
 from datetime import datetime
 
-from llm_memory.observability import (
+from khipumaq.observability import (
     emit_ingest_event,
     emit_recall_event,
     emit_search_event,

@@ -1,4 +1,4 @@
-from llm_memory.schema import flatten_state
+from khipumaq.schema import flatten_state
 
 
 def test_flatten_state_collects_nested_string_values():

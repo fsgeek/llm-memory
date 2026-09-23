@@ -5,9 +5,9 @@ from uuid import uuid4
 
 import pytest
 
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import (
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import (
     codex_rollout_files,
     codex_rollout_to_episodes,
     ingest_codex_rollout,

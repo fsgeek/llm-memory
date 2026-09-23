@@ -1,4 +1,4 @@
-from llm_memory.db import get_database
+from khipumaq.db import get_database
 
 
 def test_get_database_connects_as_scoped_user():

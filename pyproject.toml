@@ -1,17 +1,35 @@
 [project]
-name = "llm-memory"
+name = "khipumaq"
 version = "0.1.0"
-description = "Add your description here"
+description = "An episodic store of every prior Claude Code and Codex session — the user's words and the assistant's responses — searchable by the instances that come after."
 readme = "README.md"
 requires-python = ">=3.14"
+authors = [{ name = "Tony", email = "fsgeek@cs.ubc.ca" }]
+keywords = ["memory", "episodic", "llm", "agent", "arangodb", "mcp"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+]
 dependencies = [
     "mcp[cli]>=1.28.0",
+    "python-arango>=8.3.3",
+]
+
+[dependency-groups]
+# Repo tooling, not shipped: the suite, the June eval scripts (eval/ reads
+# queries.yaml), and the post-commit OpenTimestamps hook.
+dev = [
     "opentimestamps-client>=0.7.2",
     "pytest>=9.1.0",
-    "python-arango>=8.3.3",
     "pyyaml>=6.0.3",
 ]
 
+[build-system]
+requires = ["uv_build>=0.10,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+
 [tool.pytest.ini_options]
-pythonpath = ["."]
 testpaths = ["tests"]

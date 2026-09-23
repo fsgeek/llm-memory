@@ -10,6 +10,6 @@ LOG="${CODEX_HOME:-$HOME/.codex}/log/llm-memory-hook.log"
 mkdir -p "$(dirname "$LOG")"
 json=$(cat)
 setsid sh -c '
-  printf %s "$0" | PYTHONPATH="$1" timeout 300 "$1/.venv/bin/python" \
-    -c "import sys; from llm_memory.ingest import main; sys.exit(main([\"codex\"]))" >> "$2" 2>&1
+  printf %s "$0" | timeout 300 "$1/.venv/bin/python" \
+    -c "import sys; from khipumaq.ingest import main; sys.exit(main([\"codex\"]))" >> "$2" 2>&1
 ' "$json" "$ROOT" "$LOG" </dev/null >/dev/null 2>&1 &

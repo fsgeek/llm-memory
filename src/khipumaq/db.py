@@ -3,7 +3,7 @@ from pathlib import Path
 
 from arango import ArangoClient
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "db-config.ini"
+_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "db-config.ini"
 
 
 def _load_config(path=_CONFIG_PATH):

@@ -1,10 +1,10 @@
 import json
 from uuid import uuid4
 
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import ingest_file
-from llm_memory.search import search
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import ingest_file
+from khipumaq.search import search
 
 
 def test_search_finds_a_phrase_the_instance_said_in_response(tmp_path):

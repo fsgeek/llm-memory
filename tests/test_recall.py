@@ -1,9 +1,9 @@
 import json
 
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import ingest_file
-from llm_memory.recall import recall
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import ingest_file
+from khipumaq.recall import recall
 
 
 def test_recall_returns_full_episode_by_key(tmp_path):

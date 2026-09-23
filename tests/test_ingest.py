@@ -1,8 +1,8 @@
 import json
 
-from llm_memory.db import get_database
-from llm_memory.index import EPISODES, ensure_index
-from llm_memory.ingest import (
+from khipumaq.db import get_database
+from khipumaq.index import EPISODES, ensure_index
+from khipumaq.ingest import (
     claude_session_to_episodes,
     gateway_record_to_episode,
     ingest_file,

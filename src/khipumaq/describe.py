@@ -11,10 +11,10 @@ not have teaches the instance to stop searching.
 import os
 from datetime import UTC, datetime
 
-from llm_memory.index import EPISODES
-from llm_memory.ingest import label_from_path
+from khipumaq.index import EPISODES
+from khipumaq.ingest import label_from_path
 
-SERVER_NAME = "llm-memory"  # becomes "khipumaq" with the D1 rename
+SERVER_NAME = "khipumaq"
 STALE_AFTER_HOURS = 48
 
 _STATS_AQL = """

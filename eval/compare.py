@@ -8,10 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import yaml
 
-from llm_memory.db import get_database
-from llm_memory.evaluate import hit_at_k
-from llm_memory.index import ANALYZER, EPISODES, VIEW, ensure_index
-from llm_memory.search import search
+from khipumaq.db import get_database
+from khipumaq.evaluate import hit_at_k
+from khipumaq.index import ANALYZER, EPISODES, VIEW, ensure_index
+from khipumaq.search import search
 
 STATE_ONLY_VIEW = "episodes_state_only"
 SPEC = Path(__file__).parent / "queries.yaml"

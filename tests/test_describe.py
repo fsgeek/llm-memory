@@ -4,10 +4,10 @@ from uuid import uuid4
 
 import pytest
 
-from llm_memory import mcp_server
-from llm_memory.db import get_database
-from llm_memory.describe import describe, instructions, project_label, sentence
-from llm_memory.index import EPISODES, ensure_index
+from khipumaq import mcp_server
+from khipumaq.db import get_database
+from khipumaq.describe import describe, instructions, project_label, sentence
+from khipumaq.index import EPISODES, ensure_index
 
 
 def _stats(*, episodes=12_345, newest="2026-09-03T12:00:00Z", hosts=None):
