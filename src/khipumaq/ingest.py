@@ -382,6 +382,23 @@ def ingest_codex_rollout(db, path, experiment_label=None, dry_run=False, host=No
     return count
 
 
+def sweep(db, claude_root, codex_root, since=None, host=None, machine_id=None):
+    """Ingest every session file under a Claude Code projects tree and a Codex
+    sessions tree whose mtime is at or after `since` (epoch seconds; None for
+    all), idempotently: episodes are keyed by message id and overwritten (spec
+    D3/D4). This is the retry for hooks that failed. Returns
+    {"claude": (files, episodes), "codex": (files, episodes)}."""
+    fresh = lambda f: since is None or f.stat().st_mtime >= since
+    claude = [f for f in sorted(Path(claude_root).glob("*/*.jsonl")) if fresh(f)] if Path(claude_root).is_dir() else []
+    codex = [f for f in codex_rollout_files(codex_root) if fresh(f)] if Path(codex_root).is_dir() else []
+    claude_count = sum(
+        ingest_claude_session(db, f, label_from_project_dir(f.parent.name), host=host, machine_id=machine_id)
+        for f in claude
+    )
+    codex_count = sum(ingest_codex_rollout(db, f, host=host, machine_id=machine_id) for f in codex)
+    return {"claude": (len(claude), claude_count), "codex": (len(codex), codex_count)}
+
+
 def main(argv=None):
     """`python -m khipumaq.ingest claude-session [PATH]`. Without PATH, reads
     the Claude Code hook JSON from stdin and ingests its `transcript_path`

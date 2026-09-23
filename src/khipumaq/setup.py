@@ -1,10 +1,11 @@
 """Idempotent install/uninstall of khipumaq's user-scope wiring on one machine.
 
-Three places, because three programs read them:
+Four places, because four programs read them:
 - ~/.claude/settings.json: a SessionEnd hook that ingests the ending session.
 - ~/.claude.json: the read-only MCP server, under mcpServers["khipumaq"].
 - $CODEX_HOME/hooks.json + config.toml: SessionEnd/SubagentStop hooks that
   ingest the closing rollout, and the trust Codex requires before it runs them.
+- ~/.config/systemd/user: a daily sweep timer, the retry for failed hooks.
 
 Our entries are recognized by their command, not by a tag, so Codex's schema
 never sees a key it does not know. Install also removes the pre-package
@@ -61,8 +62,8 @@ def _mcp_entry():
     return {"type": "stdio", "command": prefix[0], "args": prefix[1:] + ["serve"], "env": {}}
 
 
-def _is_ours(command, legacy=True):
-    return any(s in command for s in _OURS + (_LEGACY if legacy else ()))
+def _is_ours(command):
+    return any(s in command for s in _OURS + _LEGACY)
 
 
 def _load(path):
@@ -267,3 +268,48 @@ def codex_hook(stdin=sys.stdin):
         child.stdin.write(payload)
         child.stdin.close()
     return 0
+
+
+# -- Nightly sweep (systemd user timer) ----------------------------------------
+
+UNIT = "khipumaq-sweep"
+
+
+def _unit_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
+
+
+def has_systemd_user():
+    return shutil.which("systemctl") is not None and subprocess.run(
+        ["systemctl", "--user", "is-system-running"], capture_output=True
+    ).returncode in (0, 1)  # 1 = "degraded": running, with some failed unit
+
+
+def install_timer():
+    """Daily sweep; Persistent=true runs a missed one at the next boot, so a
+    machine that was off tonight is caught when it wakes (spec D4 layer 2)."""
+    command = " ".join(command_prefix() + ["sweep"])
+    units = {
+        f"{UNIT}.service": (
+            "[Unit]\nDescription=khipumaq: ingest sessions the hooks missed\n\n"
+            f"[Service]\nType=oneshot\nExecStart={command}\n"
+        ),
+        f"{UNIT}.timer": (
+            "[Unit]\nDescription=khipumaq nightly sweep\n\n"
+            "[Timer]\nOnCalendar=daily\nRandomizedDelaySec=1h\nPersistent=true\n\n"
+            "[Install]\nWantedBy=timers.target\n"
+        ),
+    }
+    for name, text in units.items():
+        _atomic_write(_unit_dir() / name, text)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"], check=True, capture_output=True)
+
+
+def uninstall_timer():
+    if not (_unit_dir() / f"{UNIT}.timer").exists():
+        return
+    subprocess.run(["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"], capture_output=True)
+    for suffix in ("service", "timer"):
+        (_unit_dir() / f"{UNIT}.{suffix}").unlink(missing_ok=True)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)

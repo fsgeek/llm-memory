@@ -18,6 +18,8 @@ def main(argv=None):
     ingest = sub.add_parser("ingest", help="ingest sessions (see `khipumaq ingest -h`)", add_help=False)
     ingest.add_argument("rest", nargs=argparse.REMAINDER)
     sub.add_parser("describe", help="print what the store holds")
+    sweep = sub.add_parser("sweep", help="ingest this machine's sessions changed since the last sweep")
+    sweep.add_argument("--all", action="store_true", help="ignore the last sweep; ingest every session file")
     install = sub.add_parser("install", help="wire hooks and the MCP server on this machine")
     install.add_argument("--no-codex", action="store_true", help="skip the Codex hooks")
     sub.add_parser("uninstall", help="remove khipumaq's hooks and MCP entry")
@@ -39,6 +41,8 @@ def main(argv=None):
 
         print(json.dumps(describe(get_database()), indent=2))
         return 0
+    if args.command == "sweep":
+        return _sweep(everything=args.all)
     if args.command == "codex-hook":
         from khipumaq.setup import codex_hook
 
@@ -46,6 +50,38 @@ def main(argv=None):
     if args.command == "install":
         return _install(skip_codex=args.no_codex)
     return _uninstall()
+
+
+SWEEP_STATE = Path.home() / ".local" / "state" / "khipumaq" / "last-sweep"
+SWEEP_MARGIN = 86400  # re-read a day before the last sweep: sessions still open then
+
+
+def _sweep(everything):
+    """Ingest session files modified since the last successful sweep, so a
+    failed hook is caught the next time this runs (spec D4 layer 2). The first
+    run, or --all, reads everything still on disk."""
+    import socket
+    import time
+
+    from khipumaq.db import get_database
+    from khipumaq.ingest import read_machine_id, sweep
+    from khipumaq.observability import emit_ingest_event
+    from khipumaq.setup import codex_home
+
+    started = time.time()
+    since = None
+    if not everything and SWEEP_STATE.exists():
+        since = float(SWEEP_STATE.read_text()) - SWEEP_MARGIN
+    host, claude_root = socket.gethostname(), Path.home() / ".claude" / "projects"
+    result = sweep(get_database(), claude_root, codex_home() / "sessions", since=since,
+                   host=host, machine_id=read_machine_id())
+    for kind, root in (("claude", claude_root), ("codex", codex_home() / "sessions")):
+        files, count = result[kind]
+        emit_ingest_event(kind=f"sweep-{kind}", label=None, host=host, count=count, source_file=root)
+        print(f"sweep: {kind}: {count} episodes from {files} files under {root}")
+    SWEEP_STATE.parent.mkdir(parents=True, exist_ok=True)
+    SWEEP_STATE.write_text(str(started))
+    return 0
 
 
 def _claude_paths():
@@ -68,6 +104,11 @@ def _install(skip_codex):
     else:
         setup.install_codex(setup.codex_home(), codex_bin)
         print("khipumaq: Codex SessionEnd/SubagentStop hooks installed and trusted.")
+    if setup.has_systemd_user():
+        setup.install_timer()
+        print("khipumaq: nightly sweep timer enabled (systemctl --user status khipumaq-sweep.timer).")
+    else:
+        print("khipumaq: no systemd user session; schedule `khipumaq sweep` yourself.", file=sys.stderr)
     try:
         print(f"khipumaq: database config: {config_path()}")
     except FileNotFoundError as exc:
@@ -81,7 +122,8 @@ def _uninstall():
 
     setup.uninstall_claude(*_claude_paths())
     setup.uninstall_codex(setup.codex_home())
-    print("khipumaq: hooks and MCP entry removed. The store is untouched.")
+    setup.uninstall_timer()
+    print("khipumaq: hooks, MCP entry, and sweep timer removed. The store is untouched.")
     return 0
 
 
