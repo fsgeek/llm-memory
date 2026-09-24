@@ -468,16 +468,16 @@ def test_main_hook_mode_reads_transcript_path_from_stdin(tmp_path, monkeypatch):
         _delete_if_present(collection, keys_to_clean)
 
 
-def test_hook_command_imports_from_foreign_cwd_with_pythonpath(tmp_path):
+def test_installed_hook_command_imports_from_foreign_cwd_without_pythonpath(
+    tmp_path,
+):
     git_root = Path(__file__).resolve().parents[1]
-    python = git_root / ".venv" / "bin" / "python"
+    khipumaq = git_root / ".venv" / "bin" / "khipumaq"
     command = [
-        "timeout",
-        "30",
-        str(python),
-        "-c",
-        "import sys; from khipumaq.ingest import main; "
-        'sys.exit(main(["claude-session", "--dry-run"]))',
+        str(khipumaq),
+        "ingest",
+        "claude-session",
+        "--dry-run",
     ]
     session_id = str(uuid4())
     transcript = tmp_path / "-home-tony-projects-hamutay" / f"{session_id}.jsonl"
@@ -496,22 +496,16 @@ def test_hook_command_imports_from_foreign_cwd_with_pythonpath(tmp_path):
     foreign_cwd.mkdir()
     hook_input = json.dumps({"transcript_path": str(transcript)})
 
-    env_without_pythonpath = os.environ.copy()
-    env_without_pythonpath.pop("PYTHONPATH", None)
-    failed = subprocess.run(
-        command,
-        cwd=foreign_cwd,
-        env=env_without_pythonpath,
-        input=hook_input,
-        text=True,
-        capture_output=True,
-        check=False,
+    hook_env = os.environ.copy()
+    hook_env.pop("PYTHONPATH", None)
+    hook_env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "CODEX_HOME": str(tmp_path / "codex"),
+            "KHIPUMAQ_CONFIG": str(git_root / "config" / "db-config.ini"),
+        }
     )
-
-    assert failed.returncode != 0
-    assert "ModuleNotFoundError: No module named 'llm_memory'" in failed.stderr
-
-    hook_env = env_without_pythonpath | {"PYTHONPATH": str(git_root)}
     completed = subprocess.run(
         command,
         cwd=foreign_cwd,
@@ -520,6 +514,7 @@ def test_hook_command_imports_from_foreign_cwd_with_pythonpath(tmp_path):
         text=True,
         capture_output=True,
         check=False,
+        timeout=30,
     )
 
     assert completed.returncode == 0, completed.stderr

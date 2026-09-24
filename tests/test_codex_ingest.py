@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import sys
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from khipumaq.ingest import (
     ingest_codex_rollout,
     label_from_path,
     main,
+    sweep,
 )
 
 
@@ -360,10 +362,150 @@ def test_explicit_codex_label_overrides_cwd(tmp_path):
         ("/home/tony/projects/yanantin", "yanantin_construction"),
         ("/home/tony/projects/wamason.com", "wamason-com"),
         ("/home/tony", "home"),
+        ("/home/u/projects/cpsc416/tmp/capstone/s1", "cpsc416"),
+        ("/home/u/projects/llm-memory/.worktrees/x", "llm-memory"),
+        ("/home/u/projects/yanantin", "yanantin_construction"),
+        ("/mnt/c/Users/x/repos/pablo", "mnt-c-users-x-repos-pablo"),
+        ("/home/u", "home"),
     ],
 )
 def test_label_from_path_maps_project_layouts(path, expected):
     assert label_from_path(path) == expected
+
+
+def test_sweep_ingests_only_fresh_claude_and_codex_files_with_derived_labels(
+    tmp_path,
+):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    claude_root = tmp_path / "claude-projects"
+    codex_root = tmp_path / "codex-sessions"
+    fresh_claude_uuid = str(uuid4())
+    old_claude_uuid = str(uuid4())
+    fresh_claude_session = str(uuid4())
+    old_claude_session = str(uuid4())
+    fresh_claude = (
+        claude_root / "-home-u-projects-demo" / f"{fresh_claude_session}.jsonl"
+    )
+    old_claude = (
+        claude_root / "-home-u-projects-old-demo" / f"{old_claude_session}.jsonl"
+    )
+    fresh_codex_session = f"sweep-fresh-{marker}"
+    old_codex_session = f"sweep-old-{marker}"
+    fresh_codex_message = f"msg_fresh_{marker}"
+    old_codex_message = f"msg_old_{marker}"
+    fresh_codex_key = f"{fresh_codex_session}-{fresh_codex_message}"
+    old_codex_key = f"{old_codex_session}-{old_codex_message}"
+    fresh_codex = codex_root / "2026" / "09" / "23" / "rollout-fresh.jsonl"
+    old_codex = codex_root / "2026" / "09" / "22" / "rollout-old.jsonl"
+    keys = {
+        fresh_claude_uuid,
+        old_claude_uuid,
+        fresh_codex_key,
+        old_codex_key,
+    }
+    try:
+        _write_jsonl(
+            fresh_claude,
+            [
+                {
+                    "type": "user",
+                    "sessionId": fresh_claude_session,
+                    "timestamp": "2026-09-23T10:00:00Z",
+                    "message": {"content": f"fresh Claude prompt {marker}"},
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": fresh_claude_session,
+                    "uuid": fresh_claude_uuid,
+                    "timestamp": "2026-09-23T10:00:01Z",
+                    "message": {
+                        "model": "claude-test",
+                        "content": f"fresh Claude response {marker}",
+                    },
+                },
+            ],
+        )
+        _write_jsonl(
+            old_claude,
+            [
+                {
+                    "type": "assistant",
+                    "sessionId": old_claude_session,
+                    "uuid": old_claude_uuid,
+                    "timestamp": "2026-09-22T10:00:01Z",
+                    "message": {
+                        "model": "claude-test",
+                        "content": f"old Claude response {marker}",
+                    },
+                }
+            ],
+        )
+        _write_jsonl(
+            fresh_codex,
+            [
+                _session_meta(
+                    fresh_codex_session,
+                    cwd="/home/u/projects/codex-demo/nested/workdir",
+                ),
+                _turn_context("gpt-test"),
+                _message(
+                    "assistant",
+                    f"fresh Codex response {marker}",
+                    "2026-09-23T10:00:02Z",
+                    fresh_codex_message,
+                ),
+            ],
+        )
+        _write_jsonl(
+            old_codex,
+            [
+                _session_meta(old_codex_session, cwd="/home/u/projects/old-codex"),
+                _turn_context("gpt-test"),
+                _message(
+                    "assistant",
+                    f"old Codex response {marker}",
+                    "2026-09-22T10:00:02Z",
+                    old_codex_message,
+                ),
+            ],
+        )
+        since = 1_800_000_000
+        os.utime(fresh_claude, (since + 10, since + 10))
+        os.utime(fresh_codex, (since + 10, since + 10))
+        os.utime(old_claude, (since - 10, since - 10))
+        os.utime(old_codex, (since - 10, since - 10))
+
+        result = sweep(
+            db,
+            claude_root,
+            codex_root,
+            since=since,
+            host="sweep-host",
+            machine_id="sweep-machine",
+        )
+
+        assert result == {"claude": (1, 1), "codex": (1, 1)}
+        assert collection.get(fresh_claude_uuid)["experiment_label"] == "demo"
+        assert collection.get(fresh_codex_key)["experiment_label"] == "codex-demo"
+        assert collection.get(fresh_codex_key)["codex"]["cwd"] == (
+            "/home/u/projects/codex-demo/nested/workdir"
+        )
+        assert not collection.has(old_claude_uuid)
+        assert not collection.has(old_codex_key)
+    finally:
+        _delete_if_present(collection, keys)
+
+
+def test_sweep_counts_missing_roots_as_zero(tmp_path):
+    db = get_database()
+
+    assert sweep(db, tmp_path / "missing-claude", tmp_path / "missing-codex") == {
+        "claude": (0, 0),
+        "codex": (0, 0),
+    }
 
 
 def test_codex_rollout_files_returns_only_dated_rollouts_oldest_first(tmp_path):

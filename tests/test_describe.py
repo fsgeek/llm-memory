@@ -59,7 +59,10 @@ def test_describe_reports_inserted_episodes_by_label_and_host():
             item["count"] for item in result["hosts"] if item["host"] == host
         )
 
-        assert result["episodes"] == before["episodes"] + len(keys)
+        # This suite shares the live store with session hooks, so unrelated
+        # episodes can arrive between the two snapshots. The unique label and
+        # host assertions below isolate the documents this test inserted.
+        assert result["episodes"] >= before["episodes"] + len(keys)
         assert label_count == len(keys)
         assert host_count == len(keys)
         assert isinstance(result["newest"], str)
