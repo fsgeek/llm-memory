@@ -132,6 +132,33 @@ def read_machine_id(path=Path("/etc/machine-id")):
     return path.read_text(encoding="utf-8").strip()
 
 
+# User-type records Claude Code writes that are not a prompt (amendment A21):
+# harness output wrapped in these tags. What the person typed stays, including
+# `<command-name>` (a slash command), `<bash-input>`, and pasted content.
+_CLAUDE_INJECTED_TAGS = {
+    "system-reminder", "local-command-caveat", "local-command-stdout",
+    "local-command-stderr", "bash-stdout", "bash-stderr", "task-notification",
+}
+_CLAUDE_INJECTED_PREFIXES = ("This session is being continued from a previous conversation",)
+
+
+def _claude_prompt(rec, msg):
+    """The prompt text of a `type: user` record, or None when the record is not
+    one. Tool results are `type: user` too, and carry no text blocks; before
+    A21 they overwrote the prompt with "" and 70% of Claude episodes lost it.
+    `isMeta` records and compaction summaries are the harness speaking."""
+    if rec.get("isMeta") or rec.get("isCompactSummary"):
+        return None
+    text = _turn_text(msg.get("content"))
+    t = text.lstrip()
+    if not t or t.startswith(_CLAUDE_INJECTED_PREFIXES):
+        return None
+    m = re.match(r"<([A-Za-z_-]+)", t)
+    if m and m.group(1) in _CLAUDE_INJECTED_TAGS:
+        return None
+    return text
+
+
 def claude_session_to_episodes(path, experiment_label, host=None, machine_id=None, canonical=str):
     """Yield one episode per assistant turn in a Claude Code project JSONL.
 
@@ -165,8 +192,9 @@ def claude_session_to_episodes(path, experiment_label, host=None, machine_id=Non
                 continue
             session = rec.get("sessionId") or session
             if rtype == "user":
-                last_user = _turn_text(msg.get("content"))
-                last_user_ts = rec.get("timestamp")
+                text = _claude_prompt(rec, msg)
+                if text is not None:
+                    last_user, last_user_ts = text, rec.get("timestamp")
                 continue
             if rtype != "assistant":
                 continue

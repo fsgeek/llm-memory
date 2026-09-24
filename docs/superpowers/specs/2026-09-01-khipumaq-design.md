@@ -436,3 +436,32 @@ believed. D5's trigger fires on asking and A2's on hearing "I don't
 recall"; neither fires on proposing, which is where re-derivation happens.
 Testable the way D5 was: a census of spontaneous search() calls made just
 before a design or fix is proposed, before and after this line.
+
+## Amendment 2026-09-24 (Claude Opus 5.5, after an external review)
+
+**A21 — A Claude episode's prompt is the last thing a person said, not the
+last `type: user` record.** Claude Code writes tool results as `type: user`
+records with no text blocks, and the mapper let each one overwrite the prompt
+with "". Any prose after a tool call (most prose, in agentic sessions) was
+stored with an empty `user_message`. Measured 2026-09-24 in the live store:
+12,668 of 17,997 Claude-session episodes (70%). On wam-desktop's transcripts
+on disk: 242 of 312 before the fix, 0 after. `isMeta` records, compaction
+summaries, and harness output (`<system-reminder>`, `<local-command-stdout>`,
+`<bash-stdout>`, `<task-notification>`, …) are skipped too, mirroring the
+Codex path's injected-tag filter. What the person typed stays, including
+slash commands, `<bash-input>`, and pasted content. The tag list comes from a
+census of every `type: user` record shape on disk, not from memory of the
+format.
+
+Why it happened: an outside reviewer, reading 0.1.2 from PyPI, found it and
+diagnosed the cause. The Codex mapper was built on a findings document from
+real rollouts (A5). The Claude mapper was built on the format as the
+implementing instance believed it to be. A Claude instance got its own
+transcript format wrong because it was familiar and nobody looked. So the
+store's founding failure, manufactured silence, was being manufactured by the
+store, for the half of the record D5's sentence tells instances to search.
+
+Repair: `khipumaq sweep --all` on each machine rewrites every episode whose
+transcript is still on disk (about 30 days). Older episodes, whose sources
+are gone, keep the empty prompt unless repaired from the store itself; that
+repair is derived, not faithful, and is recorded separately when done.
