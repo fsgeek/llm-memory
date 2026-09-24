@@ -461,7 +461,17 @@ transcript format wrong because it was familiar and nobody looked. So the
 store's founding failure, manufactured silence, was being manufactured by the
 store, for the half of the record D5's sentence tells instances to search.
 
-Repair: `khipumaq sweep --all` on each machine rewrites every episode whose
-transcript is still on disk (about 30 days). Older episodes, whose sources
-are gone, keep the empty prompt unless repaired from the store itself; that
-repair is derived, not faithful, and is recorded separately when done.
+Repair, done 2026-09-24: `khipumaq sweep --all` on wam-desktop, wam-nuc,
+and WAM-THREADRIPPER (with its Windows side). Every transcript still on disk
+is now paired correctly: of 9,152 Claude episodes since 2026-08-24, 76 are
+still empty, all from four transcripts already gone from disk. Older than
+that, 4,315 episodes stay empty. 4,225 of them are in sessions that still hold
+other prompts: the person's words are in the store, on the first prose
+episode after each prompt, and a search for them finds that turn. What was
+lost is the pairing on the turn's later episodes, not mostly the words.
+
+No repair from the store. Carrying a session's last prompt forward would be
+wrong exactly where it cannot be checked: when the first reply to a prompt
+was a tool call, that prompt never reached the store, and carry-forward would
+attach the one before it. An empty `user_message` is an honest absence; an
+inferred one would be a guess stored as the record.
