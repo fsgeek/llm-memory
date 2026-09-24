@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "An episodic store of every prior Claude Code and Codex session — the user's words and the assistant's responses — searchable by the instances that come after."
 readme = "README.md"
 requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Tony", email = "fsgeek@cs.ubc.ca" }]
 keywords = ["memory", "episodic", "llm", "agent", "arangodb", "mcp"]
 classifiers = [
