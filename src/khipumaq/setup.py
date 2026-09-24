@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 MCP_NAME = "khipumaq"
@@ -43,10 +44,13 @@ def _checkout_root():
 
 def command_prefix():
     """How hooks and the MCP entry invoke khipumaq on this machine. Absolute
-    paths throughout: Claude Code and Codex spawn hooks with a minimal PATH."""
+    paths throughout: Claude Code and Codex spawn hooks with a minimal PATH.
+    From a wheel, pinned to the installed version: the hooks run on every
+    session end with every transcript in reach, so a later release runs only
+    after the user runs `install` again, not whenever uvx resolves it."""
     if _checkout_root() is not None:
         return [str(Path(sys.executable).parent / "khipumaq")]
-    return [shutil.which("uvx") or "uvx", "--python", "3.14", "khipumaq"]
+    return [shutil.which("uvx") or "uvx", "--from", f"khipumaq=={version('khipumaq')}", "khipumaq"]
 
 
 def _claude_hook_command():

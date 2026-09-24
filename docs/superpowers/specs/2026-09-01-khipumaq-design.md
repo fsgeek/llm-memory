@@ -475,3 +475,33 @@ wrong exactly where it cannot be checked: when the first reply to a prompt
 was a tool call, that prompt never reached the store, and carry-forward would
 attach the one before it. An empty `user_message` is an honest absence; an
 inferred one would be a guess stored as the record.
+
+**A22 — The rest of the review's findings, taken or declined.**
+- *The README's "an instance cannot edit the record" was overstated.* There
+  is no write tool, but an instance with a shell can read the config's
+  password or edit its transcript before ingest (which overwrites, per A4).
+  The README now says exactly that. Tamper-evidence (insert-only ingest that
+  refuses a changed content hash, a read-only database user for the server)
+  is a design of its own, and it has to be reconciled with A4 first; not
+  done.
+- *Unpinned `uvx khipumaq` in every hook.* A wheel install now writes
+  `uvx --from khipumaq==<installed> khipumaq`, so a new release runs on
+  transcripts only after `install` is run again. Checkout installs are
+  unchanged.
+- *The query digest could be reversed by hashing guesses.* It is now an
+  HMAC under a random per-machine key beside the event log
+  (`query_hmac`, replacing `query_sha256`). Repeated queries still match
+  on one machine, which is what the log is for.
+- *`requires-python >= 3.14` had no reason.* The suite passes on 3.11, 3.12
+  and 3.13 (tested 2026-09-24 in scratch environments); the bound is now 3.11,
+  and the hook command no longer forces `--python 3.14`.
+- *Packaging:* repository and issue URLs, a Linux classifier, the README
+  says Linux/WSL only, links that work from PyPI, the Codex hook trust stated
+  plainly, and who wrote the code.
+- *Declined:* `pyproject.toml.orig` in the sdist is uv_build's normal output,
+  identical to the repo's file. The event-log path keeps its `llm-memory`
+  name (A11).
+- *Deferred:* the research-era code still in the package (taste_open,
+  gateway, `evaluate`), the read-modify-write of `~/.claude.json`,
+  `waitForSync` on every search, no cap on `limit`, and noisy
+  `matched_field`.

@@ -33,12 +33,17 @@ deletes transcripts after about 30 days, so the record does not even wait.
   fresh it is, and when to reach for it — and says plainly when ingestion
   looks stale.
 
-There is no write tool. Episodes come only from the transcripts, so an
-instance cannot edit the record of what it did.
+There is no write tool: episodes come only from the transcripts, and nothing
+the server offers can change them. That is not tamper-proofing. An instance
+with a shell can read the database password in your config file, or edit its
+own transcript before the session ends, and the next ingest will store what
+it finds.
 
 ## Install
 
-You need Python 3.14, [uv](https://docs.astral.sh/uv/), and an ArangoDB 3.12
+khipumaq runs on Linux and on WSL; it uses systemd, `/etc/machine-id`, and
+`fcntl`, so macOS and native Windows are not supported. You need Python 3.11
+or newer, [uv](https://docs.astral.sh/uv/), and an ArangoDB 3.12
 server you control (a local container is fine) with a database and a user
 that can read and write it. khipumaq creates its collection and search view on
 first use.
@@ -62,8 +67,8 @@ first use.
 2. Wire this machine:
 
    ```sh
-   uvx --python 3.14 khipumaq install
-   uvx --python 3.14 khipumaq sweep      # first run ingests everything on disk
+   uvx khipumaq install
+   uvx khipumaq sweep      # first run ingests everything on disk
    ```
 
    `install` adds the Claude Code SessionEnd hook, the MCP server entry, the
@@ -71,6 +76,11 @@ first use.
    systemd user timer for the sweep, and — on WSL — the MCP entry for Claude
    Code and Claude Desktop on Windows. `khipumaq uninstall` removes all of it
    and leaves the store alone.
+
+   Codex asks before running a new hook; `install` records its own hooks as
+   trusted, so running `install` is that approval. The hooks and the server
+   are pinned to the version you installed, so a new release never runs on
+   your transcripts until you choose it: `uvx khipumaq@latest install`.
 
 3. Restart Claude Code. Run `install` on each machine whose sessions should
    land in the store; they can all point at one database.
@@ -83,15 +93,22 @@ through the same config file but is **not tested**; pull requests welcome.
 The store holds your conversations in full. It lives where you put it and
 nowhere else: khipumaq sends nothing to any service but your database. Its
 operational event log (`~/.local/state/llm-memory/events.jsonl`) records
-identifiers, digests, and counts, never query text or episode content. Point
+identifiers, digests, and counts, never query text or episode content;
+queries are digested with a random key kept on your machine, so a digest
+cannot be reversed by hashing guesses. Point
 it at a database on a network you trust.
 
 ## Status
 
 Pre-alpha, and used daily. Design notes and the record of how it got here are
-in `docs/superpowers/specs/2026-09-01-khipumaq-design.md`.
+in the [design spec](https://github.com/fsgeek/llm-memory/blob/main/docs/superpowers/specs/2026-09-01-khipumaq-design.md).
+
+khipumaq was written by Claude (Anthropic) in Claude Code, with its tests
+written separately by Codex (OpenAI), under the direction of its human
+author, who decided what it should be. The commit history records which
+hand wrote what.
 
 ## License
 
 MIT. Contributions are accepted under the Developer Certificate of Origin; see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/fsgeek/llm-memory/blob/main/CONTRIBUTING.md).

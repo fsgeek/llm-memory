@@ -7,10 +7,16 @@ is dropped with a note on stderr, because the store's work must not fail on
 its own bookkeeping. What the log is for: seeing that searches happen, how
 wide their candidate sets are, and whether the same query digest recurs —
 the material for improving search without reading anyone's words.
+
+The query digest is keyed with a random per-machine secret kept beside the
+log (`event-key`, 0600): an unkeyed hash of a short query can be reversed by
+hashing guesses. The same query on the same machine still gives the same
+digest, which is all the log needs.
 """
 
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -24,12 +30,35 @@ def _sha256(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _query_digest(text):
+    """HMAC-SHA256 of the query under this machine's event key, created on
+    first use. None if the key cannot be read or made: bookkeeping must not
+    fail a search."""
+    try:
+        path = _event_log_path().with_name("event-key")
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            tmp = path.with_name(f".event-key.{os.getpid()}")
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(os.urandom(32))
+            try:
+                os.link(tmp, path)  # atomic; a concurrent first use keeps the winner's key
+            except FileExistsError:
+                pass
+            finally:
+                tmp.unlink()
+        return hmac.new(path.read_bytes(), text.encode("utf-8"), hashlib.sha256).hexdigest()
+    except Exception:
+        return None
+
+
 def emit_search_event(*, query, scope, since, until, total, returned, keys) -> bool:
-    """A search completed. The query is recorded only as a digest."""
+    """A search completed. The query is recorded only as a keyed digest."""
     return _write(
         "search.completed",
         {
-            "query_sha256": _sha256(query),
+            "query_hmac": _query_digest(query),
             "scope": scope,
             "since": since,
             "until": until,
