@@ -79,9 +79,35 @@ def _sweep(everything):
         files, count = result[kind]
         emit_ingest_event(kind=f"sweep-{kind}", label=None, host=host, count=count, source_file=root)
         print(f"sweep: {kind}: {count} episodes from {files} files under {root}")
+    _sweep_windows(get_database(), since, host)
     SWEEP_STATE.parent.mkdir(parents=True, exist_ok=True)
     SWEEP_STATE.write_text(str(started))
     return 0
+
+
+def _sweep_windows(db, since, host):
+    """On WSL, also sweep the Windows user's Claude Code, Cowork, and Codex
+    transcripts: Windows runs no hooks of ours, so this is their only path in."""
+    from khipumaq import wsl
+    from khipumaq.ingest import sweep
+    from khipumaq.observability import emit_ingest_event
+
+    profile = wsl.windows_profile()
+    if profile is None:
+        return
+    machine_id = wsl.windows_machine_id()
+    totals = {}
+    for claude_root, codex_root, label in wsl.sources(profile):
+        result = sweep(db, claude_root, codex_root, since=since, host=host, machine_id=machine_id,
+                       canonical=wsl.windows_path, label=label)
+        for kind, (files, count) in result.items():
+            name = label or f"windows-{kind}"
+            f0, c0 = totals.get(name, (0, 0))
+            totals[name] = (f0 + files, c0 + count)
+    for name, (files, count) in totals.items():
+        emit_ingest_event(kind=f"sweep-{name}", label=None, host=host, count=count,
+                          source_file=wsl.windows_path(profile))
+        print(f"sweep: {name}: {count} episodes from {files} files under {wsl.windows_path(profile)}")
 
 
 def _claude_paths():
