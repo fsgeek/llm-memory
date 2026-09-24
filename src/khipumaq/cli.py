@@ -136,6 +136,11 @@ def _install(skip_codex):
             # The hooks are written but untrusted, so Codex will not run them.
             print(f"khipumaq: Codex hooks NOT trusted: {exc}", file=sys.stderr)
             status = 1
+    from khipumaq.wsl import windows_path, windows_profile
+
+    if (profile := windows_profile()) is not None:
+        for path in setup.install_windows_clients(profile):
+            print(f"khipumaq: MCP server registered for Windows in {windows_path(path)} (via wsl.exe).")
     if setup.has_systemd_user():
         setup.install_timer()
         print("khipumaq: nightly sweep timer enabled (systemctl --user status khipumaq-sweep.timer).")
@@ -155,6 +160,10 @@ def _uninstall():
     setup.uninstall_claude(*_claude_paths())
     setup.uninstall_codex(setup.codex_home())
     setup.uninstall_timer()
+    from khipumaq.wsl import windows_profile
+
+    if (profile := windows_profile()) is not None:
+        setup.uninstall_windows_clients(profile)
     print("khipumaq: hooks, MCP entry, and sweep timer removed. The store is untouched.")
     return 0
 
