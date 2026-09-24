@@ -389,3 +389,39 @@ labels are unchanged: Claude Code's encoded directory name replaces `/`
 with `-`, so `projects/foo/bar` and `projects/foo-bar` cannot be told
 apart there. No configurable fold rules: the one rule is structural, and
 Tony does not expect to repeat the grading runs.
+
+**A16 — The Windows side of a WSL machine is swept through /mnt/c.**
+Claude Code on Windows, Claude Desktop's Cowork, and Codex on Windows keep
+transcripts under the Windows profile, where no hook of ours runs. On WSL,
+`khipumaq sweep` finds the profile by interop and sweeps it, recording the
+Windows path as `source_file` and Windows' MachineGuid as `machine_id`.
+Cowork tasks are Claude Code transcripts in the same format, one projects
+tree per task, labelled `cowork` by location (`audit.jsonl`, an HMAC-signed
+duplicate of the SDK stream, is not read). Labels learn the Windows project
+roots `source\repos` and `Documents\Claude\Projects`, and the Codex app's
+dated scratch directories (`codex`). First run on WAM-THREADRIPPER: 2,861
+Cowork episodes (back to 2026-02-12), 1,105 Windows Codex, 159 Windows
+Claude Code; 4 m 15 s, mostly /mnt/c I/O. Why a sweep and not a Windows
+install: no Windows Python, hooks, or scheduler to maintain; the cost is up
+to a day's latency for Windows sessions. `install` on WSL also registers
+the server for Claude Code on Windows and Claude Desktop as
+`wsl.exe -e <khipumaq> serve` (MCP initialize from Windows: ~2 s). This
+covers the read path the container was going to provide for Windows.
+
+**A17 — `install` creates the store on a fresh database.** Nothing in the
+package called `ensure_index`; the ayllu's store exists because it was
+made in June. Found while writing the README's install section.
+
+**A18 — The person is configuration.** `[khipumaq] person = Tony` in the
+config file; default "the user". The trigger became
+`when <person> says "I don't recall", search()` — still audible (A2), no
+pronoun.
+
+**A19 — Published.** khipumaq 0.1.2 on PyPI (MIT), after TestPyPI and a
+clean-room install in an empty HOME, which found that `mcp>=1.28` with no
+upper bound resolved mcp 2.x (FastMCP renamed) and the server could not
+start; pinned `<2` until a deliberate migration. Tests throughout were
+written by Codex (`codex exec`, test-only commits), 155 passing.
+Remaining from the agreed direction: the container (ArangoDB + MCP over
+HTTP + ingest endpoint) — now for other people's deployments more than the
+ayllu's, since A16 gives Windows its read and write paths.
