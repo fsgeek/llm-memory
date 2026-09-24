@@ -130,7 +130,20 @@ def test_sentence_always_tells_nonempty_store_users_to_search_first(label):
     )
 
     assert "search() first" in result
-    assert "when Tony says he does not recall, search()" in result
+    assert 'when the user says "I don\'t recall", search()' in result
+
+
+def test_sentence_uses_configured_person_everywhere_the_user_is_named():
+    result = sentence(
+        _stats(),
+        now=datetime(2026, 9, 3, 12, 30, tzinfo=UTC),
+        person="Tony",
+    )
+
+    assert "It holds Tony's words" in result
+    assert "Before asking Tony what happened or what was decided" in result
+    assert 'when Tony says "I don\'t recall", search()' in result
+    assert "the user" not in result
 
 
 def test_sentence_does_not_count_null_hosts_as_machines():
@@ -192,6 +205,24 @@ def test_instructions_reflects_episodes_inserted_during_the_test():
         for key in keys:
             if collection.has(key):
                 collection.delete(key)
+
+
+def test_instructions_passes_person_to_sentence():
+    class FakeAql:
+        def execute(self, _query, bind_vars):
+            return iter([_stats()])
+
+    class FakeDb:
+        aql = FakeAql()
+
+    result = instructions(
+        FakeDb(),
+        now=datetime(2026, 9, 3, 12, 30, tzinfo=UTC),
+        person="Ada",
+    )
+
+    assert "It holds Ada's words" in result
+    assert "the user's words" not in result
 
 
 @pytest.mark.parametrize(

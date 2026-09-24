@@ -79,3 +79,17 @@ def test_config_path_error_names_every_path_checked(tmp_path, monkeypatch):
     message = str(raised.value)
     assert str(xdg_config) in message
     assert str(checkout_config) in message
+
+
+def test_person_defaults_to_the_user_without_khipumaq_section(tmp_path):
+    config = tmp_path / "db-config.ini"
+    config.write_text("[database]\n", encoding="utf-8")
+
+    assert db.person(config) == "the user"
+
+
+def test_person_returns_configured_name(tmp_path):
+    config = tmp_path / "db-config.ini"
+    config.write_text("[khipumaq]\nperson = Ada\n", encoding="utf-8")
+
+    assert db.person(config) == "Ada"
