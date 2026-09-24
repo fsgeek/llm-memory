@@ -63,8 +63,11 @@ def _age(newest, now):
     return _plural(int(hours // 24), "day")
 
 
-def sentence(stats, label=None, now=None):
-    """The server's one sentence about itself, from a `describe()` result."""
+def sentence(stats, label=None, now=None, person="the user"):
+    """The server's one sentence about itself, from a `describe()` result.
+    `person` is who the sessions are with; the trigger is said in their name
+    because a person saying "I don't recall" is audible to the instance, where
+    its own ignorance is not (amendment A2)."""
     now = now or datetime.now(UTC)
     total = stats["episodes"]
     if not total:
@@ -89,12 +92,12 @@ def sentence(stats, label=None, now=None):
         )
         text += f"; this project is `{label}` ({count:,} episodes)"
     text += (
-        ". It holds the user's words and prior assistant responses, not "
-        "summaries. Before asking Tony what happened or what was decided, "
-        "search() first; when Tony says he does not recall, search()."
+        f". It holds {person}'s words and prior assistant responses, not "
+        f"summaries. Before asking {person} what happened or what was decided, "
+        f"search() first; when {person} says \"I don't recall\", search()."
     )
     return text
 
 
-def instructions(db, project_dir=None, now=None):
-    return sentence(describe(db), project_label(project_dir), now)
+def instructions(db, project_dir=None, now=None, person="the user"):
+    return sentence(describe(db), project_label(project_dir), now, person)

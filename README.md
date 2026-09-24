@@ -54,7 +54,10 @@ first use.
    user_password = ...
    ```
 
-   `$KHIPUMAQ_CONFIG` points elsewhere if you prefer.
+   `$KHIPUMAQ_CONFIG` points elsewhere if you prefer. An optional
+   `[khipumaq]` section with `person = <your name>` lets the server's
+   sentence name you ("Before asking <name> what happened…"); the default
+   is "the user".
 
 2. Wire this machine:
 

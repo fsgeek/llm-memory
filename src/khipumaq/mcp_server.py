@@ -17,7 +17,7 @@ Run for dogfooding:  uv run python -m khipumaq.mcp_server   (stdio transport)
 
 from mcp.server.fastmcp import FastMCP
 
-from khipumaq.db import get_database
+from khipumaq.db import get_database, person
 from khipumaq.describe import SERVER_NAME
 from khipumaq.describe import describe as _describe
 from khipumaq.describe import instructions as _instructions
@@ -31,7 +31,7 @@ def _self_description() -> str:
     the store at every start. If the store cannot be reached, say that rather
     than say nothing: the tools below will fail the same way."""
     try:
-        return _instructions(get_database())
+        return _instructions(get_database(), person=person())
     except Exception as exc:  # noqa: BLE001 — any failure is worth naming
         return (
             f"{SERVER_NAME} could not reach its episode store at start "
@@ -52,8 +52,8 @@ def search(
     until: str | None = None,
 ) -> dict:
     """Search every prior session's turns: the user's own words and the
-    assistant's full responses, from Claude Code and Codex sessions on all of
-    Tony's machines (March 2026 onward), keyed by project label. Use it before
+    assistant's full responses, from Claude Code and Codex sessions on every
+    machine where khipumaq is installed, keyed by project label. Use it before
     asking what happened, what was decided, or what a prior instance answered.
     `scope` restricts to one project label (see `describe`); "all" searches
     everything. `since`/`until` are ISO dates bounding the episode timestamp;

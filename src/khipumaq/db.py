@@ -35,6 +35,15 @@ def _load_config(path):
     return parser["database"]
 
 
+def person(path=None):
+    """Who these sessions are with, as the server's sentence should name them:
+    `person` under an optional [khipumaq] section of the same config file,
+    else "the user"."""
+    parser = configparser.ConfigParser()
+    parser.read(path or config_path())
+    return parser.get("khipumaq", "person", fallback="the user")
+
+
 def get_database(path=None):
     """Return a python-arango Database handle for the scoped llm_memory user.
     Fail-stop: missing config or unreachable server raises rather than degrading."""

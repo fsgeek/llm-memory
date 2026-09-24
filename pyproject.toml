@@ -1,6 +1,6 @@
 [project]
 name = "khipumaq"
-version = "0.1.0"
+version = "0.1.1"
 description = "An episodic store of every prior Claude Code and Codex session — the user's words and the assistant's responses — searchable by the instances that come after."
 readme = "README.md"
 requires-python = ">=3.14"
