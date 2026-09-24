@@ -96,6 +96,10 @@ def test_turn_text_extracts_only_supported_text_content(content, expected):
         ("-home-tony-projects-wamason.com", "wamason-com"),
         ("-home-tony-projects-yanantin", "yanantin_construction"),
         ("-home-tony-projects-quantumos", "quantumos"),
+        ("C--Users-u-source-repos-hamutay", "hamutay"),
+        ("C--Users-u-Documents-Claude-Projects-Gig-Work", "Gig-Work"),
+        ("C--Users-u-local-agent-mode-sessions-task-project", "cowork"),
+        ("C--Users-u-Documents-Codex-2026-08-25-go", "codex"),
         ("-home-tony", "home"),
     ],
 )

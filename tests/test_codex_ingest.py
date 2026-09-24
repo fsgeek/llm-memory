@@ -366,6 +366,12 @@ def test_explicit_codex_label_overrides_cwd(tmp_path):
         ("/home/u/projects/llm-memory/.worktrees/x", "llm-memory"),
         ("/home/u/projects/yanantin", "yanantin_construction"),
         ("/mnt/c/Users/x/repos/pablo", "mnt-c-users-x-repos-pablo"),
+        (r"C:\Users\u\source\repos\eidolon", "eidolon"),
+        (r"C:\Users\u\Documents\Codex\2026-08-25\go", "codex"),
+        (
+            r"C:\Users\u\AppData\Roaming\Claude\local-agent-mode-sessions\task-1\outputs\work\.claude\projects\C--Users-u-project",
+            "cowork",
+        ),
         ("/home/u", "home"),
     ],
 )
@@ -506,6 +512,99 @@ def test_sweep_counts_missing_roots_as_zero(tmp_path):
         "claude": (0, 0),
         "codex": (0, 0),
     }
+
+
+def test_sweep_applies_canonical_paths_and_label_override_to_all_files(tmp_path):
+    db = get_database()
+    ensure_index(db)
+    collection = db.collection(EPISODES)
+    marker = uuid4().hex
+    claude_root = tmp_path / "claude-projects"
+    codex_root = tmp_path / "codex-sessions"
+    claude_session = str(uuid4())
+    main_uuid = str(uuid4())
+    subagent_uuid = str(uuid4())
+    parent = claude_root / "encoded-cowork-project" / f"{claude_session}.jsonl"
+    subagent = parent.with_suffix("") / "subagents" / "agent-test.jsonl"
+    codex_session = f"canonical-sweep-{marker}"
+    codex_message = f"msg_{marker}"
+    codex_key = f"{codex_session}-{codex_message}"
+    codex_path = codex_root / "2026" / "08" / "25" / "rollout-test.jsonl"
+    keys = [main_uuid, subagent_uuid, codex_key]
+
+    def canonical(path):
+        return f"windows::{path}"
+
+    try:
+        _write_jsonl(
+            parent,
+            [
+                {
+                    "type": "user",
+                    "sessionId": claude_session,
+                    "timestamp": "2026-08-25T10:00:00Z",
+                    "message": {"content": f"main prompt {marker}"},
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": claude_session,
+                    "uuid": main_uuid,
+                    "timestamp": "2026-08-25T10:00:01Z",
+                    "message": {
+                        "model": "claude-test",
+                        "content": f"main response {marker}",
+                    },
+                },
+            ],
+        )
+        _write_jsonl(
+            subagent,
+            [
+                {
+                    "type": "assistant",
+                    "sessionId": claude_session,
+                    "uuid": subagent_uuid,
+                    "timestamp": "2026-08-25T10:00:02Z",
+                    "message": {
+                        "model": "claude-test",
+                        "content": f"subagent response {marker}",
+                    },
+                }
+            ],
+        )
+        _write_jsonl(
+            codex_path,
+            [
+                _session_meta(codex_session, cwd=r"C:\Users\u\unrelated"),
+                _turn_context("gpt-test"),
+                _message(
+                    "assistant",
+                    f"Codex response {marker}",
+                    "2026-08-25T10:00:03Z",
+                    codex_message,
+                ),
+            ],
+        )
+
+        result = sweep(
+            db,
+            claude_root,
+            codex_root,
+            host="windows-host",
+            machine_id="windows-machine",
+            canonical=canonical,
+            label="cowork",
+        )
+
+        assert result == {"claude": (1, 2), "codex": (1, 1)}
+        assert collection.get(main_uuid)["source_file"] == canonical(parent)
+        assert collection.get(subagent_uuid)["source_file"] == canonical(subagent)
+        assert collection.get(codex_key)["source_file"] == canonical(codex_path)
+        assert {
+            collection.get(key)["experiment_label"] for key in keys
+        } == {"cowork"}
+    finally:
+        _delete_if_present(collection, keys)
 
 
 def test_codex_rollout_files_returns_only_dated_rollouts_oldest_first(tmp_path):

@@ -260,3 +260,46 @@ def test_command_prefix_uses_this_checkouts_venv_binary():
     checkout = Path(__file__).resolve().parents[1]
 
     assert setup.command_prefix() == [str(checkout / ".venv" / "bin" / "khipumaq")]
+
+
+def test_install_and_uninstall_windows_clients_preserve_other_config(tmp_path):
+    profile = tmp_path / "windows-profile"
+    claude_code, claude_desktop = setup.windows_client_configs(profile)
+    code_config = {
+        "theme": "dark",
+        "mcpServers": {
+            "other": {"command": "other-server", "args": ["--flag"]},
+        },
+    }
+    desktop_config = {"theme": "light", "mcpServers": {}}
+    _write_json(claude_code, code_config)
+    _write_json(claude_desktop, desktop_config)
+
+    assert setup.install_windows_clients(profile) == [claude_code, claude_desktop]
+
+    entry = {
+        "command": "wsl.exe",
+        "args": ["-e", *setup.command_prefix(), "serve"],
+    }
+    installed_code = json.loads(claude_code.read_text(encoding="utf-8"))
+    installed_desktop = json.loads(claude_desktop.read_text(encoding="utf-8"))
+    assert installed_code["mcpServers"]["khipumaq"] == entry
+    assert installed_desktop["mcpServers"]["khipumaq"] == entry
+    assert installed_code["theme"] == "dark"
+    assert installed_code["mcpServers"]["other"] == code_config["mcpServers"][
+        "other"
+    ]
+    assert installed_desktop["theme"] == "light"
+
+    setup.uninstall_windows_clients(profile)
+
+    assert json.loads(claude_code.read_text(encoding="utf-8")) == code_config
+    assert json.loads(claude_desktop.read_text(encoding="utf-8")) == desktop_config
+
+
+def test_install_windows_clients_does_not_create_missing_config(tmp_path):
+    profile = tmp_path / "windows-profile"
+    paths = setup.windows_client_configs(profile)
+
+    assert setup.install_windows_clients(profile) == []
+    assert all(not path.exists() for path in paths)
