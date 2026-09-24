@@ -128,9 +128,15 @@ def test_sentence_always_tells_nonempty_store_users_to_search_first(label):
     result = sentence(
         _stats(), label=label, now=datetime(2026, 9, 3, 12, 30, tzinfo=UTC)
     )
+    asking_trigger = "Before asking the user what happened or what was decided"
+    proposal_trigger = "before proposing a design or a fix, search() for it"
+    recall_trigger = 'when the user says "I don\'t recall", search()'
 
     assert "search() first" in result
-    assert 'when the user says "I don\'t recall", search()' in result
+    assert proposal_trigger in result
+    assert recall_trigger in result
+    assert result.index(asking_trigger) < result.index(proposal_trigger)
+    assert result.index(proposal_trigger) < result.index(recall_trigger)
 
 
 def test_sentence_uses_configured_person_everywhere_the_user_is_named():
@@ -139,10 +145,16 @@ def test_sentence_uses_configured_person_everywhere_the_user_is_named():
         now=datetime(2026, 9, 3, 12, 30, tzinfo=UTC),
         person="Tony",
     )
+    asking_trigger = "Before asking Tony what happened or what was decided"
+    proposal_trigger = "before proposing a design or a fix, search() for it"
+    recall_trigger = 'when Tony says "I don\'t recall", search()'
 
     assert "It holds Tony's words" in result
-    assert "Before asking Tony what happened or what was decided" in result
-    assert 'when Tony says "I don\'t recall", search()' in result
+    assert asking_trigger in result
+    assert proposal_trigger in result
+    assert recall_trigger in result
+    assert result.index(asking_trigger) < result.index(proposal_trigger)
+    assert result.index(proposal_trigger) < result.index(recall_trigger)
     assert "the user" not in result
 
 
