@@ -67,7 +67,9 @@ def sentence(stats, label=None, now=None, person="the user"):
     """The server's one sentence about itself, from a `describe()` result.
     `person` is who the sessions are with; the trigger is said in their name
     because a person saying "I don't recall" is audible to the instance, where
-    its own ignorance is not (amendment A2)."""
+    its own ignorance is not (amendment A2). The proposal trigger (A20) covers
+    the case neither of those does: an instance reasoning toward a design from
+    what it believes, asking nobody, while the record already holds the answer."""
     now = now or datetime.now(UTC)
     total = stats["episodes"]
     if not total:
@@ -94,7 +96,9 @@ def sentence(stats, label=None, now=None, person="the user"):
     text += (
         f". It holds {person}'s words and prior assistant responses, not "
         f"summaries. Before asking {person} what happened or what was decided, "
-        f"search() first; when {person} says \"I don't recall\", search()."
+        f"search() first; before proposing a design or a fix, search() for it, "
+        f"because it may already exist; when {person} says \"I don't recall\", "
+        f"search()."
     )
     return text
 

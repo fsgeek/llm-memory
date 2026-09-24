@@ -425,3 +425,14 @@ written by Codex (`codex exec`, test-only commits), 155 passing.
 Remaining from the agreed direction: the container (ArangoDB + MCP over
 HTTP + ingest endpoint) — now for other people's deployments more than the
 ayllu's, since A16 gives Windows its read and write paths.
+
+**A20 — A third trigger: before proposing, search.** The sentence now
+says "before proposing a design or a fix, search() for it, because it may
+already exist." Why: on 2026-09-23 the implementing instance recommended an
+encrypted off-site backup that A10 had built three weeks earlier. The store
+held every episode of that work; the instance never searched, because it
+was not asking anyone anything, only reasoning toward a design from what it
+believed. D5's trigger fires on asking and A2's on hearing "I don't
+recall"; neither fires on proposing, which is where re-derivation happens.
+Testable the way D5 was: a census of spontaneous search() calls made just
+before a design or fix is proposed, before and after this line.
