@@ -16,8 +16,15 @@ def label_from_project_dir(name):
     """Derive the experiment label from a `~/.claude/projects/<name>` directory
     name. Strips the projects prefix, folds worktree dirs into their project,
     maps scratchpad-launched dirs to the project they were launched from, and
-    normalizes dots to dashes so `wamason.com` and `wamason-com` agree."""
-    m = re.search(r"-projects-(.+)$", name)
+    normalizes dots to dashes so `wamason.com` and `wamason-com` agree.
+    Windows keeps projects under `source\\repos` (Visual Studio) or
+    `Documents\\Claude\\Projects` (Claude Desktop); Cowork runs each task in a
+    directory of its own, and the Codex app in a dated scratch directory."""
+    if "-local-agent-mode-sessions-" in name:
+        return "cowork"
+    if re.search(r"-Documents-Codex-\d{4}-\d{2}-\d{2}(-|$)", name):
+        return "codex"
+    m = re.search(r"-(?:projects|source-repos|Documents-Claude-Projects)-(.+)$", name)
     if m:
         rest = m.group(1)
         rest = re.split(rf"-{_UUID}", rest)[0]  # scratchpad dirs
@@ -42,8 +49,9 @@ def label_from_path(path):
     `cpsc416`, not one label per student. The full path stays on the episode
     (`codex.cwd`). An encoded project directory name has lost its separators,
     so `label_from_project_dir` cannot do the same."""
-    m = re.match(r"(.*/projects/[^/]+)", str(path))
-    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", m.group(1) if m else str(path)))
+    path = str(path).replace("\\", "/")
+    m = re.match(r"(.*/(?:projects|source/repos|Documents/Claude/Projects)/[^/]+)", path)
+    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", m.group(1) if m else path))
 
 
 def record_to_episode(record, source_file):
@@ -124,7 +132,7 @@ def read_machine_id(path=Path("/etc/machine-id")):
     return path.read_text(encoding="utf-8").strip()
 
 
-def claude_session_to_episodes(path, experiment_label, host=None, machine_id=None):
+def claude_session_to_episodes(path, experiment_label, host=None, machine_id=None, canonical=str):
     """Yield one episode per assistant turn in a Claude Code project JSONL.
 
     Each line is one event; `type` is `user`/`assistant`/etc. An episode pairs an
@@ -136,7 +144,9 @@ def claude_session_to_episodes(path, experiment_label, host=None, machine_id=Non
     `experiment_label` is caller-supplied so a project's construction history
     partitions distinctly from pichay-captured `claude_code` traffic. `host` and
     `machine_id` are the machine of origin (spec D3); the caller supplies them
-    because a staged copy on another machine must not claim to be local."""
+    because a staged copy on another machine must not claim to be local, and
+    `canonical` maps the path read to the path on that machine (a Windows file
+    read through WSL's /mnt/c is recorded as C:\\...)."""
     session = "unknown"
     last_user = ""
     last_user_ts = None
@@ -170,7 +180,7 @@ def claude_session_to_episodes(path, experiment_label, host=None, machine_id=Non
                 "ts": rec.get("timestamp"),
                 "model": msg.get("model"),
                 "experiment_label": experiment_label,
-                "source_file": str(path),
+                "source_file": canonical(path),
                 "user_message": last_user,
                 "user_ts": last_user_ts,
                 "response": response,
@@ -191,7 +201,7 @@ def claude_session_files(path):
     return [path] + sorted(subagents.glob("*.jsonl"))
 
 
-def ingest_claude_session(db, path, experiment_label, dry_run=False, host=None, machine_id=None):
+def ingest_claude_session(db, path, experiment_label, dry_run=False, host=None, machine_id=None, canonical=str):
     """Load one Claude Code session (project JSONL plus its subagent
     transcripts) into the episodes collection. One episode per prose assistant
     turn. Idempotent per assistant uuid. When dry_run, counts what WOULD be
@@ -199,7 +209,7 @@ def ingest_claude_session(db, path, experiment_label, dry_run=False, host=None, 
     col = db.collection(EPISODES)
     count = 0
     for file in claude_session_files(path):
-        for episode in claude_session_to_episodes(file, experiment_label, host=host, machine_id=machine_id):
+        for episode in claude_session_to_episodes(file, experiment_label, host=host, machine_id=machine_id, canonical=canonical):
             if not dry_run:
                 col.insert(episode, overwrite=True)
             count += 1
@@ -282,7 +292,7 @@ def _iso(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def codex_rollout_to_episodes(path, experiment_label=None, host=None, machine_id=None):
+def codex_rollout_to_episodes(path, experiment_label=None, host=None, machine_id=None, canonical=str):
     """Yield one episode per prose assistant message in a Codex CLI rollout
     JSONL (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), paired with the
     most recent preceding user prompt — the mirror of
@@ -352,7 +362,7 @@ def codex_rollout_to_episodes(path, experiment_label=None, host=None, machine_id
                 "model": model,
                 "experiment_label": experiment_label
                 or (label_from_path(cwd) if cwd else "codex"),
-                "source_file": str(path),
+                "source_file": canonical(path),
                 "user_message": last_user,
                 "user_ts": last_user_ts,
                 "response": text,
@@ -377,32 +387,38 @@ def codex_rollout_files(root):
     return sorted(Path(root).glob("*/*/*/rollout-*.jsonl"))
 
 
-def ingest_codex_rollout(db, path, experiment_label=None, dry_run=False, host=None, machine_id=None):
+def ingest_codex_rollout(db, path, experiment_label=None, dry_run=False, host=None, machine_id=None, canonical=str):
     """Load one Codex rollout into the episodes collection. Idempotent per
     (session, message id). Returns the count."""
     col = db.collection(EPISODES)
     count = 0
-    for episode in codex_rollout_to_episodes(path, experiment_label, host=host, machine_id=machine_id):
+    for episode in codex_rollout_to_episodes(path, experiment_label, host=host, machine_id=machine_id, canonical=canonical):
         if not dry_run:
             col.insert(episode, overwrite=True)
         count += 1
     return count
 
 
-def sweep(db, claude_root, codex_root, since=None, host=None, machine_id=None):
+def sweep(db, claude_root, codex_root, since=None, host=None, machine_id=None, canonical=str, label=None):
     """Ingest every session file under a Claude Code projects tree and a Codex
     sessions tree whose mtime is at or after `since` (epoch seconds; None for
     all), idempotently: episodes are keyed by message id and overwritten (spec
-    D3/D4). This is the retry for hooks that failed. Returns
-    {"claude": (files, episodes), "codex": (files, episodes)}."""
+    D3/D4). This is the retry for hooks that failed. `canonical` maps each path
+    read to the path recorded; `label`, when given, overrides the derived one
+    (a tree whose location says more than its directory names, like Cowork's).
+    Returns {"claude": (files, episodes), "codex": (files, episodes)}."""
     fresh = lambda f: since is None or f.stat().st_mtime >= since
-    claude = [f for f in sorted(Path(claude_root).glob("*/*.jsonl")) if fresh(f)] if Path(claude_root).is_dir() else []
-    codex = [f for f in codex_rollout_files(codex_root) if fresh(f)] if Path(codex_root).is_dir() else []
+    claude = [f for f in sorted(Path(claude_root).glob("*/*.jsonl")) if fresh(f)] if claude_root and Path(claude_root).is_dir() else []
+    codex = [f for f in codex_rollout_files(codex_root) if fresh(f)] if codex_root and Path(codex_root).is_dir() else []
     claude_count = sum(
-        ingest_claude_session(db, f, label_from_project_dir(f.parent.name), host=host, machine_id=machine_id)
+        ingest_claude_session(db, f, label or label_from_project_dir(f.parent.name),
+                              host=host, machine_id=machine_id, canonical=canonical)
         for f in claude
     )
-    codex_count = sum(ingest_codex_rollout(db, f, host=host, machine_id=machine_id) for f in codex)
+    codex_count = sum(
+        ingest_codex_rollout(db, f, label, host=host, machine_id=machine_id, canonical=canonical)
+        for f in codex
+    )
     return {"claude": (len(claude), claude_count), "codex": (len(codex), codex_count)}
 
 

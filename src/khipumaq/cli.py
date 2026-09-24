@@ -79,9 +79,35 @@ def _sweep(everything):
         files, count = result[kind]
         emit_ingest_event(kind=f"sweep-{kind}", label=None, host=host, count=count, source_file=root)
         print(f"sweep: {kind}: {count} episodes from {files} files under {root}")
+    _sweep_windows(get_database(), since, host)
     SWEEP_STATE.parent.mkdir(parents=True, exist_ok=True)
     SWEEP_STATE.write_text(str(started))
     return 0
+
+
+def _sweep_windows(db, since, host):
+    """On WSL, also sweep the Windows user's Claude Code, Cowork, and Codex
+    transcripts: Windows runs no hooks of ours, so this is their only path in."""
+    from khipumaq import wsl
+    from khipumaq.ingest import sweep
+    from khipumaq.observability import emit_ingest_event
+
+    profile = wsl.windows_profile()
+    if profile is None:
+        return
+    machine_id = wsl.windows_machine_id()
+    totals = {}
+    for claude_root, codex_root, label in wsl.sources(profile):
+        result = sweep(db, claude_root, codex_root, since=since, host=host, machine_id=machine_id,
+                       canonical=wsl.windows_path, label=label)
+        for kind, (files, count) in result.items():
+            name = label or f"windows-{kind}"
+            f0, c0 = totals.get(name, (0, 0))
+            totals[name] = (f0 + files, c0 + count)
+    for name, (files, count) in totals.items():
+        emit_ingest_event(kind=f"sweep-{name}", label=None, host=host, count=count,
+                          source_file=wsl.windows_path(profile))
+        print(f"sweep: {name}: {count} episodes from {files} files under {wsl.windows_path(profile)}")
 
 
 def _claude_paths():
@@ -110,6 +136,11 @@ def _install(skip_codex):
             # The hooks are written but untrusted, so Codex will not run them.
             print(f"khipumaq: Codex hooks NOT trusted: {exc}", file=sys.stderr)
             status = 1
+    from khipumaq.wsl import windows_path, windows_profile
+
+    if (profile := windows_profile()) is not None:
+        for path in setup.install_windows_clients(profile):
+            print(f"khipumaq: MCP server registered for Windows in {windows_path(path)} (via wsl.exe).")
     if setup.has_systemd_user():
         setup.install_timer()
         print("khipumaq: nightly sweep timer enabled (systemctl --user status khipumaq-sweep.timer).")
@@ -119,8 +150,30 @@ def _install(skip_codex):
         print(f"khipumaq: database config: {config_path()}")
     except FileNotFoundError as exc:
         print(f"khipumaq: {exc}\n          Hooks and server will fail until it exists.", file=sys.stderr)
+        status = 1
+    else:
+        status = _ensure_store() or status
     print("khipumaq: restart Claude Code for the MCP server to load.")
     return status
+
+
+def _ensure_store():
+    """Create the episodes collection and its search view on a fresh database;
+    an existing store is left as it is."""
+    from khipumaq.db import get_database
+    from khipumaq.index import EPISODES, ensure_index
+
+    try:
+        db = get_database()
+        if db.has_collection(EPISODES):
+            print(f"khipumaq: store reachable, {db.collection(EPISODES).count():,} episodes.")
+        else:
+            ensure_index(db)
+            print("khipumaq: store created (episodes collection and search view).")
+    except Exception as exc:  # noqa: BLE001 — any failure here is worth naming
+        print(f"khipumaq: database unreachable ({type(exc).__name__}: {exc}).", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _uninstall():
@@ -129,6 +182,10 @@ def _uninstall():
     setup.uninstall_claude(*_claude_paths())
     setup.uninstall_codex(setup.codex_home())
     setup.uninstall_timer()
+    from khipumaq.wsl import windows_profile
+
+    if (profile := windows_profile()) is not None:
+        setup.uninstall_windows_clients(profile)
     print("khipumaq: hooks, MCP entry, and sweep timer removed. The store is untouched.")
     return 0
 

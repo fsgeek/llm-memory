@@ -334,3 +334,30 @@ def uninstall_timer():
     for suffix in ("service", "timer"):
         (_unit_dir() / f"{UNIT}.{suffix}").unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+
+# -- Windows clients on a WSL machine -----------------------------------------
+
+def windows_client_configs(profile):
+    """Claude Code on Windows and Claude Desktop read their MCP servers from
+    these; each launches khipumaq in WSL through wsl.exe over stdio."""
+    return [profile / ".claude.json", profile / "AppData" / "Roaming" / "Claude" / "claude_desktop_config.json"]
+
+
+def install_windows_clients(profile):
+    entry = {"command": "wsl.exe", "args": ["-e"] + command_prefix() + ["serve"]}
+    installed = []
+    for path in windows_client_configs(profile):
+        if path.exists():
+            config = _load(path)
+            config.setdefault("mcpServers", {})[MCP_NAME] = entry
+            _write_json(path, config)
+            installed.append(path)
+    return installed
+
+
+def uninstall_windows_clients(profile):
+    for path in windows_client_configs(profile):
+        config = _load(path)
+        if config.get("mcpServers", {}).pop(MCP_NAME, None) is not None:
+            _write_json(path, config)
