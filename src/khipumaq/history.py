@@ -66,13 +66,14 @@ class QueryHistory:
             return None
 
     def search(self, *, query, scope, since, until, limit, result, elapsed):
-        hits = []
+        returned = []  # every key, for linking a later recall; only MAX_HITS are stored
 
         def make():
-            hits.extend(
+            returned.extend(h["key"] for h in result["hits"])
+            hits = [
                 {"key": h["key"], "rank": i, "score": h.get("score")}
                 for i, h in enumerate(result["hits"][:MAX_HITS])
-            )
+            ]
             return {
                 "kind": "search",
                 "query": query,
@@ -88,8 +89,8 @@ class QueryHistory:
 
         key = self._insert(make)
         if key is not None:
-            for h in hits:
-                self._returned[h["key"]] = (key, h["rank"])
+            for rank, k in enumerate(returned):
+                self._returned[k] = (key, rank)
 
     def recall(self, *, key, found):
         after, rank = self._returned.get(key, (None, None))
