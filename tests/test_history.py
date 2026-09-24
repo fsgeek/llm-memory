@@ -143,13 +143,6 @@ def test_search_caps_recorded_hits_but_preserves_returned_count(recorder):
     assert all(hit["key"] != "episode-100" for hit in document["hits"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A23 bug: QueryHistory remembers only the capped recorded hits, so a "
-        "returned key beyond MAX_HITS cannot be linked by recall"
-    ),
-)
 def test_recall_links_to_returned_key_beyond_recording_cap(recorder):
     history, database = recorder
     history.search(
