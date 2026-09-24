@@ -376,3 +376,16 @@ In conversation I recommended an encrypted off-site backup; A10 had built
 one on 2026-09-04, and neither Tony nor I knew. The store had the episodes
 that built it; I did not search for them because I did not know there was
 anything to search for. A checkout is a snapshot, the same way context is.
+
+**A15 — A working directory below a project folds into the project.**
+`label_from_path` (Codex `cwd`, `CLAUDE_PROJECT_DIR`) cuts a path at the
+first component under `projects/`: `…/projects/cpsc416/tmp/capstone/<student>`
+is `cpsc416`. Why: automated Codex grading runs, one per student, had made
+176 labels for 8 projects, and the D5 sentence reported "219 projects". The
+full path is still on every Codex episode (`codex.cwd`), so this folds the
+search surface without losing anything; `scripts/relabel-codex-by-project.py`
+relabelled the 1,077 existing episodes (219 → 45 labels). Claude-session
+labels are unchanged: Claude Code's encoded directory name replaces `/`
+with `-`, so `projects/foo/bar` and `projects/foo-bar` cannot be told
+apart there. No configurable fold rules: the one rule is structural, and
+Tony does not expect to repeat the grading runs.

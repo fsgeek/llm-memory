@@ -35,8 +35,15 @@ def label_from_path(path):
     """Label for a working-directory path (a Codex rollout's `cwd`, Claude's
     CLAUDE_PROJECT_DIR), by the same rule as the project directory name:
     Claude Code names `~/.claude/projects/<name>` by replacing every
-    non-alphanumeric character in the path with a dash."""
-    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", str(path)))
+    non-alphanumeric character in the path with a dash.
+
+    A real path still has its separators, so a directory below a project folds
+    into the project: `…/projects/cpsc416/tmp/capstone/<student>` is
+    `cpsc416`, not one label per student. The full path stays on the episode
+    (`codex.cwd`). An encoded project directory name has lost its separators,
+    so `label_from_project_dir` cannot do the same."""
+    m = re.match(r"(.*/projects/[^/]+)", str(path))
+    return label_from_project_dir(re.sub(r"[^A-Za-z0-9]", "-", m.group(1) if m else str(path)))
 
 
 def record_to_episode(record, source_file):
