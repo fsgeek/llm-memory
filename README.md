@@ -95,8 +95,11 @@ nowhere else: khipumaq sends nothing to any service but your database. Its
 operational event log (`~/.local/state/llm-memory/events.jsonl`) records
 identifiers, digests, and counts, never query text or episode content;
 queries are digested with a random key kept on your machine, so a digest
-cannot be reversed by hashing guesses. Point
-it at a database on a network you trust.
+cannot be reversed by hashing guesses. The store itself also keeps how it
+is used: each search's text, window, match count and returned keys, and
+which hit was opened afterwards, in a `queries` collection beside the
+episodes, so search can be improved from real use. The tools never search
+it. Point it at a database on a network you trust.
 
 ## Status
 

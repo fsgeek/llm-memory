@@ -12,6 +12,9 @@ Two principles, kept from the retired contract layer (spec D2):
 The server says one sentence about itself at start (spec D5), rebuilt from
 the store: what it holds, how fresh it is, and when to reach for it.
 
+Each call is also recorded in the store's `queries` collection (A23): how the
+store is used, kept apart from what it holds.
+
 Run for dogfooding:  uv run python -m khipumaq.mcp_server   (stdio transport)
 """
 
@@ -21,6 +24,8 @@ from khipumaq.db import get_database, person
 from khipumaq.describe import SERVER_NAME
 from khipumaq.describe import describe as _describe
 from khipumaq.describe import instructions as _instructions
+from khipumaq.describe import project_label
+from khipumaq.history import QueryHistory, timed
 from khipumaq.observability import emit_recall_event, emit_search_event
 from khipumaq.recall import recall as _recall
 from khipumaq.search import search as _search
@@ -41,6 +46,7 @@ def _self_description() -> str:
 
 
 mcp = FastMCP(SERVER_NAME, instructions=_self_description())
+history = QueryHistory(get_database, project=project_label())
 
 
 @mcp.tool()
@@ -63,7 +69,8 @@ def search(
     `since` rather than trust the top ten. Hits carry `key`, `score`, `ts`,
     `experiment_label`, `source_file`, and a 200-char snippet; pass `key` to
     `recall` for the whole episode."""
-    result = _search(get_database(), query, scope=scope, limit=limit, since=since, until=until)
+    result, elapsed = timed(_search, get_database(), query, scope=scope, limit=limit, since=since, until=until)
+    history.search(query=query, scope=scope, since=since, until=until, limit=limit, result=result, elapsed=elapsed)
     emit_search_event(
         query=query,
         scope=scope,
@@ -83,6 +90,7 @@ def recall(key: str) -> dict | None:
     host, and source file. Null if no episode has that key."""
     episode = _recall(get_database(), key)
     emit_recall_event(key=key, found=episode is not None)
+    history.recall(key=key, found=episode is not None)
     return episode
 
 
@@ -91,6 +99,7 @@ def describe() -> dict:
     """What the store holds: episode count, counts by project label and by
     host, and the oldest/newest timestamps. Read-only; use it to pick a
     `scope` for `search` or to check whether ingestion is current."""
+    history.describe()
     return _describe(get_database())
 
 

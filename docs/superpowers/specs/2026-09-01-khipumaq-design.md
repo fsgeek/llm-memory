@@ -505,3 +505,39 @@ inferred one would be a guess stored as the record.
   gateway, `evaluate`), the read-modify-write of `~/.claude.json`,
   `waitForSync` on every search, no cap on `limit`, and noisy
   `matched_field`.
+
+**A23 — The server keeps how the store is used, in the store.** Every
+`search`, `recall`, and `describe` becomes a document in a `queries`
+collection:
+- the query text, `scope`/`since`/`until`/`limit`, `total`, and the returned
+  keys with rank and score (never hit text, at most 100 hits);
+- elapsed time, host, the consuming project's label, and a session id made
+  when the server process starts (one stdio process serves one session);
+- for a `recall`, the search in the same session that returned that key and
+  at what rank, if any.
+
+Why: Tony's Question 2 of 2026-09-24 ("who can make this store forget, and
+how?") became "which questions can still be answered correctly if some data
+is thrown away, and which can't?" The first half is measurable only against a
+workload, and the store kept none. The queries were in the transcripts
+(`tool_use` inputs and results), but ingest keeps prose only, and the
+transcripts go after about 30 days. A search followed by a recall of hit #3
+is a relevance judgment nobody had to label. Tony's Indaleko did this
+(`query/cli.py`, QueryHistoryData plus activity-stream records); its lesson
+on size, when unbounded result sets made 100MB+ history records, is why
+records carry keys and scores only, with a cap.
+
+Three boundaries:
+1. `queries` is not in the `episodes_search` view. How the store is used is
+   not what it holds, and an instance that finds its own past queries in
+   search mistakes them for evidence (the June `_activity_log` confound).
+2. D2's content-free rule governs the operational log, a file outside the
+   store. Query text in the ayllu's own database is on the other side of
+   that line: content in the store is what the store is for. The file log
+   keeps its keyed digest (A22).
+3. Recording never fails a tool: build and write are both guarded; a failure
+   is one line on stderr.
+
+The container is not needed for this; the stdio server already reaches the
+one database. When the container comes, the capture moves with the server,
+and the MCP HTTP session id replaces the per-process one.
