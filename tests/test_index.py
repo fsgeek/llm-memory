@@ -17,6 +17,7 @@ def test_ensure_index_creates_collection_and_view():
     assert "user_message" in fields
     assert "response" in fields
     assert "state_text" in fields
+    assert "queries" not in view["links"]
 
 
 def test_ensure_index_is_idempotent():
