@@ -1,9 +1,11 @@
 import hashlib
+import hmac
 import json
 import stat
 from datetime import datetime
 
 from khipumaq.observability import (
+    _query_digest,
     emit_ingest_event,
     emit_recall_event,
     emit_search_event,
@@ -43,12 +45,15 @@ def test_emit_search_event_appends_the_documented_content_free_record(
 
     text = path.read_text(encoding="utf-8")
     records = _read_records(path)
+    key = (tmp_path / "event-key").read_bytes()
     assert written is True
     assert len(records) == 1
     assert records[0] == {
         "event": "search.completed",
         "keys_sha256": hashlib.sha256(b"episode-a\nepisode-b").hexdigest(),
-        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "query_hmac": hmac.new(
+            key, query.encode("utf-8"), hashlib.sha256
+        ).hexdigest(),
         "returned": 2,
         "scope": "hamutay",
         "since": "2026-08-01T00:00:00Z",
@@ -58,6 +63,68 @@ def test_emit_search_event_appends_the_documented_content_free_record(
     }
     _assert_utc_timestamp(records[0])
     assert query not in text
+
+
+def test_query_digest_creates_and_uses_a_private_machine_key(tmp_path, monkeypatch):
+    _event_log(tmp_path, monkeypatch)
+    query = "literal private query"
+
+    first = _query_digest(query)
+    repeated = _query_digest(query)
+    different = _query_digest("a different private query")
+
+    key_path = tmp_path / "event-key"
+    key = key_path.read_bytes()
+    assert len(key) == 32
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert first == repeated
+    assert first != different
+    assert first != hashlib.sha256(query.encode("utf-8")).hexdigest()
+    assert first == hmac.new(key, query.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def test_query_digest_reuses_a_preexisting_machine_key(tmp_path, monkeypatch):
+    _event_log(tmp_path, monkeypatch)
+    key_path = tmp_path / "event-key"
+    original_key = bytes(range(32))
+    key_path.write_bytes(original_key)
+    original_inode = key_path.stat().st_ino
+
+    digest = _query_digest("known query")
+
+    assert key_path.read_bytes() == original_key
+    assert key_path.stat().st_ino == original_inode
+    assert digest == hmac.new(
+        original_key, b"known query", hashlib.sha256
+    ).hexdigest()
+
+
+def test_missing_query_key_does_not_break_search_event_logging(
+    tmp_path, monkeypatch
+):
+    event_dir = tmp_path / "events"
+    event_dir.mkdir()
+    path = event_dir / "events.jsonl"
+    path.touch(mode=0o600)
+    monkeypatch.setenv("LLM_MEMORY_EVENT_LOG", str(path))
+    event_dir.chmod(0o500)
+
+    try:
+        assert _query_digest("private query") is None
+        written = emit_search_event(
+            query="private query",
+            scope=None,
+            since=None,
+            until=None,
+            total=0,
+            returned=0,
+            keys=[],
+        )
+    finally:
+        event_dir.chmod(0o700)
+
+    assert written is True
+    assert _read_records(path)[0]["query_hmac"] is None
 
 
 def test_emit_recall_event_appends_the_documented_record(tmp_path, monkeypatch):

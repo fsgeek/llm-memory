@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import json
 from uuid import uuid4
 
@@ -165,6 +166,7 @@ def test_search_tool_emits_a_content_free_completed_event(tmp_path, monkeypatch)
 
     event_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
     records = [json.loads(line) for line in event_text.splitlines()]
+    key = (tmp_path / "event-key").read_bytes()
     assert returned is result
     assert search_calls == [
         (
@@ -180,7 +182,9 @@ def test_search_tool_emits_a_content_free_completed_event(tmp_path, monkeypatch)
     assert records[0] == {
         "event": "search.completed",
         "keys_sha256": hashlib.sha256(b"episode-a\nepisode-b").hexdigest(),
-        "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        "query_hmac": hmac.new(
+            key, query.encode("utf-8"), hashlib.sha256
+        ).hexdigest(),
         "returned": 2,
         "scope": "hamutay",
         "since": "2026-08-01T00:00:00Z",

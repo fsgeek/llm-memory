@@ -2,6 +2,7 @@ import io
 import json
 import os
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -260,6 +261,75 @@ def test_command_prefix_uses_this_checkouts_venv_binary():
     checkout = Path(__file__).resolve().parents[1]
 
     assert setup.command_prefix() == [str(checkout / ".venv" / "bin" / "khipumaq")]
+
+
+def test_command_prefix_from_wheel_pins_the_installed_version(
+    tmp_path, monkeypatch
+):
+    fake_home = tmp_path / "home"
+    codex_home = tmp_path / "codex-home"
+    uvx = str(tmp_path / "bin" / "uvx")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(setup, "_checkout_root", lambda: None)
+    monkeypatch.setattr(setup.shutil, "which", lambda command: uvx)
+
+    assert setup.command_prefix() == [
+        uvx,
+        "--from",
+        f"khipumaq=={version('khipumaq')}",
+        "khipumaq",
+    ]
+
+
+def test_install_replaces_unpinned_uvx_hook_and_uninstall_removes_pinned_hook(
+    tmp_path, monkeypatch
+):
+    fake_home = tmp_path / "home"
+    codex_home = tmp_path / "codex-home"
+    settings_path = fake_home / ".claude" / "settings.json"
+    claude_json = fake_home / ".claude.json"
+    uvx = str(tmp_path / "bin" / "uvx")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(setup, "_checkout_root", lambda: None)
+    monkeypatch.setattr(setup.shutil, "which", lambda command: uvx)
+    _write_json(
+        settings_path,
+        {
+            "hooks": {
+                "SessionEnd": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": (
+                                    "uvx --python 3.14 khipumaq ingest "
+                                    "claude-session"
+                                ),
+                                "timeout": 30,
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+    )
+
+    setup.install_claude(settings_path, claude_json)
+
+    handlers = _session_end_handlers(
+        json.loads(settings_path.read_text(encoding="utf-8"))
+    )
+    assert [handler["command"] for handler in handlers] == [
+        " ".join(setup.command_prefix() + ["ingest", "claude-session"])
+    ]
+    assert "khipumaq ingest claude-session" in handlers[0]["command"]
+
+    setup.uninstall_claude(settings_path, claude_json)
+
+    uninstalled = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert _session_end_handlers(uninstalled) == []
 
 
 def test_install_and_uninstall_windows_clients_preserve_other_config(tmp_path):

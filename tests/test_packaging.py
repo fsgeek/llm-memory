@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -46,3 +47,19 @@ def test_built_wheel_contains_only_package_code_and_metadata(tmp_path):
         if entry.startswith("khipumaq/")
     )
     assert not any(entry.endswith((".ini", ".json", ".jsonl")) for entry in entries)
+
+
+def _project_metadata():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+
+
+def test_package_supports_python_3_11_and_newer():
+    assert _project_metadata()["requires-python"] == ">=3.11"
+
+
+def test_package_metadata_links_to_repository_and_issues():
+    assert _project_metadata()["urls"] == {
+        "Repository": "https://github.com/fsgeek/llm-memory",
+        "Issues": "https://github.com/fsgeek/llm-memory/issues",
+    }
