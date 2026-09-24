@@ -187,6 +187,289 @@ def test_claude_session_to_episodes_maps_identity_provenance_and_latest_user(tmp
     assert all(episode["_key"] != tool_only_uuid for episode in episodes)
 
 
+def test_claude_session_keeps_prompt_across_tool_round_trip(tmp_path):
+    session_id = str(uuid4())
+    prompt_ts = "2026-09-24T10:00:00Z"
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _user_record(session_id, "original prompt", prompt_ts),
+            _assistant_record(
+                session_id,
+                "first-prose",
+                "I will inspect the file.",
+                "2026-09-24T10:00:01Z",
+            ),
+            _assistant_record(
+                session_id,
+                "tool-use-only",
+                [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/example"},
+                    }
+                ],
+                "2026-09-24T10:00:02Z",
+            ),
+            _user_record(
+                session_id,
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "file contents",
+                    }
+                ],
+                "2026-09-24T10:00:03Z",
+            ),
+            _assistant_record(
+                session_id,
+                "second-prose",
+                "The file contains the answer.",
+                "2026-09-24T10:00:04Z",
+            ),
+        ],
+    )
+
+    episodes = list(claude_session_to_episodes(path, "hamutay"))
+
+    assert [episode["_key"] for episode in episodes] == [
+        "first-prose",
+        "second-prose",
+    ]
+    assert [episode["user_message"] for episode in episodes] == [
+        "original prompt",
+        "original prompt",
+    ]
+    assert [episode["user_ts"] for episode in episodes] == [prompt_ts, prompt_ts]
+
+
+@pytest.mark.parametrize(
+    ("ignored_content", "record_flags"),
+    [
+        pytest.param(
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-1",
+                    "content": "tool output",
+                }
+            ],
+            {},
+            id="tool-result-only",
+        ),
+        pytest.param("meta text", {"isMeta": True}, id="is-meta"),
+        pytest.param(
+            "compact summary text",
+            {"isCompactSummary": True},
+            id="is-compact-summary",
+        ),
+        pytest.param(
+            "This session is being continued from a previous conversation "
+            "that ran out of context.",
+            {},
+            id="continued-session",
+        ),
+        pytest.param(
+            "  This session is being continued from a previous conversation.",
+            {},
+            id="continued-session-leading-whitespace",
+        ),
+        pytest.param(
+            "<system-reminder>injected</system-reminder>",
+            {},
+            id="system-reminder",
+        ),
+        pytest.param(
+            "  <system-reminder>injected</system-reminder>",
+            {},
+            id="system-reminder-leading-whitespace",
+        ),
+        pytest.param(
+            "<local-command-caveat>injected</local-command-caveat>",
+            {},
+            id="local-command-caveat",
+        ),
+        pytest.param(
+            "\t<local-command-caveat>injected</local-command-caveat>",
+            {},
+            id="local-command-caveat-leading-whitespace",
+        ),
+        pytest.param(
+            "<local-command-stdout>injected</local-command-stdout>",
+            {},
+            id="local-command-stdout",
+        ),
+        pytest.param(
+            "\n<local-command-stdout>injected</local-command-stdout>",
+            {},
+            id="local-command-stdout-leading-whitespace",
+        ),
+        pytest.param(
+            "<local-command-stderr>injected</local-command-stderr>",
+            {},
+            id="local-command-stderr",
+        ),
+        pytest.param(
+            "  <local-command-stderr>injected</local-command-stderr>",
+            {},
+            id="local-command-stderr-leading-whitespace",
+        ),
+        pytest.param(
+            "<bash-stdout>injected</bash-stdout>",
+            {},
+            id="bash-stdout",
+        ),
+        pytest.param(
+            "\t<bash-stdout>injected</bash-stdout>",
+            {},
+            id="bash-stdout-leading-whitespace",
+        ),
+        pytest.param(
+            "<bash-stderr>injected</bash-stderr>",
+            {},
+            id="bash-stderr",
+        ),
+        pytest.param(
+            "\n<bash-stderr>injected</bash-stderr>",
+            {},
+            id="bash-stderr-leading-whitespace",
+        ),
+        pytest.param(
+            "<task-notification>injected</task-notification>",
+            {},
+            id="task-notification",
+        ),
+        pytest.param(
+            "  <task-notification>injected</task-notification>",
+            {},
+            id="task-notification-leading-whitespace",
+        ),
+    ],
+)
+def test_claude_session_ignores_non_prompt_user_records(
+    tmp_path, ignored_content, record_flags
+):
+    session_id = str(uuid4())
+    prompt_ts = "2026-09-24T11:00:00Z"
+    ignored = _user_record(
+        session_id,
+        ignored_content,
+        "2026-09-24T11:00:01Z",
+    )
+    ignored.update(record_flags)
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _user_record(session_id, "human prompt", prompt_ts),
+            ignored,
+            _assistant_record(session_id, "answer", "assistant response"),
+        ],
+    )
+
+    [episode] = list(claude_session_to_episodes(path, "hamutay"))
+
+    assert episode["user_message"] == "human prompt"
+    assert episode["user_ts"] == prompt_ts
+
+
+@pytest.mark.parametrize(
+    ("prompt_content", "expected_prompt"),
+    [
+        pytest.param("plain replacement", "plain replacement", id="plain-string"),
+        pytest.param(
+            [{"type": "text", "text": "text block replacement"}],
+            "text block replacement",
+            id="text-block-list",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "aW1hZ2U=",
+                    },
+                },
+                {"type": "text", "text": "describe this image"},
+            ],
+            "describe this image",
+            id="text-alongside-image",
+        ),
+        pytest.param(
+            "<command-name>/review</command-name>",
+            "<command-name>/review</command-name>",
+            id="command-name",
+        ),
+        pytest.param(
+            "<bash-input>uv run pytest -q</bash-input>",
+            "<bash-input>uv run pytest -q</bash-input>",
+            id="bash-input",
+        ),
+        pytest.param(
+            '<pasted_content source="clipboard">notes</pasted_content>',
+            '<pasted_content source="clipboard">notes</pasted_content>',
+            id="pasted-content",
+        ),
+        pytest.param(
+            '<teammate-message teammate_id="reviewer">findings</teammate-message>',
+            '<teammate-message teammate_id="reviewer">findings</teammate-message>',
+            id="teammate-message",
+        ),
+    ],
+)
+def test_claude_session_accepts_person_authored_prompt_shapes(
+    tmp_path, prompt_content, expected_prompt
+):
+    session_id = str(uuid4())
+    replacement_ts = "2026-09-24T12:00:01Z"
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _user_record(session_id, "superseded prompt", "2026-09-24T12:00:00Z"),
+            _user_record(session_id, prompt_content, replacement_ts),
+            _assistant_record(session_id, "answer", "assistant response"),
+        ],
+    )
+
+    [episode] = list(claude_session_to_episodes(path, "hamutay"))
+
+    assert episode["user_message"] == expected_prompt
+    assert episode["user_ts"] == replacement_ts
+
+
+def test_claude_session_with_tool_result_before_any_prompt_uses_empty_prompt(tmp_path):
+    session_id = str(uuid4())
+    path = tmp_path / "session.jsonl"
+    _write_jsonl(
+        path,
+        [
+            _user_record(
+                session_id,
+                [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "tool output",
+                    }
+                ],
+            ),
+            _assistant_record(session_id, "answer", "assistant response"),
+        ],
+    )
+
+    [episode] = list(claude_session_to_episodes(path, "hamutay"))
+
+    assert episode["user_message"] == ""
+    assert episode["user_ts"] is None
+
+
 def test_forked_sessions_dedupe_shared_uuid_and_keep_both_tails(tmp_path):
     db = get_database()
     ensure_index(db)
